@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import orjson
 
 from kahin import _state as state
@@ -46,6 +49,8 @@ _MAX_ATTRIBUTE_LENGTH = 1_024
 _MAX_EXTRACT_LENGTH = 100_000
 _MAX_EVALUATE_LENGTH = 1_000_000
 _MAX_SCREENSHOT_BYTES = 32 * 1024 * 1024
+_VISION_API_URL = "https://vision.googleapis.com/v1/images:annotate"
+_MAX_OCR_INPUT_LENGTH = 50 * 1024 * 1024
 _NAVIGATE_WAIT_UNTIL = ("commit", "domcontentloaded", "load", "networkidle")
 _NAVIGATE_IDLE_QUIET = 0.5
 _NAVIGATE_MAX_TIMEOUT = 120.0
@@ -1205,6 +1210,109 @@ async def screenshot(full_page: bool = False) -> str:
             return orjson.dumps({"path": str(fpath.resolve()), "format": "png", "bytes": len(data)}, option=orjson.OPT_INDENT_2).decode()
     except Exception as exc:  # noqa: BLE001 - visual tools must never leak exceptions
         return _json_error("kahin_screenshot", f"Screenshot failed: {exc}", "tool_failed")
+
+
+def _read_ocr_image(value: str) -> bytes:
+    if value.startswith("data:"):
+        try:
+            _, encoded = value.split(",", 1)
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("image data URI must contain valid base64") from exc
+    else:
+        try:
+            image_path = Path(value).expanduser()
+            if image_path.is_file():
+                image_bytes = image_path.read_bytes()
+            else:
+                image_bytes = base64.b64decode(value, validate=True)
+        except (OSError, ValueError, binascii.Error) as exc:
+            raise ValueError("image must be an existing path or base64 data") from exc
+    if not image_bytes:
+        raise ValueError("image must not be empty")
+    return image_bytes
+
+
+@mcp.tool(name="kahin_ocr", annotations=_RO)
+async def ocr(image: str) -> str:
+    """Read the supplied image with Google Vision TEXT_DETECTION."""
+    image_value, error = _validate_text(
+        image,
+        tool="kahin_ocr",
+        field="image",
+        maximum=_MAX_OCR_INPUT_LENGTH,
+    )
+    if error:
+        return error
+    assert image_value is not None
+    try:
+        image_bytes = _read_ocr_image(image_value)
+    except ValueError as exc:
+        return _json_error("kahin_ocr", str(exc), "invalid_argument", field="image")
+
+    api_key = os.environ.get("GOOGLE_VISION_API_KEY", "")
+    if not api_key:
+        return _json_error(
+            "kahin_ocr",
+            "Google Vision API key is not configured",
+            "missing_configuration",
+        )
+
+    request_body = {
+        "requests": [{
+            "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+            "features": [{"type": "TEXT_DETECTION"}],
+        }],
+    }
+    try:
+        async with _healer_ref.safe("kahin_ocr"):
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    _VISION_API_URL,
+                    params={"key": api_key},
+                    json=request_body,
+                )
+    except httpx.HTTPError:
+        return _json_error("kahin_ocr", "Google Vision request failed", "provider_error")
+    except Exception:
+        logger.exception("Google Vision OCR failed")
+        return _json_error("kahin_ocr", "OCR failed", "tool_failed")
+
+    if response.status_code >= 400:
+        return _json_error(
+            "kahin_ocr",
+            "Google Vision request failed",
+            "provider_error",
+            status=response.status_code,
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        return _json_error("kahin_ocr", "Google Vision returned invalid JSON", "invalid_provider_response")
+
+    responses = payload.get("responses") if isinstance(payload, dict) else None
+    first = responses[0] if isinstance(responses, list) and responses else {}
+    if not isinstance(first, dict):
+        return _json_error("kahin_ocr", "Google Vision returned an invalid response", "invalid_provider_response")
+    provider_error = first.get("error")
+    if isinstance(provider_error, dict):
+        message = provider_error.get("message")
+        return _json_error(
+            "kahin_ocr",
+            str(message) if isinstance(message, str) and message else "Google Vision OCR failed",
+            "provider_error",
+        )
+
+    full_annotation = first.get("fullTextAnnotation")
+    full_text = full_annotation.get("text") if isinstance(full_annotation, dict) else None
+    if isinstance(full_text, str) and full_text.strip():
+        return full_text.strip()
+    annotations = first.get("textAnnotations")
+    if isinstance(annotations, list) and annotations:
+        description = annotations[0].get("description") if isinstance(annotations[0], dict) else None
+        if isinstance(description, str):
+            return description.strip()
+    return ""
 
 
 @mcp.tool(name="kahin_evaluate", annotations=_RW)

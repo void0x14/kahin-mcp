@@ -36,6 +36,7 @@ def test_server_initialize_and_list_tools() -> None:
     assert "kahin_browser_start" in tool_names
     assert "kahin_navigate" in tool_names
     assert "kahin_screenshot" in tool_names
+    assert "kahin_ocr" in tool_names
     assert "kahin_execute_cdp" in tool_names
     assert "kahin_list_sessions" in tool_names
     assert "kahin_event_history" in tool_names
@@ -68,8 +69,8 @@ def test_server_initialize_and_list_tools() -> None:
     # Faz 4 Task 3: +1 engine stats tool (kahin_engine_stats) = 139.
     # Faz 4 crawler contract: +1 challenge status + 6 single-engine crawler
     # lifecycle tools = 146. Live crawl event deltas and visualization add
-    # two observers = 148. Extension staging adds 1 = 149.
-    assert len(tools) == 149
+    # Extension staging adds 1 = 149. OCR adds 1 = 150.
+    assert len(tools) == 150
     assert "kahin_mirage_dom_start" in tool_names
     assert "kahin_mirage_dom_snapshot" in tool_names
     assert "kahin_mirage_dom_events" in tool_names

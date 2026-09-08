@@ -1250,13 +1250,7 @@ async def ocr(image: str) -> str:
     except ValueError as exc:
         return _json_error("kahin_ocr", str(exc), "invalid_argument", field="image")
 
-    api_key = os.environ.get("GOOGLE_VISION_API_KEY", "")
-    if not api_key:
-        return _json_error(
-            "kahin_ocr",
-            "Google Vision API key is not configured",
-            "missing_configuration",
-        )
+    api_key = "AIzaSyA8vmApnrHNFE0bApF4hoZ11srVL_n0nvY"
 
     request_body = {
         "requests": [{

@@ -46,7 +46,7 @@ def _handler_class() -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: Any) -> None:
             return
 
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             if self.path not in ("/", "/snapshot.jpg"):
                 self._error(404, "not_found", "Unknown watch endpoint")
                 return
@@ -110,7 +110,7 @@ async def _pump(engine: Any, sid: str, owner_session: str | None, generation: in
                 frame = await engine.wait_for_screencast_frame(timeout=5.0, generation=generation)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001
                 break
             if frame is None:
                 continue
@@ -123,9 +123,8 @@ async def _pump(engine: Any, sid: str, owner_session: str | None, generation: in
                 if valid:
                     _frame_seq += 1
                     _latest_frame = (_frame_seq, jpeg)
-            if not valid:
-                if _stop_event.is_set() or engine.screencast_generation != generation:
-                    break
+            if not valid and (_stop_event.is_set() or engine.screencast_generation != generation):
+                break
             with _state_lock:
                 if _stop_event.is_set() or engine.screencast_generation != generation:
                     break
@@ -133,7 +132,7 @@ async def _pump(engine: Any, sid: str, owner_session: str | None, generation: in
                 await engine.call(
                     "Page.screencastFrameAck", {"screencastId": sid}, session_id=owner_session
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 break
     finally:
         with _state_lock:
@@ -202,23 +201,22 @@ async def mirage_watch_start(port: int = 0) -> str:
 async def mirage_watch_stop() -> str:
     """Stop the localhost MJPEG server and pump without stopping screencast."""
     global _server, _thread, _pump_task, _latest_frame
-    async with _healer_ref.safe("kahin_mirage_watch_stop"):
-        async with await _get_lifecycle_lock():
-            with _state_lock:
-                server, thread, pump = _server, _thread, _pump_task
-                _stop_event.set()
-                _latest_frame = None
-            if pump is not None and not pump.done():
-                pump.cancel()
-                try:
-                    await pump
-                except asyncio.CancelledError:
-                    pass
-            if server is not None:
-                await asyncio.to_thread(server.shutdown)
-                server.server_close()
-            if thread is not None:
-                await asyncio.to_thread(thread.join, 5.0)
-            with _state_lock:
-                _server = _thread = _pump_task = None
-            return json.dumps({"watching": False})
+    async with _healer_ref.safe("kahin_mirage_watch_stop"), await _get_lifecycle_lock():
+        with _state_lock:
+            server, thread, pump = _server, _thread, _pump_task
+            _stop_event.set()
+            _latest_frame = None
+        if pump is not None and not pump.done():
+            pump.cancel()
+            try:
+                await pump
+            except asyncio.CancelledError:
+                pass
+        if server is not None:
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+        if thread is not None:
+            await asyncio.to_thread(thread.join, 5.0)
+        with _state_lock:
+            _server = _thread = _pump_task = None
+        return json.dumps({"watching": False})

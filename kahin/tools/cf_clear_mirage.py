@@ -7,32 +7,29 @@ inside Kahin's already-open session:
 2. probe with the same ``_CHALLENGE_STATUS_JS`` contract ``challenge_status``
    uses (no challenge -> return immediately),
 3. wait out non-interactive managed challenges (they self-resolve),
-4. click an interactive Turnstile checkbox human-like (Bézier travel +
-   jittered press delay + real down/up) when one is on screen, then verify.
+4. click an interactive Turnstile checkbox with native press/release events
+   when one is on screen, then re-evaluate to verify.
 
-Live-verified findings baked into this design (nopecha.com/demo/cloudflare,
-observed via Kahin screencast + a11y tree, not inferred from DOM dumps):
+Trust contract (mirrors the Türk bypasser ``cf_bypasser/core/bypasser.py``):
+frames filtered by ``"challenges.cloudflare" in frame.url``, checkbox found
+by walking open + closed shadow roots (``el.fakeShadowRoot || el.shadowRoot``)
+for ``input[type=checkbox]``, click gated on ``w > 0`` and not ``checked``,
+checkbox page coords = frame-element bounding-box origin + in-frame centre,
+native ``Page.dispatchMouseEvent`` press/release (no Bézier travel, no press
+delay — the reference passes without humanization), re-eval after click where
+success = checkbox not found or checked, up to 5 attempts with jittered 3s
+poll sleeps after a 5s post-navigation settle.
 
-- The Turnstile iframe has an EMPTY url in ``Page.getFrameTree`` and its
-  internals hide in a CLOSED shadow root: ``document.querySelector('iframe')``
-  returns nothing, ``querySelectorAll('*')`` shows no ``shadowRoot``, and the
-  a11y tree sees only an "internal frame" node with no coordinates. URL-based
-  frame filtering and in-iframe checkbox JS can NEVER find it.
-- The only measurable anchor is the widget mount div (``div#lVJB5``-style:
-  x matches the visible widget box pixel-for-pixel). The checkbox sits at
-  the mount box's left-center (~7% from left edge, vertically centered).
-- Synthetic ``Page.dispatchMouseEvent`` without cursor travel makes CF
-  rotate the Ray ID (bot signal). Travel + press delay are required.
-- ``Browser.getCookies`` returns the WHOLE persistent profile (httpOnly
-  included), so ``cf_clearance`` may belong to another site. A cookie match
-  is only meaningful when its domain covers the target host AND
-  ``document.cookie`` (page context) agrees. Ground truth for ``cleared``
-  is the page itself (title gate), never the cookie jar.
+Ground truth for ``cleared`` is the page itself (title gate) plus
+host-scoped ``cf_clearance`` presence as supporting evidence — never cookie
+presence alone (``Browser.getCookies`` returns the WHOLE persistent profile,
+so a cookie match is only meaningful when its domain covers the target host
+AND ``document.cookie`` agrees).
 
 Unsolvable states (block page, third-party image/audio CAPTCHA, CF refusing
-clicks / rotating Ray IDs, timeout) return ``cleared: false`` with evidence
-and the same ``pause_for_human`` contract ``challenge_status`` uses — never
-hammer, never guess.
+clicks, timeout) return ``cleared: false`` with evidence and the same
+``pause_for_human`` contract ``challenge_status`` uses — never hammer, never
+guess.
 """
 
 from __future__ import annotations
@@ -44,7 +41,7 @@ from typing import Any
 import orjson
 
 from kahin._mcp import mcp
-from kahin.humanize import bezier_trajectory, jittered_delay
+from kahin.humanize import jittered_delay
 from kahin.tools._common import (
     _RO,
     _RW,
@@ -58,22 +55,25 @@ from kahin.tools.pilot_mirage import (
     _dispatch_mouse,
     _is_error_response,
     _json_error,
-    get_last_mouse_position,
 )
 
 _TOOL = "kahin_cf_clear"
 
 # Bounds: every wait is finite, every retry counted. Defaults cover a slow
 # managed challenge (JS proof-of-work + a Turnstile click + settle).
+# Mirrors the Türk bypasser constants (cf_bypasser/utils/constants.py):
+# DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5, RETRY_POLL_SECONDS=3.
 _MAX_URL_LENGTH = 4096
 _DEFAULT_TIMEOUT = 60.0
 _MAX_TIMEOUT = 180.0
-_POLL_SECONDS = 3.0
+_RETRY_POLL_SECONDS = 3.0
+_RETRY_POLL_JITTER_SECONDS = 1.0
 _INITIAL_SETTLE_SECONDS = 5.0
-_MAX_CLICKS = 5
-# Human-like press: travel the cursor (Bézier) then hold before release.
-_PRESS_DELAY_MS = 120.0
-_PRESS_JITTER_MS = 40.0
+_MAX_ATTEMPTS = 5
+
+# Frame-URL filter: the Turnstile challenge frame serves from this host
+# (cf_bypasser/core/bypasser.py:171 — ``"challenges.cloudflare" in f.url``).
+_CF_FRAME_MARKER = "challenges.cloudflare"
 
 # Block-page markers. "cloudflare ray id" alone is NOT a signal — legit
 # footers carry it. Mirrors the Türk repo's _BLOCK_MARKERS contract.
@@ -84,34 +84,26 @@ _BLOCK_MARKERS = (
     "access denied",
 )
 
-# Runs in the PAGE (not the iframe — the iframe is unreachable): finds the
-# Turnstile mount div. The widget's closed shadow root renders INSIDE this
-# box, so its rect is the only measurable anchor. Candidates are divs in the
-# left half whose size fits a Turnstile box (~300x65 live-observed; bounds
-# are deliberately loose) and which contain the cf-turnstile-response input.
-_FIND_MOUNT_JS = """(() => {
-    const out = [];
-    for(const d of document.querySelectorAll('div')){
-        if(!d.querySelector('input[name=cf-turnstile-response]')) continue;
-        const r = d.getBoundingClientRect();
-        // Width is NOT bounded: the mount stretches with the viewport
-        // (300px at 1424w, 896px at 1920w live-observed). The response
-        // input + sane height already disambiguate; innermost wins below.
-        if(r.width < 150 || r.height < 30 || r.height > 200) continue;
-        if(r.x < 0 || r.y < 50) continue;
-        out.push({x:r.x, y:r.y, w:r.width, h:r.height});
+# Runs INSIDE the Turnstile challenge frame: walks open + closed shadow
+# roots (``el.fakeShadowRoot || el.shadowRoot``) for ``input[type=checkbox]``
+# and returns its centre relative to the frame viewport. Verbatim mirror of
+# the Türk bypasser ``_FIND_CHECKBOX_JS`` (cf_bypasser/core/bypasser.py:58-73).
+_FIND_CHECKBOX_JS = """() => {
+    function find(root){
+        if(!root) return null;
+        const direct = root.querySelector && root.querySelector('input[type=checkbox]');
+        if(direct) return direct;
+        for(const el of (root.querySelectorAll ? root.querySelectorAll('*') : [])){
+            const sr = el.fakeShadowRoot || el.shadowRoot;
+            if(sr){ const r = find(sr); if(r) return r; }
+        }
+        return null;
     }
-    // innermost first: nested mount wrappers collapse to the same box
-    out.sort((a,b) => (a.w*a.h) - (b.w*b.h));
-    return out.slice(0,3);
-})()"""
-
-# Checkbox geometry, live-measured at two viewports (1424x771 and
-# 1920x~920, modlens-verified): the visible widget (~300px) sits at the
-# mount div's LEFT edge, checkbox centre ~19px right of it, vertically
-# centred. A fraction would drift as the mount stretches (299px -> 896px
-# wide); a pixel offset does not (19px vs 18px observed).
-_CHECKBOX_LEFT_PX = 19.0
+    const cb = find(document);
+    if(!cb) return {found:false};
+    const r = cb.getBoundingClientRect();
+    return {found:true, checked:cb.checked, x:r.x+r.width/2, y:r.y+r.height/2, w:r.width};
+}"""
 
 # Page-level bypass probe: title gate + block markers. Returns a dict.
 _BLOCK_MARKERS_JSON = orjson.dumps(list(_BLOCK_MARKERS)).decode()
@@ -163,53 +155,130 @@ async def _is_blocked(session_id: str) -> str | None:
     return None
 
 
-async def _turnstile_mount(session_id: str) -> dict[str, float] | None:
-    """Page-space rect of the Turnstile mount div, or None when absent.
+def _iter_frame_entries(frame_tree: Any) -> Any:
+    """Yield ``(frame_id, url)`` pairs from a ``Page.getFrameTree`` payload."""
+    stack = [frame_tree]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        frame = node.get("frame")
+        if isinstance(frame, dict):
+            yield frame.get("id"), str(frame.get("url") or "")
+        children = node.get("childFrames")
+        if isinstance(children, list):
+            stack.extend(children)
 
-    The mount div (holding ``input[name=cf-turnstile-response]``) is the
-    only JS-visible anchor: the widget renders in a closed shadow root /
-    opaque iframe inside this box.
+
+async def _cf_frame_ids(session_id: str) -> list[str]:
+    """Frame ids whose URL serves the Turnstile challenge, or []."""
+    engine = _mirage_engine()
+    try:
+        tree = await engine.call("Page.getFrameTree", session_id=session_id)
+    except Exception:  # noqa: BLE001 - no frame tree means no click target
+        return []
+    frame_tree = tree.get("frameTree") if isinstance(tree, dict) else None
+    if not isinstance(frame_tree, dict):
+        return []
+    return [
+        frame_id
+        for frame_id, url in _iter_frame_entries(frame_tree)
+        if isinstance(frame_id, str) and frame_id and _CF_FRAME_MARKER in url
+    ]
+
+
+async def _checkbox_in_frame(session_id: str, frame_id: str) -> dict[str, float] | None:
+    """In-frame checkbox centre (frame-viewport coords), or None.
+
+    Click gate lives here in Python (not in JS) for testability: skip when
+    the checkbox is missing, has no width, or is already checked — verbatim
+    mirror of cf_bypasser/core/bypasser.py:175.
     """
-    boxes = await _eval_value(_FIND_MOUNT_JS, session_id)
-    if not isinstance(boxes, list) or not boxes:
+    raw = await _mirage_eval_result(
+        f"({ _FIND_CHECKBOX_JS })()", frame_id, session_id=session_id,
+    )
+    if isinstance(raw, str) or not isinstance(raw, dict):
         return None
-    box = boxes[0]
-    if not isinstance(box, dict):
+    if raw.get("exceptionDetails"):
+        return None
+    info = (raw.get("result") or {}).get("value")
+    if not isinstance(info, dict) or not info.get("found"):
         return None
     try:
-        x, y = float(box.get("x") or 0), float(box.get("y") or 0)
-        w, h = float(box.get("w") or 0), float(box.get("h") or 0)
+        w = float(info.get("w") or 0)
+        x = float(info.get("x") or 0)
+        y = float(info.get("y") or 0)
     except (TypeError, ValueError):
         return None
-    if w <= 0 or h <= 0:
+    if w <= 0 or info.get("checked"):
         return None
-    return {"x": x, "y": y, "w": w, "h": h}
+    return {"x": x, "y": y}
+
+
+async def _find_checkbox(session_id: str) -> tuple[str, dict[str, float]] | None:
+    """First clickable Turnstile checkbox: ``(frame_id, page coords)``.
+
+    The in-frame centre becomes page coordinates via the hosting
+    ``<iframe>`` element's bounding-box origin (cf_bypasser:177-182 — the
+    frame's own JS world has no ``window.frameElement`` back-reference, so
+    the page measures the frame element instead).
+    """
+    for frame_id in await _cf_frame_ids(session_id):
+        box = await _checkbox_in_frame(session_id, frame_id)
+        if box is None:
+            continue
+        origin = await _eval_value(
+            "(el => { if(!el) return null;"
+            " const r = el.getBoundingClientRect();"
+            " return {x:r.x, y:r.y}; })"
+            f"(document.querySelector('iframe[src*=\"{_CF_FRAME_MARKER}\"]'))",
+            session_id,
+        )
+        if not isinstance(origin, dict):
+            continue
+        try:
+            ox, oy = float(origin.get("x") or 0), float(origin.get("y") or 0)
+        except (TypeError, ValueError):
+            continue
+        return frame_id, {"x": ox + box["x"], "y": oy + box["y"]}
+    return None
+
+
+async def _click_at(session_id: str, x: float, y: float) -> bool:
+    """Native press/release at page coords. True when both dispatched."""
+    down = await _dispatch_mouse("mousedown", x, y, buttons=1, session_id=session_id)
+    if _is_error_response(down):
+        return False
+    up = await _dispatch_mouse("mouseup", x, y, session_id=session_id)
+    return not _is_error_response(up)
+
+
+async def _verify_checkbox(session_id: str, frame_id: str) -> bool:
+    """Re-evaluate after click: success = checkbox gone or checked."""
+    raw = await _mirage_eval_result(
+        f"({ _FIND_CHECKBOX_JS })()", frame_id, session_id=session_id,
+    )
+    if isinstance(raw, str) or not isinstance(raw, dict):
+        return False
+    if raw.get("exceptionDetails"):
+        return False
+    info = (raw.get("result") or {}).get("value")
+    if not isinstance(info, dict):
+        return False
+    return (not info.get("found")) or bool(info.get("checked"))
 
 
 async def _click_turnstile(session_id: str) -> bool:
-    """Human-like click on the Turnstile checkbox. True if dispatched.
-
-    Travels the cursor along a jittered Bézier to the checkbox point
-    (mount-box left + fraction, vertical centre), presses with a jittered
-    hold, releases. Ray-ID rotation after a click means CF rejected it —
-    the caller detects that via title/cookie, not here.
+    """Find the Turnstile checkbox via frame filter + shadow walk and click
+    it natively. True only when the post-click re-eval verifies success.
     """
-    mount = await _turnstile_mount(session_id)
-    if mount is None:
+    found = await _find_checkbox(session_id)
+    if found is None:
         return False
-    tx = mount["x"] + _CHECKBOX_LEFT_PX
-    ty = mount["y"] + mount["h"] / 2
-    start_x, start_y = get_last_mouse_position()
-    for px, py in bezier_trajectory(start_x, start_y, tx, ty, steps=24, jitter=2.0):
-        move = await _dispatch_mouse("mousemove", px, py, session_id=session_id)
-        if _is_error_response(move):
-            return False
-    down = await _dispatch_mouse("mousedown", tx, ty, buttons=1, session_id=session_id)
-    if _is_error_response(down):
+    frame_id, point = found
+    if not await _click_at(session_id, point["x"], point["y"]):
         return False
-    await asyncio.sleep(jittered_delay(_PRESS_DELAY_MS, _PRESS_JITTER_MS) / 1000.0)
-    up = await _dispatch_mouse("mouseup", tx, ty, session_id=session_id)
-    return not _is_error_response(up)
+    return await _verify_checkbox(session_id, frame_id)
 
 
 async def _cf_cookies(session_id: str, host: str) -> dict[str, str]:
@@ -269,15 +338,17 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
     """Clear a Cloudflare challenge in the current session (embedded solver).
 
     Navigates to ``url`` inside Kahin's already-open Camoufox browser, waits
-    out non-interactive managed challenges, human-like clicks an interactive
-    Turnstile checkbox when one is on screen, and verifies the page itself
-    opened (title gate). No second browser, no cookie cache, no replay proxy.
+    out non-interactive managed challenges, clicks an interactive Turnstile
+    checkbox with native events when one is on screen, and verifies the page
+    itself opened (title gate). No second browser, no cookie cache, no replay
+    proxy.
 
     Returns ``{cleared, method, url, cfCookies, elapsedMs}``. ``cleared`` is
-    true ONLY when the interstitial title is gone; host-scoped cf_ cookies
-    are reported as supporting evidence. CF may refuse clicks (Ray-ID
-    rotation) — then ``cleared`` is false with evidence and the
-    ``pause_for_human`` contract ``challenge_status`` uses.
+    true ONLY when the interstitial title is gone AND host-scoped
+    ``cf_clearance`` is present; host-scoped cf_ cookies are reported as
+    supporting evidence. CF may refuse clicks — then ``cleared`` is false
+    with evidence and the ``pause_for_human`` contract ``challenge_status``
+    uses.
     """
     if not isinstance(url, str) or not url or len(url) > _MAX_URL_LENGTH:
         return _json_error(_TOOL, "url must be a non-empty string", "invalid_argument", field="url")
@@ -296,16 +367,6 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
         host = ""
     if not host:
         return _json_error(_TOOL, "url must include a hostname", "invalid_argument", field="url")
-    if not isinstance(url, str) or not url or len(url) > _MAX_URL_LENGTH:
-        return _json_error(_TOOL, "url must be a non-empty string", "invalid_argument", field="url")
-    try:
-        budget = float(timeout)
-    except (TypeError, ValueError, OverflowError):
-        budget = _DEFAULT_TIMEOUT
-    import math as _math
-    if not _math.isfinite(budget):
-        budget = _DEFAULT_TIMEOUT
-    budget = max(5.0, min(_MAX_TIMEOUT, budget))
 
     async with _healer_ref.safe(_TOOL, url=url[:80], timeout=budget):
         session_id, error = await _capture_page_session(_TOOL)
@@ -346,38 +407,31 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                           "elapsedMs": elapsed_ms()})
 
         clicks = 0
-        ray_before = await _ray_id(session_id)
         deadline = started + budget
-        while time.monotonic() < deadline:
+        # TR retry loop (cf_bypasser:232-239): up to _MAX_ATTEMPTS passes of
+        # verify -> click -> jittered retry-poll sleep. The click helper only
+        # reports success when the post-click re-eval verifies, so a passed
+        # attempt without bypass progress still consumes an attempt.
+        for _ in range(_MAX_ATTEMPTS):
             # Ground truth: the interstitial title is gone. Cookies are only
             # supporting evidence (host-scoped + page-context agreement).
             if await _is_bypassed(session_id):
                 cf = await _cf_cookies(session_id, host)
                 page_names = await _page_cf_cookie_names(session_id)
-                return _dump({"cleared": True,
-                              "method": "click" if clicks else "auto",
-                              "url": url, "cfCookies": sorted(cf),
-                              "pageCfCookies": sorted(page_names),
-                              "clicks": clicks, "elapsedMs": elapsed_ms()})
-            if clicks < _MAX_CLICKS and await _click_turnstile(session_id):
+                if "cf_clearance" in cf:
+                    return _dump({"cleared": True,
+                                  "method": "click" if clicks else "auto",
+                                  "url": url, "cfCookies": sorted(cf),
+                                  "pageCfCookies": sorted(page_names),
+                                  "clicks": clicks, "elapsedMs": elapsed_ms()})
+            if time.monotonic() >= deadline:
+                break
+            if await _click_turnstile(session_id):
                 clicks += 1
-                await asyncio.sleep(_POLL_SECONDS)
-                # CF rejecting the click rotates the Ray ID instead of
-                # advancing the challenge. Two rotations = refused.
-                ray_after = await _ray_id(session_id)
-                if ray_before is not None and ray_after is not None and ray_after != ray_before:
-                    ray_before = ray_after
-                    if clicks >= 2:
-                        cf = await _cf_cookies(session_id, host)
-                        return _dump({
-                            "cleared": False, "method": "refused", "url": url,
-                            "reason": "CF rotated Ray ID after clicks — engine fingerprinted, clicks rejected",
-                            "rayId": ray_after, "clicks": clicks,
-                            "cfCookies": sorted(cf),
-                            "action": "pause_for_human_or_authorized_provider",
-                            "elapsedMs": elapsed_ms()})
-                continue
-            await asyncio.sleep(_POLL_SECONDS)
+            await asyncio.sleep(
+                jittered_delay(_RETRY_POLL_SECONDS * 1000.0,
+                               _RETRY_POLL_JITTER_SECONDS * 1000.0) / 1000.0,
+            )
 
         cf = await _cf_cookies(session_id, host)
         probe = await _challenge_probe(session_id)

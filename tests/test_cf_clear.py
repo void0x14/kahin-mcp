@@ -7,6 +7,7 @@ solving is covered by test_e2e_cf_clear.py against a real Camoufox.
 from __future__ import annotations
 
 import json
+import pathlib
 from typing import Any
 
 import pytest
@@ -57,19 +58,84 @@ def test_block_markers_exclude_ray_id_footers() -> None:
     assert "error 1020" in cf._BLOCK_MARKERS
 
 
-def test_mount_js_targets_response_input_not_iframe() -> None:
-    # Live finding: the Turnstile iframe has an empty URL and a closed
-    # shadow root — the mount div holding cf-turnstile-response is the
-    # only JS-visible anchor.
-    assert "cf-turnstile-response" in cf._FIND_MOUNT_JS
-    assert "getBoundingClientRect" in cf._FIND_MOUNT_JS
-    assert "iframe" not in cf._FIND_MOUNT_JS.lower()
+def test_mount_heuristic_removed_from_module_source() -> None:
+    # TR trust contract: no mount-div search, no pixel offset — frame-URL
+    # filter + shadow walk give frame-anchored coordinates instead.
+    source = pathlib.Path(cf.__file__).read_text()
+    assert "_FIND_MOUNT_JS" not in source
+    assert "_CHECKBOX_LEFT_PX" not in source
 
 
-def test_checkbox_geometry_matches_live_measurement() -> None:
-    # Visible widget sits at the mount's left edge; checkbox centre ~19px
-    # right of it at two viewports (1424w: 19px, 1920w: 18px observed).
-    assert cf._CHECKBOX_LEFT_PX == pytest.approx(19.0, abs=1.0)
+def test_checkbox_finder_js_uses_frame_filter_and_shadow_walk() -> None:
+    # Mirrors cf_bypasser/core/bypasser.py _FIND_CHECKBOX_JS: walk open +
+    # closed shadow roots for input[type=checkbox]; the frame-URL filter
+    # marker lives in _CF_FRAME_MARKER used by the frame-tree scan.
+    assert "fakeShadowRoot" in cf._FIND_CHECKBOX_JS
+    assert "input[type=checkbox]" in cf._FIND_CHECKBOX_JS
+    assert "challenges.cloudflare" in cf._CF_FRAME_MARKER
+
+
+def test_retry_and_settle_constants_match_tr_reference() -> None:
+    # TR: DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5, retry poll 3s.
+    assert cf._MAX_ATTEMPTS == 5
+    assert cf._INITIAL_SETTLE_SECONDS == pytest.approx(5.0)
+    assert cf._RETRY_POLL_SECONDS == pytest.approx(3.0)
+
+
+def _eval_result(value: Any) -> dict[str, Any]:
+    return {"result": {"value": value}}
+
+
+def _stub_eval_result(value: Any) -> Any:
+    async def fake(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return _eval_result(value)
+
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_checkbox_gate_skips_missing_narrow_and_checked() -> None:
+    # TR click gate (bypasser.py:175): skip when not found, w<=0, checked.
+    cases = [
+        {"found": False},
+        {"found": True, "checked": False, "x": 10.0, "y": 10.0, "w": 0.0},
+        {"found": True, "checked": True, "x": 10.0, "y": 10.0, "w": 20.0},
+    ]
+    real = cf._mirage_eval_result
+    for info in cases:
+        cf._mirage_eval_result = _stub_eval_result(info)  # type: ignore[assignment]
+        try:
+            assert await cf._checkbox_in_frame("sid", "frame1") is None
+        finally:
+            cf._mirage_eval_result = real
+
+
+@pytest.mark.asyncio
+async def test_checkbox_gate_returns_centre_when_clickable() -> None:
+    real = cf._mirage_eval_result
+    cf._mirage_eval_result = _stub_eval_result(  # type: ignore[assignment]
+        {"found": True, "checked": False, "x": 10.0, "y": 20.0, "w": 20.0}
+    )
+    try:
+        assert await cf._checkbox_in_frame("sid", "frame1") == {"x": 10.0, "y": 20.0}
+    finally:
+        cf._mirage_eval_result = real
+
+
+@pytest.mark.asyncio
+async def test_click_at_reports_dispatch_failure() -> None:
+    real = cf._dispatch_mouse
+
+    async def fake_dispatch(kind: str, x: float, y: float, **kwargs: Any) -> str:
+        if kind == "mousedown":
+            return '{"error": "wedged", "code": "tool_failed"}'
+        raise AssertionError("mouseup must not run after a failed mousedown")
+
+    cf._dispatch_mouse = fake_dispatch  # type: ignore[assignment]
+    try:
+        assert await cf._click_at("sid", 100.0, 100.0) is False
+    finally:
+        cf._dispatch_mouse = real
 
 
 def test_bypass_js_gates_on_title_and_blocks() -> None:

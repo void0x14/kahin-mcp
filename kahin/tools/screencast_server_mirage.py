@@ -102,8 +102,15 @@ def _handler_class() -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-async def _pump(engine: Any, sid: str, owner_session: str | None, generation: int) -> None:
+async def _pump(
+    engine: Any,
+    sid: str,
+    owner_session: str | None,
+    generation: int,
+    watch_generation: int | None = None,
+) -> None:
     global _latest_frame, _frame_seq, _server, _thread, _pump_task
+    watch_generation = generation if watch_generation is None else watch_generation
     try:
         while not _stop_event.is_set() and engine.screencast_generation == generation:
             try:
@@ -135,14 +142,19 @@ async def _pump(engine: Any, sid: str, owner_session: str | None, generation: in
             except Exception:  # noqa: BLE001
                 break
     finally:
+        # A stale pump must never tear down a newer watch generation.
         with _state_lock:
-            server, thread = _server, _thread
-            if _pump_task is asyncio.current_task():
+            current = (
+                _pump_task is asyncio.current_task()
+                and _generation == watch_generation
+            )
+            server, thread = (_server, _thread) if current else (None, None)
+            if current:
                 _pump_task = None
-            _server = None
-            _thread = None
-            _stop_event.set()
-            _latest_frame = None
+                _server = None
+                _thread = None
+                _stop_event.set()
+                _latest_frame = None
         if server is not None:
             await asyncio.to_thread(server.shutdown)
             server.server_close()
@@ -183,6 +195,7 @@ async def mirage_watch_start(port: int = 0) -> str:
                 actual = _server.server_address[1]
                 return json.dumps({"watching": True, "url": f"http://127.0.0.1:{actual}/", "port": actual, "format": "mjpeg"})
             _generation += 1
+            watch_generation = _generation
             _stop_event.clear()
             with _state_lock:
                 _latest_frame = None
@@ -192,7 +205,9 @@ async def mirage_watch_start(port: int = 0) -> str:
             thread = threading.Thread(target=_serve, args=(server,), daemon=True, name="kahin-mjpeg")
             _server, _thread = server, thread
             thread.start()
-            _pump_task = asyncio.create_task(_pump(engine, sid, owner_session, generation))
+            _pump_task = asyncio.create_task(
+                _pump(engine, sid, owner_session, generation, watch_generation)
+            )
             actual = server.server_address[1]
             return json.dumps({"watching": True, "url": f"http://127.0.0.1:{actual}/", "port": actual, "format": "mjpeg"})
 

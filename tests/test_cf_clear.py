@@ -188,6 +188,61 @@ def test_bypass_js_gates_on_title_and_blocks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fast_path_requires_host_scoped_clearance(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeEngine:
+        async def call(self, method: str, params: dict[str, Any], session_id: str | None = None) -> Any:
+            assert method == "Page.navigate"
+            return {"frameId": "main"}
+
+    async def fake_click(_sid: str) -> tuple[bool, bool]:
+        return False, False
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
+    monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
+    monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value(_ready()))
+    monkeypatch.setattr(cf, "_is_bypassed", lambda _sid: _true())
+    monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value(_cookies_without_clearance()))
+    monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
+    result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
+    assert result["cleared"] is False
+    assert result["method"] == "timeout"
+
+
+async def _session() -> tuple[str, None]:
+    return "sid", None
+
+
+async def _true() -> bool:
+    return True
+
+
+def _ready() -> dict[str, Any]:
+    return {"detected": False}
+
+
+def _cookies_without_clearance() -> dict[str, str]:
+    return {"__cf_bm": "supporting-only"}
+
+
+@pytest.mark.asyncio
+async def test_empty_frame_url_requires_selected_frame_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = {"frame": {"id": "main", "url": "https://example.com"}, "childFrames": [
+        {"frame": {"id": "challenge", "parentId": "main", "url": ""}},
+    ]}
+    monkeypatch.setattr(cf, "_frame_tree", lambda _sid: _async_value(tree))
+    monkeypatch.setattr(cf, "_checkbox_in_frame", lambda _sid, _frame: _async_value({"x": 2.0, "y": 3.0}))
+    monkeypatch.setattr(cf, "_frame_origin", lambda _sid, _frame, _tree: _async_value(None))
+    assert await cf._find_checkbox("sid") is None
+
+
+async def _async_value(value: Any) -> Any:
+    return value
+
+
+@pytest.mark.asyncio
 async def test_cf_cookies_scoped_to_host() -> None:
     class FakeEngine:
         async def call(self, method: str, params: dict[str, Any], session_id: str | None = None) -> Any:

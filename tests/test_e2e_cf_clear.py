@@ -4,12 +4,10 @@ Target: https://nopecha.com/demo/cloudflare (curl gets 403 + Just a
 moment, so the challenge is real). Requires the sidecar + Camoufox
 runtime; skipped otherwise — same gate as test_e2e_mirage.py.
 
-Live-observed behaviour (2026-09-15, screencast + a11y verified): CF
-serves an interactive Turnstile and ROTATES the Ray ID on clicks from
-this engine instead of advancing — i.e. the honest outcome here is
-``cleared: false`` with ``method: refused`` and a new rayId. The test
-pins that contract (no false ``cleared: true``) rather than a bypass
-CF does not grant.
+Bounded live behaviour is environment-dependent: Cloudflare may grant
+clearance, refuse the native attempt, or leave the challenge until the
+bounded timeout. The test asserts only the neutral result contract and
+never treats refusal as a deterministic server behaviour.
 """
 
 from __future__ import annotations
@@ -25,8 +23,7 @@ from pytest_asyncio import fixture as async_fixture
 from kahin import _state as state
 from kahin.the_twins import mirage as mirage_mod
 from kahin.tools import cf_clear_mirage as cf
-from kahin.tools import pilot
-from kahin.tools import trainman_mirage
+from kahin.tools import pilot, trainman_mirage
 
 
 def _real_available() -> bool:
@@ -48,7 +45,7 @@ def _loads(text: str) -> Any:
 
 
 @async_fixture
-async def mirage_tools() -> AsyncGenerator[None, None]:
+async def mirage_tools() -> AsyncGenerator[None]:
     resp = _loads(await pilot.browser_start(engine="mirage"))
     assert resp["status"] == "started", resp
     try:

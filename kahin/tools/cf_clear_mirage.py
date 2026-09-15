@@ -156,58 +156,110 @@ async def _is_blocked(session_id: str) -> str | None:
 
 
 def _iter_frame_entries(frame_tree: Any) -> Any:
-    """Yield ``(frame_id, url)`` pairs from a ``Page.getFrameTree`` payload."""
-    stack = [frame_tree]
+    """Yield ``(frame_id, url)`` pairs from a frame tree."""
+    for frame_id, _parent_id, url in _iter_frame_nodes(frame_tree):
+        yield frame_id, url
+
+
+def _iter_frame_nodes(frame_tree: Any) -> Any:
+    """Yield ``(frame_id, parent_id, url)`` entries from a frame tree."""
+    stack = [(frame_tree, None)]
     while stack:
-        node = stack.pop()
+        node, parent_id = stack.pop()
         if not isinstance(node, dict):
             continue
         frame = node.get("frame")
+        actual_parent = parent_id
         if isinstance(frame, dict):
-            yield frame.get("id"), str(frame.get("url") or "")
+            frame_id = frame.get("id")
+            actual_parent = frame.get("parentId") or parent_id
+            yield frame_id, actual_parent, str(frame.get("url") or "")
         children = node.get("childFrames")
         if isinstance(children, list):
-            stack.extend(children)
+            stack.extend(
+                (child, frame.get("id") if isinstance(frame, dict) else actual_parent)
+                for child in children
+            )
+
+
+async def _frame_tree(session_id: str) -> dict[str, Any] | None:
+    """Return the live frame tree, or None when unavailable."""
+    try:
+        tree = await _mirage_engine().call("Page.getFrameTree", session_id=session_id)
+    except Exception:  # noqa: BLE001
+        return None
+    frame_tree = tree.get("frameTree") if isinstance(tree, dict) else None
+    return frame_tree if isinstance(frame_tree, dict) else None
+
+
+async def _frame_origin(session_id: str, frame_id: str, frame_tree: dict[str, Any]) -> dict[str, float] | None:
+    """Resolve a frame origin through its actual parent iframe relation."""
+    parents: dict[str, str | None] = {}
+    for candidate_id, parent_id, _url in _iter_frame_nodes(frame_tree):
+        if isinstance(candidate_id, str) and candidate_id:
+            parents[candidate_id] = parent_id if isinstance(parent_id, str) else None
+
+    async def resolve(current_id: str, seen: set[str]) -> dict[str, float] | None:
+        if current_id in seen:
+            return None
+        seen.add(current_id)
+        parent_id = parents.get(current_id)
+        if not parent_id:
+            return {"x": 0.0, "y": 0.0}
+        marker = f"__kahin_cf_frame_{current_id}"
+        marker_json = orjson.dumps(marker).decode()
+        old_name = await _eval_value(
+            f"(() => {{ const old = window.name; window.name = {marker_json}; return old; }})()",
+            session_id, frame_id=current_id,
+        )
+        if not isinstance(old_name, str):
+            return None
+        try:
+            local = await _eval_value(
+                "(() => { for (const el of document.querySelectorAll('iframe')) {"
+                f" try {{ if (el.contentWindow && el.contentWindow.name === {marker_json}) {{"
+                " const r = el.getBoundingClientRect(); return {x:r.x, y:r.y}; } } catch (_) {}"
+                " } return null; })()",
+                session_id, frame_id=parent_id,
+            )
+        finally:
+            await _eval_value(f"window.name = {orjson.dumps(old_name).decode()}", session_id, frame_id=current_id)
+        if not isinstance(local, dict):
+            return None
+        try:
+            local_x, local_y = float(local.get("x") or 0), float(local.get("y") or 0)
+        except (TypeError, ValueError):
+            return None
+        ancestor = await resolve(parent_id, seen)
+        if ancestor is None:
+            return None
+        return {"x": ancestor["x"] + local_x, "y": ancestor["y"] + local_y}
+
+    return await resolve(frame_id, set())
 
 
 async def _cf_frame_ids(session_id: str) -> list[str]:
-    """Frame ids whose URL serves the Turnstile challenge, or []."""
-    engine = _mirage_engine()
-    try:
-        tree = await engine.call("Page.getFrameTree", session_id=session_id)
-    except Exception:  # noqa: BLE001 - no frame tree means no click target
-        return []
-    frame_tree = tree.get("frameTree") if isinstance(tree, dict) else None
-    if not isinstance(frame_tree, dict):
+    """Frame ids for challenge frames, retaining URL-less candidates."""
+    frame_tree = await _frame_tree(session_id)
+    if frame_tree is None:
         return []
     return [
-        frame_id
-        for frame_id, url in _iter_frame_entries(frame_tree)
-        if isinstance(frame_id, str) and frame_id and _CF_FRAME_MARKER in url
+        frame_id for frame_id, parent_id, url in _iter_frame_nodes(frame_tree)
+        if isinstance(frame_id, str) and frame_id and parent_id
+        and (_CF_FRAME_MARKER in url or not url)
     ]
 
 
 async def _checkbox_in_frame(session_id: str, frame_id: str) -> dict[str, float] | None:
-    """In-frame checkbox centre (frame-viewport coords), or None.
-
-    Click gate lives here in Python (not in JS) for testability: skip when
-    the checkbox is missing, has no width, or is already checked — verbatim
-    mirror of cf_bypasser/core/bypasser.py:175.
-    """
-    raw = await _mirage_eval_result(
-        f"({ _FIND_CHECKBOX_JS })()", frame_id, session_id=session_id,
-    )
-    if isinstance(raw, str) or not isinstance(raw, dict):
-        return None
-    if raw.get("exceptionDetails"):
+    """In-frame checkbox centre (frame-viewport coords), or None."""
+    raw = await _mirage_eval_result(f"({_FIND_CHECKBOX_JS})()", frame_id, session_id=session_id)
+    if isinstance(raw, str) or not isinstance(raw, dict) or raw.get("exceptionDetails"):
         return None
     info = (raw.get("result") or {}).get("value")
     if not isinstance(info, dict) or not info.get("found"):
         return None
     try:
-        w = float(info.get("w") or 0)
-        x = float(info.get("x") or 0)
-        y = float(info.get("y") or 0)
+        w, x, y = float(info.get("w") or 0), float(info.get("x") or 0), float(info.get("y") or 0)
     except (TypeError, ValueError):
         return None
     if w <= 0 or info.get("checked"):
@@ -216,31 +268,22 @@ async def _checkbox_in_frame(session_id: str, frame_id: str) -> dict[str, float]
 
 
 async def _find_checkbox(session_id: str) -> tuple[str, dict[str, float]] | None:
-    """First clickable Turnstile checkbox: ``(frame_id, page coords)``.
-
-    The in-frame centre becomes page coordinates via the hosting
-    ``<iframe>`` element's bounding-box origin (cf_bypasser:177-182 — the
-    frame's own JS world has no ``window.frameElement`` back-reference, so
-    the page measures the frame element instead).
-    """
-    for frame_id in await _cf_frame_ids(session_id):
+    """Find a checkbox and map coordinates through its selected frame relation."""
+    frame_tree = await _frame_tree(session_id)
+    if frame_tree is None:
+        return None
+    for frame_id, parent_id, url in _iter_frame_nodes(frame_tree):
+        if not (isinstance(frame_id, str) and frame_id and parent_id):
+            continue
+        if _CF_FRAME_MARKER not in url and url:
+            continue
         box = await _checkbox_in_frame(session_id, frame_id)
         if box is None:
             continue
-        origin = await _eval_value(
-            "(el => { if(!el) return null;"
-            " const r = el.getBoundingClientRect();"
-            " return {x:r.x, y:r.y}; })"
-            f"(document.querySelector('iframe[src*=\"{_CF_FRAME_MARKER}\"]'))",
-            session_id,
-        )
-        if not isinstance(origin, dict):
+        origin = await _frame_origin(session_id, frame_id, frame_tree)
+        if origin is None:
             continue
-        try:
-            ox, oy = float(origin.get("x") or 0), float(origin.get("y") or 0)
-        except (TypeError, ValueError):
-            continue
-        return frame_id, {"x": ox + box["x"], "y": oy + box["y"]}
+        return frame_id, {"x": origin["x"] + box["x"], "y": origin["y"] + box["y"]}
     return None
 
 
@@ -255,25 +298,15 @@ async def _click_at(session_id: str, x: float, y: float) -> bool:
 
 async def _verify_checkbox(session_id: str, frame_id: str) -> bool:
     """Re-evaluate after click: success = checkbox gone or checked."""
-    raw = await _mirage_eval_result(
-        f"({ _FIND_CHECKBOX_JS })()", frame_id, session_id=session_id,
-    )
-    if isinstance(raw, str) or not isinstance(raw, dict):
-        return False
-    if raw.get("exceptionDetails"):
+    raw = await _mirage_eval_result(f"({_FIND_CHECKBOX_JS})()", frame_id, session_id=session_id)
+    if isinstance(raw, str) or not isinstance(raw, dict) or raw.get("exceptionDetails"):
         return False
     info = (raw.get("result") or {}).get("value")
-    if not isinstance(info, dict):
-        return False
-    return (not info.get("found")) or bool(info.get("checked"))
+    return isinstance(info, dict) and ((not info.get("found")) or bool(info.get("checked")))
 
 
 async def _click_turnstile(session_id: str) -> tuple[bool, bool]:
-    """Find the Turnstile checkbox via frame filter + shadow walk and click
-    it natively. Returns ``(dispatched, verified)``: dispatched is True once
-    the native press/release dispatches, verified reflects the post-click
-    re-eval (checkbox gone or checked).
-    """
+    """Find and natively click the first actionable Turnstile checkbox."""
     found = await _find_checkbox(session_id)
     if found is None:
         return False, False
@@ -399,8 +432,9 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
             and await _is_bypassed(session_id)
         ):
             cf = await _cf_cookies(session_id, host)
-            return _dump({"cleared": True, "method": "none", "url": url,
-                          "cfCookies": sorted(cf), "elapsedMs": elapsed_ms()})
+            if "cf_clearance" in cf:
+                return _dump({"cleared": True, "method": "none", "url": url,
+                              "cfCookies": sorted(cf), "elapsedMs": elapsed_ms()})
 
         blocked = await _is_blocked(session_id)
         if blocked is not None:

@@ -458,6 +458,12 @@ olmalı veya `kahin_mirage_click(selector="input[type=file]")` ile eşzamanlı
 - `kahin_mirage_screencast_stop`, `kahin_mirage_screencast_pending`
 - `kahin_mirage_watch_start`, `kahin_mirage_watch_stop`
 
+Screencast frame'leri FIFO sırada tutulur; `fresh=true` bekleyen frame'leri
+atıp yeni frame bekler. Tüketilen her frame doğru `screencastId` ile ACK'lenir;
+ACK akışı durursa Camoufox tek frame uçuş penceresinde stream'i durdurur.
+Live watch aynı akıştan localhost MJPEG sunar: `/` sürekli multipart stream,
+`/snapshot.jpg` son JPEG frame'inin tekil kopyasıdır. Watch yalnızca aktif
+screencast'ı gözlemler; kendisi başlatmaz/durdurmaz.
 ### Accessibility ve engine (3)
 
 - `kahin_mirage_accessibility_tree`

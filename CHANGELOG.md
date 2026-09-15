@@ -2,10 +2,9 @@
 
 ## Unreleased
 
-- feat(cf): add embedded Cloudflare solver `kahin_cf_clear` + `kahin_cf_status` (same-session navigate/wait/human-like Turnstile click, page-truth verification)
-- fix(cf): scope cf_ cookies to target host; profile jar matches from other sites no longer count as clearance
-- fix(cf): drop unreachable iframe-URL/closed-shadow checkbox lookup; mount-div anchor + ~19px checkbox offset (live-verified at 3 viewports)
-- feat(cf): refuse-path — Ray-ID rotation after clicks returns `cleared:false`/`method:refused` with evidence instead of false success
+- feat(cf): rewrite `kahin_cf_clear` around the TR trust contract: frame-anchored native press/release, FakeShadowRoot-style shadow walk, 5 attempts with jittered 3s retries, and title-gate plus host-scoped `cf_clearance` evidence
+- feat(watch): add localhost-only `kahin_mirage_watch_start` / `kahin_mirage_watch_stop` MJPEG live watch fed by the existing screencast pump; manual frame calls may race the watch pump
+- verify(live): real nopecha Cloudflare attempt returned `cleared:false`, `method:timeout`, `clicks:0`; live watch `/snapshot.jpg` returned JPEG `ffd8ff`, and three screencast frames were ACKed with pending `0`
 
 ## [0.3.10] — 2026-08-09
 

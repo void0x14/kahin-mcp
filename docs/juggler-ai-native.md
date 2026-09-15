@@ -250,16 +250,23 @@ birlikte gözlemler; 403/429/503 yanıtlarında `httpStatus` ve varsa
 çalıştırmamalıdır.
 
 `kahin_cf_clear` / `kahin_cf_status` bu sözleşmenin gömülü tamamlayıcısıdır:
-aynı oturumda navigate + bekle + insansı Turnstile tıklaması + sayfa-tabanlı
-doğrulama yapar. Canlı-doğrulanmış sınırlar (screencast + a11y + modlens,
-2026-09-15): Turnstile iframe'i `getFrameTree`'de BOŞ url taşır ve kapalı
-shadow-root arkasındadır — URL filtresi ve in-iframe checkbox JS'i onu asla
-bulamaz; tek ölçülebilir çapa `cf-turnstile-response` input'unu taşıyan
-mount div'dir, checkbox mount-sol + ~19px'dedir. `Browser.getCookies` tüm
-profil jar'ını döndürür; `cf_clearance` ancak hedef host'a aitse anlamlıdır.
-`cleared:true` yalnızca interstitial başlığı gittiğinde raporlanır; CF
-tıklamaları reddederse (Ray-ID rotasyonu) sonuç `cleared:false` +
-`method:refused` ve kanıtla döner. Dış browser, cookie cache, replay yok.
+aynı oturumda navigate + settle + native Turnstile tıklaması + sayfa-tabanlı
+verifikasyon yapar. Checkbox araması yalnızca URL'sinde
+`challenges.cloudflare` bulunan frame'lerde yürütülür; `fakeShadowRoot ||
+shadowRoot` ağacı içindeki gerçek checkbox merkezi bulunur ve frame-element
+kökenine eklenerek sayfa koordinatına çevrilir. Tıklama yalnızca görünür,
+unchecked checkbox için gerçek native press/release olaylarıyla yapılır; her
+hamleden sonra checkbox yeniden değerlendirilir (yok veya checked ise adım
+başarılıdır). En fazla 5 deneme, her biri yaklaşık 3 saniyelik ±1 saniye
+jitter'lı beklemeyle ve ilk probe öncesi 5 saniyelik settle ile sınırlıdır.
+`cf_clearance` hedef host'a ait cookie ve sayfa bağlamındaki kanıt olarak
+raporlanır; tek başına cookie varlığı başarı değildir. `cleared:true` yalnızca
+interstitial title gate geçtiğinde ve host-scoped `cf_clearance` mevcutsa
+döner. Aksi halde `cleared:false` ile `method:timeout`/`blocked` ve
+`pause_for_human_or_authorized_provider` eylemi döner; dış browser, cookie
+cache ve replay proxy yoktur. 2026-09-15 canlı denemesinde title gate geçmedi:
+sonuç `cleared:false`, `method:timeout`, `clicks:0` oldu; bu dürüst bir
+başarısızlık kanıtıdır, Cloudflare başarısı değildir.
 
 ### 3.6 Uzun süreli crawler job sözleşmesi
 
@@ -349,7 +356,7 @@ script'i ayrıca evaluate eder. Observer sayfa tarafında bounded olduğu için
 
 ## 6. Juggler tool kataloğu (A-Z)
 
-Aşağıdaki liste Mirage'ın 104 Juggler-native tool'unun tamamıdır. `MIRAGE`
+Aşağıdaki liste Mirage'ın 106 Juggler-native tool'unun tamamıdır. `MIRAGE`
 tool'ları `engine="mirage"` aktifken kullanılır.
 
 ### DOM gözlem ve adaptif action (5)
@@ -445,16 +452,11 @@ Upload çağrısı da `Page.fileChooserOpened` bekler. Input önceden tıklanmı
 olmalı veya `kahin_mirage_click(selector="input[type=file]")` ile eşzamanlı
 çağrılmalıdır; upload tool hangi input'u kendiliğinden seçmez.
 
-### Screencast (4)
+### Screencast ve live watch (6)
 
 - `kahin_mirage_screencast_start`, `kahin_mirage_screencast_frame`
 - `kahin_mirage_screencast_stop`, `kahin_mirage_screencast_pending`
-
-`kahin_mirage_screencast_frame(fresh=true)`, önceki çağrıların ACK edilmiş
-ama henüz kuyrukta kalan frame'lerini temizler ve çağrıdan sonra gelen ilk
-frame'i bekler. Sayfa mutation'ı veya viewport değişiminden sonra görsel
-doğrulama için bu yol kullanılmalıdır; varsayılan `fresh=false` ise kuyruktaki
-en eski frame FIFO olarak döner.
+- `kahin_mirage_watch_start`, `kahin_mirage_watch_stop`
 
 ### Accessibility ve engine (3)
 
@@ -467,9 +469,8 @@ en eski frame FIFO olarak döner.
 
 `kahin_mirage_accessibility_tree(max_nodes=N)` gerçek Camoufox AX ağacını
 alır, toplam `nodeCount`'ı raporlar ve ajana en fazla `N` node döndürür.
-Sidecar'ın raw AX cevabı da bounded'dır; büyük belgelerde beklenen sonuç
-`truncated: true` olabilir. `result_too_large` veya `truncated` gördüğünüzde
-engine'in öldüğünü varsaymayın; `kahin_engine_health` ile doğrulayın ve
+Sidecar'ın raw AX cevabı da bounded'dır; büyük belgelerde beklenen
+sonuç `truncated: true` olabilir. `result_too_large` veya `truncated` gördüğünüzde
 gerekirse DOM snapshot/selector ile hedef alanı daraltın.
 
 ### Agent-native (10)

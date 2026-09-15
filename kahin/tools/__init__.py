@@ -33,6 +33,7 @@ from kahin.tools import pilot_obscura  # noqa: F401
 from kahin.tools import prophecy  # noqa: F401
 from kahin.tools import screencast_mirage  # noqa: F401
 from kahin.tools import screencast_server_mirage  # noqa: F401
+from kahin.tools import seraph  # noqa: F401
 from kahin.tools import stealth_mirage  # noqa: F401
 from kahin.tools import storage_mirage  # noqa: F401
 from kahin.tools import trainman  # noqa: F401
@@ -63,6 +64,7 @@ __all__ = [
     "prophecy",
     "screencast_mirage",
     "screencast_server_mirage",
+    "seraph",
     "stealth_mirage",
     "storage_mirage",
     "trainman",

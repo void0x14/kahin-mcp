@@ -17,11 +17,13 @@ def test_mjpeg_part_has_jpeg_multipart_headers() -> None:
 
 
 def test_watch_tools_are_registered_and_async() -> None:
+    from kahin._mcp import mcp
+
     assert inspect.iscoroutinefunction(screencast_server_mirage.mirage_watch_start)
     assert inspect.iscoroutinefunction(screencast_server_mirage.mirage_watch_stop)
-    names = {"kahin_mirage_watch_start", "kahin_mirage_watch_stop"}
-    assert "kahin_mirage_watch_start" in names
-    assert "kahin_mirage_watch_stop" in names
+    registered = mcp._tool_manager._tools
+    assert "kahin_mirage_watch_start" in registered
+    assert "kahin_mirage_watch_stop" in registered
 
 
 async def _call_watch_start() -> dict:

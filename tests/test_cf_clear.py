@@ -136,6 +136,48 @@ async def test_click_at_reports_dispatch_failure() -> None:
         assert await cf._click_at("sid", 100.0, 100.0) is False
     finally:
         cf._dispatch_mouse = real
+        cf._dispatch_mouse = real
+
+
+@pytest.mark.asyncio
+async def test_click_turnstile_reports_dispatch_and_verify_separately() -> None:
+    # clicks counts dispatched press/release pairs even when verify fails.
+    real_find = cf._find_checkbox
+    real_click = cf._click_at
+    real_verify = cf._verify_checkbox
+
+    async def fake_find(_session_id: str) -> Any:
+        return ("frame1", {"x": 10.0, "y": 20.0})
+
+    async def fake_click(_session_id: str, _x: float, _y: float) -> bool:
+        return True
+
+    async def fake_verify(_session_id: str, _frame_id: str) -> bool:
+        return False
+
+    cf._find_checkbox = fake_find  # type: ignore[assignment]
+    cf._click_at = fake_click  # type: ignore[assignment]
+    cf._verify_checkbox = fake_verify  # type: ignore[assignment]
+    try:
+        assert await cf._click_turnstile("sid") == (True, False)
+    finally:
+        cf._find_checkbox = real_find
+        cf._click_at = real_click
+        cf._verify_checkbox = real_verify
+
+
+@pytest.mark.asyncio
+async def test_click_turnstile_reports_no_dispatch_when_lookup_misses() -> None:
+    real_find = cf._find_checkbox
+
+    async def fake_find(_session_id: str) -> Any:
+        return None
+
+    cf._find_checkbox = fake_find  # type: ignore[assignment]
+    try:
+        assert await cf._click_turnstile("sid") == (False, False)
+    finally:
+        cf._find_checkbox = real_find
 
 
 def test_bypass_js_gates_on_title_and_blocks() -> None:

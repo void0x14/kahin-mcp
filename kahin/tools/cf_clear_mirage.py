@@ -268,17 +268,19 @@ async def _verify_checkbox(session_id: str, frame_id: str) -> bool:
     return (not info.get("found")) or bool(info.get("checked"))
 
 
-async def _click_turnstile(session_id: str) -> bool:
+async def _click_turnstile(session_id: str) -> tuple[bool, bool]:
     """Find the Turnstile checkbox via frame filter + shadow walk and click
-    it natively. True only when the post-click re-eval verifies success.
+    it natively. Returns ``(dispatched, verified)``: dispatched is True once
+    the native press/release dispatches, verified reflects the post-click
+    re-eval (checkbox gone or checked).
     """
     found = await _find_checkbox(session_id)
     if found is None:
-        return False
+        return False, False
     frame_id, point = found
     if not await _click_at(session_id, point["x"], point["y"]):
-        return False
-    return await _verify_checkbox(session_id, frame_id)
+        return False, False
+    return True, await _verify_checkbox(session_id, frame_id)
 
 
 async def _cf_cookies(session_id: str, host: str) -> dict[str, str]:
@@ -324,6 +326,7 @@ async def _page_cf_cookie_names(session_id: str) -> list[str]:
     return [str(n) for n in value] if isinstance(value, list) else []
 
 
+# kept for future refusal-evidence / debugging; currently unused.
 async def _ray_id(session_id: str) -> str | None:
     """CF Ray ID from page text; None when unreadable. Rotation detector."""
     value = await _eval_value(
@@ -409,9 +412,9 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
         clicks = 0
         deadline = started + budget
         # TR retry loop (cf_bypasser:232-239): up to _MAX_ATTEMPTS passes of
-        # verify -> click -> jittered retry-poll sleep. The click helper only
-        # reports success when the post-click re-eval verifies, so a passed
-        # attempt without bypass progress still consumes an attempt.
+        # verify -> click -> jittered retry-poll sleep. ``clicks`` counts
+        # dispatched native press/release pairs even when the post-click
+        # re-eval does not verify, so timeout evidence shows real attempts.
         for _ in range(_MAX_ATTEMPTS):
             # Ground truth: the interstitial title is gone. Cookies are only
             # supporting evidence (host-scoped + page-context agreement).
@@ -426,7 +429,8 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                                   "clicks": clicks, "elapsedMs": elapsed_ms()})
             if time.monotonic() >= deadline:
                 break
-            if await _click_turnstile(session_id):
+            dispatched, _verified = await _click_turnstile(session_id)
+            if dispatched:
                 clicks += 1
             await asyncio.sleep(
                 jittered_delay(_RETRY_POLL_SECONDS * 1000.0,

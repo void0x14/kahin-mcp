@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- feat(cf): add embedded Cloudflare solver `kahin_cf_clear` + `kahin_cf_status` (same-session navigate/wait/human-like Turnstile click, page-truth verification)
+- fix(cf): scope cf_ cookies to target host; profile jar matches from other sites no longer count as clearance
+- fix(cf): drop unreachable iframe-URL/closed-shadow checkbox lookup; mount-div anchor + ~19px checkbox offset (live-verified at 3 viewports)
+- feat(cf): refuse-path — Ray-ID rotation after clicks returns `cleared:false`/`method:refused` with evidence instead of false success
+
 ## [0.3.10] — 2026-08-09
 
 - fix(harness): align lifecycle tests and screenshot measure with grace-window runtime

@@ -14,6 +14,7 @@ and do not register pretend tools.
 
 from kahin.tools import agent_mirage  # noqa: F401
 from kahin.tools import accessibility_mirage  # noqa: F401
+from kahin.tools import cf_clear_mirage  # noqa: F401
 from kahin.tools import dejavu  # noqa: F401
 from kahin.tools import dejavu_mirage  # noqa: F401
 from kahin.tools import dejavu_obscura  # noqa: F401
@@ -43,6 +44,7 @@ from kahin.tools import visualization  # noqa: F401
 __all__ = [
     "agent_mirage",
     "accessibility_mirage",
+    "cf_clear_mirage",
     "crawler_mirage",
     "dejavu",
     "dejavu_mirage",

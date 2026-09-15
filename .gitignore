@@ -23,3 +23,6 @@ camoufox-harness/core/root
 .codex/
 .ffs/
 .playwright-mcp/
+
+# Local live-debug screenshots — never part of the package
+screenshots/

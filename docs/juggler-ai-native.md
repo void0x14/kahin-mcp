@@ -249,6 +249,18 @@ birlikte gözlemler; 403/429/503 yanıtlarında `httpStatus` ve varsa
 çözümü yapmaz; ajan verilen karara uymalı ve aynı origin'i körlemesine tekrar
 çalıştırmamalıdır.
 
+`kahin_cf_clear` / `kahin_cf_status` bu sözleşmenin gömülü tamamlayıcısıdır:
+aynı oturumda navigate + bekle + insansı Turnstile tıklaması + sayfa-tabanlı
+doğrulama yapar. Canlı-doğrulanmış sınırlar (screencast + a11y + modlens,
+2026-09-15): Turnstile iframe'i `getFrameTree`'de BOŞ url taşır ve kapalı
+shadow-root arkasındadır — URL filtresi ve in-iframe checkbox JS'i onu asla
+bulamaz; tek ölçülebilir çapa `cf-turnstile-response` input'unu taşıyan
+mount div'dir, checkbox mount-sol + ~19px'dedir. `Browser.getCookies` tüm
+profil jar'ını döndürür; `cf_clearance` ancak hedef host'a aitse anlamlıdır.
+`cleared:true` yalnızca interstitial başlığı gittiğinde raporlanır; CF
+tıklamaları reddederse (Ray-ID rotasyonu) sonuç `cleared:false` +
+`method:refused` ve kanıtla döner. Dış browser, cookie cache, replay yok.
+
 ### 3.6 Uzun süreli crawler job sözleşmesi
 
 Tek tek navigate çağrıları yerine uzun ve gözlenebilir bir crawl için şu ORBIT

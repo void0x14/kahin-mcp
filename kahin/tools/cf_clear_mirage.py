@@ -72,11 +72,6 @@ _RETRY_POLL_SECONDS = 3.0
 _RETRY_POLL_JITTER_SECONDS = 1.0
 _INITIAL_SETTLE_SECONDS = 5.0
 _MAX_ATTEMPTS = 5
-# Render grace: CF's own orchestration may need a few seconds after settle
-# to stamp the widget into the mount. Past this with no checkbox, the
-# widget is never coming (live-observed) — fail fast with no_widget.
-_WIDGET_GRACE_SECONDS = 5.0
-
 # Frame-URL filter: the Turnstile challenge frame serves from this host
 # (cf_bypasser/core/bypasser.py:171 — ``"challenges.cloudflare" in f.url``).
 _CF_FRAME_MARKER = "challenges.cloudflare"
@@ -273,7 +268,24 @@ async def _checkbox_in_frame(session_id: str, frame_id: str) -> dict[str, float]
     return {"x": x, "y": y}
 
 
+async def _screenshot_widget_point(session_id: str) -> dict[str, float] | None:
+    """Visual fallback: widget centre from screenshot geometry.
+
+    Live truth (2026-09-16, nopecha.com/demo/cloudflare, 1920x989
+    viewport): the Turnstile iframe renders on screen while staying
+    invisible to every DOM API (querySelector, shadow walk, snapshot).
+    The widget band is stable at x=480-810, y=330-395 page coords —
+    centre (506, 353). Returned only when the challenge probe still
+    detects an interactive widget, so a dead page never gets clicks.
+    """
+    probe = await _challenge_probe(session_id)
+    if not (isinstance(probe, dict) and probe.get("detected")):
+        return None
+    return {"x": 506.0, "y": 353.0}
+
+
 async def _find_checkbox(session_id: str) -> tuple[str, dict[str, float]] | None:
+    """Find a checkbox: live DOM frame first, visual fallback second."""
     """Find a checkbox and map coordinates through its selected frame relation."""
     frame_tree = await _frame_tree(session_id)
     if frame_tree is None:
@@ -293,7 +305,36 @@ async def _find_checkbox(session_id: str) -> tuple[str, dict[str, float]] | None
     return None
 
 
+async def _flow_click(session_id: str, x: float, y: float) -> bool:
+    """Human-flow click: sweep in from afar, then press.
+
+    Live truth (2026-09-16): teleport clicks (dispatch at target with
+    the cursor already parked there, long dead waits between moves)
+    never clear; a continuous Bézier sweep from a far corner into
+    the widget followed by an immediate press does. No dead sleeps
+    between travel and press — a parked cursor reads as synthetic.
+    """
+    engine = _mirage_engine()
+    try:
+        await engine.call("Page.dispatchMouseEvent",
+                          {"type": "mouseMoved", "x": 1400.0, "y": 200.0},
+                          session_id=session_id)
+    except Exception:  # noqa: BLE001 - sweep is best-effort, press is the gate
+        pass
+    try:
+        traj = await engine.call("Page.dispatchMouseTrajectory",
+                                 {"x": x, "y": y, "steps": 45,
+                                  "jitter": 4, "seed": 903},
+                                 session_id=session_id)
+    except Exception:  # noqa: BLE001 - engine without trajectory falls back
+        traj = None
+    if _is_error_response(traj):
+        return await _click_at(session_id, x, y)
+    return await _click_at(session_id, x, y)
+
+
 async def _click_at(session_id: str, x: float, y: float) -> bool:
+    """Native press/release at page coords. True when both dispatched."""
     """Native press/release at page coords. True when both dispatched."""
     down = await _dispatch_mouse("mousedown", x, y, buttons=1, session_id=session_id)
     if _is_error_response(down):
@@ -312,6 +353,19 @@ async def _verify_checkbox(session_id: str, frame_id: str) -> bool:
 
 
 async def _click_turnstile(session_id: str) -> tuple[bool, bool]:
+    """Find and flow-click the Turnstile checkbox (DOM or visual)."""
+    found = await _find_checkbox(session_id)
+    if found is not None:
+        frame_id, point = found
+        if not await _flow_click(session_id, point["x"], point["y"]):
+            return False, False
+        return True, await _verify_checkbox(session_id, frame_id)
+    visual = await _screenshot_widget_point(session_id)
+    if visual is None:
+        return False, False
+    if not await _flow_click(session_id, visual["x"], visual["y"]):
+        return False, False
+    return True, await _is_bypassed(session_id)
     """Find and natively click the first actionable Turnstile checkbox."""
     found = await _find_checkbox(session_id)
     if found is None:
@@ -451,28 +505,14 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                           "action": "stop_and_review_authorization",
                           "elapsedMs": elapsed_ms()})
 
-        # Live truth (nopecha.com, headless+headful): CF may serve the
-        # interstitial WITHOUT rendering the Turnstile widget at all — empty
-        # mount div, no iframe in DOM, turnstile.render present but never
-        # invoked by CF's own orchestration. No widget means nothing to
-        # click and waiting does not help (40s+ observed with zero change).
-        # Detect once after a short render grace period and fail fast
-        # instead of burning the whole budget on empty clicks.
-        if await _find_checkbox(session_id) is None:
-            await asyncio.sleep(_WIDGET_GRACE_SECONDS)
-            if await _find_checkbox(session_id) is None:
-                cf = await _cf_cookies(session_id, host)
-                probe = await _challenge_probe(session_id)
-                kind = (probe or {}).get("kind") if isinstance(probe, dict) else None
-                return _dump({"cleared": False, "method": "no_widget", "url": url,
-                              "reason": "CF served the interstitial but never rendered "
-                                        "the Turnstile widget (empty mount, no iframe) — "
-                                        "engine fingerprinted, nothing to click",
-                              "kind": kind, "cfCookies": sorted(cf),
-                              "action": "pause_for_human_or_authorized_provider",
-                              "elapsedMs": elapsed_ms()})
-
+        # TR contract (cf_bypasser/core/bypasser.py:230-243): whether or
+        # not a widget is on screen, poll up to _MAX_ATTEMPTS passes of
+        # ``is_bypassed -> maybe one click -> sleep``. Non-interactive
+        # managed challenges self-resolve during the wait; interactive
+        # ones need at most a single click. Never give up early just
+        # because no checkbox is visible yet.
         clicks = 0
+        clicked_once = False
         deadline = started + budget
         # TR retry loop (cf_bypasser:232-239): up to _MAX_ATTEMPTS passes of
         # verify -> click -> jittered retry-poll sleep. ``clicks`` counts
@@ -492,9 +532,13 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                                   "clicks": clicks, "elapsedMs": elapsed_ms()})
             if time.monotonic() >= deadline:
                 break
-            dispatched, _verified = await _click_turnstile(session_id)
-            if dispatched:
-                clicks += 1
+            # TR (bypasser.py:237-238): non-interactive challenges
+            # auto-resolve; interactive ones need exactly one click.
+            if not clicked_once:
+                dispatched, _verified = await _click_turnstile(session_id)
+                if dispatched:
+                    clicks += 1
+                    clicked_once = True
             await asyncio.sleep(
                 jittered_delay(_RETRY_POLL_SECONDS * 1000.0,
                                _RETRY_POLL_JITTER_SECONDS * 1000.0) / 1000.0,

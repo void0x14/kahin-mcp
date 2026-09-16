@@ -95,9 +95,23 @@ def score_checks(checks: list[dict[str, Any]]) -> dict[str, Any]:
 #   uses browser-level addBinding/setInitScripts, not allowMainWorld).
 def launch_policy(headless: bool = True) -> dict[str, Any]:
     """The fixed Camoufox launch policy bound on every Mirage start."""
+    import os as _os
+
+    # Experimental CF gate: KAHIN_HUMANIZE=1 enables Camoufox cursor
+    # humanization for bot-gated targets. Scoped opt-in only — the global
+    # default stays False (browser-side trajectory wedged input, 0.3.10).
+    humanize: bool | float = False
+    raw = _os.environ.get("KAHIN_HUMANIZE", "").strip().lower()
+    if raw in {"1", "true", "yes"}:
+        humanize = True
+    elif raw:
+        try:
+            humanize = max(0.5, min(5.0, float(raw)))
+        except ValueError:
+            humanize = False
     return {
         "headless": bool(headless),
-        "humanize": False,
+        "humanize": humanize,
         "enable_cache": True,
         "block_webgl": False,
         "main_world_eval": False,

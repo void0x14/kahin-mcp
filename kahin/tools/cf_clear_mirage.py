@@ -503,6 +503,22 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
         cf = await _cf_cookies(session_id, host)
         probe = await _challenge_probe(session_id)
         kind = (probe or {}).get("kind") if isinstance(probe, dict) else None
+        # Live truth (Chromium control, 2026-09-16): CF can issue a
+        # host-scoped cf_clearance yet keep serving the interstitial —
+        # clearance written, page never opens, reload does not help.
+        # That cookie is dead weight, not progress: retrying clicks
+        # against it is wasted work. Report it as its own terminal
+        # diagnosis so callers stop instead of looping.
+        if "cf_clearance" in cf:
+            return _dump({"cleared": False, "method": "stale_clearance",
+                          "url": url,
+                          "reason": "host-scoped cf_clearance present but the "
+                                    "interstitial still serves — CF voided the "
+                                    "token, further clicks will not revive it",
+                          "kind": kind, "cfCookies": sorted(cf),
+                          "clicks": clicks,
+                          "action": "pause_for_human_or_authorized_provider",
+                          "elapsedMs": elapsed_ms()})
         return _dump({"cleared": False, "method": "timeout", "url": url,
                       "kind": kind, "cfCookies": sorted(cf), "clicks": clicks,
                       "action": "pause_for_human_or_authorized_provider",

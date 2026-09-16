@@ -238,6 +238,35 @@ async def test_no_widget_fails_fast_without_clicks(monkeypatch: pytest.MonkeyPat
     assert result["action"] == "pause_for_human_or_authorized_provider"
 
 
+@pytest.mark.asyncio
+async def test_stale_clearance_terminal_diagnosis(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeEngine:
+        async def call(self, method: str, params: dict[str, Any], session_id: str | None = None) -> Any:
+            assert method == "Page.navigate"
+            return {"frameId": "main"}
+
+    async def fake_click(_sid: str) -> tuple[bool, bool]:
+        return True, False
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
+    monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
+    monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value({"detected": True, "kind": "turnstile"}))
+    monkeypatch.setattr(cf, "_is_bypassed", lambda _sid: _async_value(False))
+    monkeypatch.setattr(cf, "_is_blocked", lambda _sid: _async_value(None))
+    monkeypatch.setattr(cf, "_find_checkbox", lambda _sid: _async_value({"x": 10.0, "y": 10.0}))
+    monkeypatch.setattr(cf, "_click_turnstile", fake_click)
+    monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value({"cf_clearance": "dead-token"}))
+    monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
+    result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
+    assert result["cleared"] is False
+    assert result["method"] == "stale_clearance"
+    assert result["clicks"] >= 1
+    assert result["action"] == "pause_for_human_or_authorized_provider"
+
+
 async def _session() -> tuple[str, None]:
     return "sid", None
 

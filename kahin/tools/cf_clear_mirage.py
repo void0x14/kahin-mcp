@@ -269,6 +269,68 @@ async def _checkbox_in_frame(session_id: str, frame_id: str) -> dict[str, float]
 
 
 async def _screenshot_widget_point(session_id: str) -> dict[str, float] | None:
+    """Visual fallback: locate the widget on screen, no hardcoded coords.
+
+    Live truth (2026-09-16): the Turnstile iframe can render while
+    staying invisible to every DOM API (querySelector, shadow walk,
+    snapshot). Strategy: screenshot -> find the widget band by its
+    stable visual signature (dark rounded rect on light challenge
+    page, ~300x65 at the content column) -> map screenshot pixels
+    to page coords via the viewport scale. Probe-gated so a dead
+    page never gets clicks.
+    """
+    probe = await _challenge_probe(session_id)
+    if not (isinstance(probe, dict) and probe.get("detected")):
+        return None
+    engine = _mirage_engine()
+    try:
+        shot = await engine.call("Page.captureScreenshot",
+                                 {"format": "png"}, session_id=session_id)
+    except Exception:  # noqa: BLE001
+        return None
+    data = (shot.get("data") if isinstance(shot, dict) else None) if not _is_error_response(shot) else None
+    if not isinstance(data, str) or not data:
+        return None
+    import base64 as _b64
+    import io as _io
+    try:
+        from PIL import Image as _Image
+    except ImportError:
+        return None
+    try:
+        img = _Image.open(_io.BytesIO(_b64.b64decode(data))).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return None
+    sw, sh = img.size
+    vp = await _eval_value(
+        "({w: window.innerWidth, h: window.innerHeight})", session_id)
+    if not isinstance(vp, dict):
+        return None
+    try:
+        vw, vh = float(vp.get("w") or 0), float(vp.get("h") or 0)
+    except (TypeError, ValueError):
+        return None
+    if vw <= 0 or vh <= 0:
+        return None
+    sx, sy = sw / vw, sh / vh
+    px = img.load()
+    best: dict[str, float] | None = None
+    best_score = 0
+    step = max(4, sw // 480)
+    y0, y1 = int(sh * 0.25), int(sh * 0.6)
+    for yy in range(y0, y1, step):
+        run = 0
+        for xx in range(0, sw, step):
+            r, g, b = px[xx, yy][:3]
+            dark = (r < 90 and g < 90 and b < 90)
+            run = run + step if dark else 0
+            if run >= 200:
+                score = run
+                if score > best_score:
+                    best_score = score
+                    best = {"x": (xx - run / 2) / sx + 40.0 / sx,
+                            "y": yy / sy}
+    return best
     """Visual fallback: widget centre from screenshot geometry.
 
     Live truth (2026-09-16, nopecha.com/demo/cloudflare, 1920x989

@@ -631,6 +631,59 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                       "elapsedMs": elapsed_ms()})
 
 
+@mcp.tool(name="kahin_cf_probe_many", annotations=_RO)
+async def cf_probe_many(sites_file: str = "/tmp/cf_sites.txt") -> str:
+    """Probe many URLs for CF challenge presence (read-only sweep).
+
+    Navigates each URL, waits for settle, records title + challenge
+    probe + cookie state. Never clicks. Returns per-site rows plus
+    a summary: how many serve a CF challenge at all (the denominator
+    any bypass claim must be judged against).
+    """
+    import pathlib as _pl
+    try:
+        urls = [l.strip() for l in _pl.Path(sites_file).read_text().splitlines()]
+    except Exception as exc:  # noqa: BLE001
+        return _json_error("kahin_cf_probe_many", f"cannot read sites file: {exc}",
+                           "io_error", field="sites_file")
+    urls = [u for u in urls if u.startswith("http")]
+    async with _healer_ref.safe("kahin_cf_probe_many", count=len(urls)):
+        session_id, error = await _capture_page_session("kahin_cf_probe_many")
+        if error:
+            return error
+        assert session_id is not None
+        engine = _mirage_engine()
+        rows: list[dict[str, Any]] = []
+        for url in urls:
+            from urllib.parse import urlparse as _up
+            host = (_up(url).hostname or "").lower()
+            row: dict[str, Any] = {"url": url}
+            try:
+                await engine.call("Page.navigate", {"url": url}, session_id=session_id)
+            except Exception as exc:  # noqa: BLE001
+                row["error"] = f"nav: {exc}"
+                rows.append(row)
+                continue
+            await asyncio.sleep(6.0)
+            try:
+                probe = await _challenge_probe(session_id)
+                title = await _eval_value("document.title", session_id)
+                cf = await _cf_cookies(session_id, host)
+                row["title"] = str(title)[:60] if isinstance(title, str) else None
+                row["challenge"] = (probe or {}).get("kind") if isinstance(probe, dict) else None
+                row["detected"] = bool((probe or {}).get("detected")) if isinstance(probe, dict) else None
+                row["cf"] = sorted(cf)
+            except Exception as exc:  # noqa: BLE001
+                row["error"] = f"probe: {exc}"
+            rows.append(row)
+        challenged = [r for r in rows if r.get("detected")]
+        return _dump({"total": len(rows),
+                      "challenged": len(challenged),
+                      "unchallenged": len(rows) - len(challenged),
+                      "challenge_rows": challenged,
+                      "rows": rows})
+
+
 @mcp.tool(name="kahin_cf_status", annotations=_RO)
 async def cf_status() -> str:
     """Report Cloudflare clearance state of the current page (read-only).

@@ -20,11 +20,13 @@ delay — the reference passes without humanization), re-eval after click where
 success = checkbox not found or checked, up to 5 attempts with jittered 3s
 poll sleeps after a 5s post-navigation settle.
 
-Ground truth for ``cleared`` is the page itself (title gate) plus
-host-scoped ``cf_clearance`` presence as supporting evidence — never cookie
-presence alone (``Browser.getCookies`` returns the WHOLE persistent profile,
-so a cookie match is only meaningful when its domain covers the target host
-AND ``document.cookie`` agrees).
+Ground truth for ``cleared`` is the page itself (title gate + challenge
+probe) plus host-scoped ``cf_clearance`` presence as supporting evidence —
+never cookie presence alone (``Browser.getCookies`` returns the WHOLE
+persistent profile, so a cookie match is only meaningful when its domain
+covers the target host). ``cf_clearance`` is httpOnly, so it is never
+visible in ``document.cookie``; page-context ``cf_`` names are reported as
+non-httpOnly supporting evidence only and are never part of the gate.
 
 Unsolvable states (block page, third-party image/audio CAPTCHA, CF refusing
 clicks, timeout) return ``cleared: false`` with evidence and the same
@@ -70,6 +72,10 @@ _RETRY_POLL_SECONDS = 3.0
 _RETRY_POLL_JITTER_SECONDS = 1.0
 _INITIAL_SETTLE_SECONDS = 5.0
 _MAX_ATTEMPTS = 5
+# Render grace: CF's own orchestration may need a few seconds after settle
+# to stamp the widget into the mount. Past this with no checkbox, the
+# widget is never coming (live-observed) — fail fast with no_widget.
+_WIDGET_GRACE_SECONDS = 5.0
 
 # Frame-URL filter: the Turnstile challenge frame serves from this host
 # (cf_bypasser/core/bypasser.py:171 — ``"challenges.cloudflare" in f.url``).
@@ -322,8 +328,10 @@ async def _cf_cookies(session_id: str, host: str) -> dict[str, str]:
     ``Browser.getCookies`` returns the whole persistent profile (every
     site's httpOnly cookies included), so an unscoped match proves nothing.
     A cookie counts only when its domain covers ``host`` — and even then it
-    is supporting evidence, not clearance: page context (``document.cookie``)
-    must agree and the title gate must pass.
+    is supporting evidence, not clearance: the title gate + challenge probe
+    must pass. ``cf_clearance`` is httpOnly, so it is never visible in
+    ``document.cookie``; page-context ``cf_`` names are reported as
+    non-httpOnly supporting evidence only and are never part of the gate.
     """
     engine = _mirage_engine()
     try:
@@ -442,6 +450,27 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                           "reason": f"block page ({blocked}) — IP/ASN decision, nothing to click",
                           "action": "stop_and_review_authorization",
                           "elapsedMs": elapsed_ms()})
+
+        # Live truth (nopecha.com, headless+headful): CF may serve the
+        # interstitial WITHOUT rendering the Turnstile widget at all — empty
+        # mount div, no iframe in DOM, turnstile.render present but never
+        # invoked by CF's own orchestration. No widget means nothing to
+        # click and waiting does not help (40s+ observed with zero change).
+        # Detect once after a short render grace period and fail fast
+        # instead of burning the whole budget on empty clicks.
+        if await _find_checkbox(session_id) is None:
+            await asyncio.sleep(_WIDGET_GRACE_SECONDS)
+            if await _find_checkbox(session_id) is None:
+                cf = await _cf_cookies(session_id, host)
+                probe = await _challenge_probe(session_id)
+                kind = (probe or {}).get("kind") if isinstance(probe, dict) else None
+                return _dump({"cleared": False, "method": "no_widget", "url": url,
+                              "reason": "CF served the interstitial but never rendered "
+                                        "the Turnstile widget (empty mount, no iframe) — "
+                                        "engine fingerprinted, nothing to click",
+                              "kind": kind, "cfCookies": sorted(cf),
+                              "action": "pause_for_human_or_authorized_provider",
+                              "elapsedMs": elapsed_ms()})
 
         clicks = 0
         deadline = started + budget

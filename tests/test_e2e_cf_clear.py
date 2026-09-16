@@ -63,7 +63,7 @@ async def test_cf_clear_live_protected_page(mirage_tools: None) -> None:
     assert state._current_engine is not None
     resp = _loads(await cf.cf_clear(url="https://nopecha.com/demo/cloudflare", timeout=90))
     assert resp.get("url") == "https://nopecha.com/demo/cloudflare", resp
-    assert resp.get("method") in {"none", "auto", "click", "blocked", "refused", "timeout"}, resp
+    assert resp.get("method") in {"none", "auto", "click", "blocked", "refused", "timeout", "no_widget"}, resp
     if resp.get("cleared") is True:
         # Bypass granted: the page itself must be open (title gate), and
         # any claimed clearance must be host-scoped, not the profile jar.
@@ -72,6 +72,6 @@ async def test_cf_clear_live_protected_page(mirage_tools: None) -> None:
     else:
         # Refused/timeout: evidence + human-handoff contract, never a
         # silent pass and never a bare failure.
-        assert resp.get("method") in {"blocked", "refused", "timeout"}, resp
+        assert resp.get("method") in {"blocked", "refused", "timeout", "no_widget"}, resp
         assert "action" in resp, resp
         assert resp.get("elapsedMs", 0) > 0, resp

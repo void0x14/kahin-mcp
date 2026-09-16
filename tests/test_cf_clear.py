@@ -205,10 +205,37 @@ async def test_fast_path_requires_host_scoped_clearance(monkeypatch: pytest.Monk
     monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value(_ready()))
     monkeypatch.setattr(cf, "_is_bypassed", lambda _sid: _true())
     monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value(_cookies_without_clearance()))
+    monkeypatch.setattr(cf, "_find_checkbox", lambda _sid: _async_value({"x": 10.0, "y": 10.0}))
+    monkeypatch.setattr(cf, "_click_turnstile", fake_click)
     monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
     result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
     assert result["cleared"] is False
     assert result["method"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_no_widget_fails_fast_without_clicks(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeEngine:
+        async def call(self, method: str, params: dict[str, Any], session_id: str | None = None) -> Any:
+            assert method == "Page.navigate"
+            return {"frameId": "main"}
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
+    monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
+    monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value({"detected": True, "kind": "turnstile"}))
+    monkeypatch.setattr(cf, "_is_bypassed", lambda _sid: _async_value(False))
+    monkeypatch.setattr(cf, "_is_blocked", lambda _sid: _async_value(None))
+    monkeypatch.setattr(cf, "_find_checkbox", lambda _sid: _async_value(None))
+    monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value({}))
+    monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
+    result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
+    assert result["cleared"] is False
+    assert result["method"] == "no_widget"
+    assert "clicks" not in result
+    assert result["action"] == "pause_for_human_or_authorized_provider"
 
 
 async def _session() -> tuple[str, None]:
@@ -225,6 +252,36 @@ def _ready() -> dict[str, Any]:
 
 def _cookies_without_clearance() -> dict[str, str]:
     return {"__cf_bm": "supporting-only"}
+
+
+def _cookies_with_clearance() -> dict[str, str]:
+    # cf_clearance is httpOnly: never visible in document.cookie, so the
+    # page-name list stays empty while the host-scoped jar carries it.
+    return {"cf_clearance": "ours", "__cf_bm": "x"}
+
+
+@pytest.mark.asyncio
+async def test_fast_path_clears_with_host_clearance_and_empty_page_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        async def call(self, method: str, params: dict[str, Any], session_id: str | None = None) -> Any:
+            assert method == "Page.navigate"
+            return {"frameId": "main"}
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
+    monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
+    monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value(_ready()))
+    monkeypatch.setattr(cf, "_is_bypassed", lambda _sid: _true())
+    monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value(_cookies_with_clearance()))
+    monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
+    result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
+    assert result["cleared"] is True
+    assert result["method"] == "none"
+    assert "cf_clearance" in result["cfCookies"]
 
 
 @pytest.mark.asyncio

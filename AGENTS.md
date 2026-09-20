@@ -66,7 +66,7 @@ kahin_pattern_query(context="doggystyle")
 kahin_pattern_suggest(partial="navig")
 ```
 
-## Tool Listesi (149 adet)
+## Tool Listesi (155 adet)
 
 Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 [docs/juggler-ai-native.md](docs/juggler-ai-native.md)
@@ -89,7 +89,7 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_error_decode` | CDP hata kodunu çözümle, alternatif öner |
 | `kahin_get_dependencies` | Komutun ön koşullarını göster |
 
-### PILOT — Browser Kontrol (8)
+### PILOT — Browser Kontrol (9)
 | Tool | Ne işe yarar? |
 |------|---------------|
 | `kahin_browser_start` | Varsayılan Camoufox/Mirage browser motorunu başlat (Shadow açıkça seçilebilir) |
@@ -100,6 +100,7 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_screenshot` | Ekran görüntüsü al (base64 PNG) |
 | `kahin_evaluate` | JavaScript çalıştır |
 | `kahin_execute_cdp` | Ham CDP komutu gönder (ileri seviye) |
+| `kahin_ocr` | Görüntüyü Google Vision TEXT_DETECTION ile oku |
 
 ### TRAINMAN — Session (4)
 | Tool | Ne işe yarar? |
@@ -126,7 +127,7 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_pattern_forget` | Pattern sil |
 | `kahin_pattern_stats` | Pattern istatistikleri |
 
-### MIRAGE — Juggler Native (104) — Camoufox varsayılandır; Shadow'dan gerektiğinde otomatik yükseltilir
+### MIRAGE — Juggler Native (106) — Camoufox varsayılandır; Shadow'dan gerektiğinde otomatik yükseltilir
 
 #### DOM Stream (5) — gerçek MutationObserver + Juggler binding
 | Tool | Ne işe yarar? |
@@ -137,7 +138,7 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_mirage_dom_action` | Snapshot'tan alınan canlı nodeId üzerinde click/hover/focus/type/scroll/select yapar |
 | `kahin_mirage_dom_stop` | Mevcut frame observer'ını durdurur; sonraki DOM çağrısı yeni streamId ile yeniden kurar, eski nodeId/cursor geçersiz olur |
 
-#### DOM (12) — hepsinde opsiyonel `frame_id` parametresi (iframe içi erişim; listeleme: `kahin_mirage_frame_tree`)
+#### DOM (13) — hepsinde opsiyonel `frame_id` parametresi (iframe içi erişim; listeleme: `kahin_mirage_frame_tree`)
 | Tool | Ne işe yarar? |
 |------|---------------|
 | `kahin_mirage_query` | CSS selector ile ilk elementi bul |
@@ -152,6 +153,7 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_mirage_get_html` | Elementin outerHTML'ini al |
 | `kahin_mirage_wait_selector` | Seçici görünene kadar bekle (timeout) |
 | `kahin_mirage_get_value` | Input elementinin değerini al |
+| `kahin_mirage_eval` | Serbest JS ifadesi çalıştır (opsiyonel frame_id; ana frame master world'de shadowRootUnl + cross-origin contentDocument okunur) |
 
 #### Reliability (9) — locator, assertion, verified input ve route araçları
 | Tool | Ne işe yarar? |
@@ -249,13 +251,15 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_mirage_set_file_chooser_intercept` | File chooser interception'ı aç/kapat (Page.setInterceptFileChooserDialog) |
 | `kahin_mirage_upload_files` | Page.fileChooserOpened bekle + Page.setFileInputFiles; input önceden/eşzamanlı tıklanmalı, absolute path zorunlu |
 
-#### Screencast (4)
+#### Screencast (4) + Watch (2)
 | Tool | Ne işe yarar? |
 |------|---------------|
 | `kahin_mirage_screencast_start` | Canlı ekran kaydı başlat (Page.startScreencast → screencastId) |
 | `kahin_mirage_screencast_frame` | Bir sonraki frame'i al (base64 JPEG) + otomatik ack; sayfa değişiminden sonra `fresh=true` ile kuyruk temizle |
 | `kahin_mirage_screencast_stop` | Kaydı durdur, kalan frame'leri temizle |
 | `kahin_mirage_screencast_pending` | Bekleyen (ack'siz) frame sayısı + stream sağlığı |
+| `kahin_mirage_watch_start` | Aktif screencast için localhost-only MJPEG watch başlat |
+| `kahin_mirage_watch_stop` | MJPEG server ve pump'u durdur (screencast çalışmaya devam eder) |
 
 #### Accessibility (1)
 | Tool | Ne işe yarar? |
@@ -291,7 +295,7 @@ Stealth CI kapısı: `KAHIN_REQUIRE_STEALTH=1` altında audit ratio ≥ 0.8 ve
 identity rotasyonu tam fingerprint özetini değiştirmek zorundadır
 (`scripts/stealth-regression.py` drift-watcher + `camoufox-harness/tests/perf/stealth-baseline.json`).
 
-### ORBIT — Long Crawler (6)
+### ORBIT — Long Crawler (7)
 
 | Tool | Ne işe yarar? |
 |------|---------------|
@@ -317,6 +321,13 @@ rate-limit kaçış yolu olarak kullanmaz.
 | Tool | Ne işe yarar? |
 |------|---------------|
 | `kahin_extension_prepare` | Gerçek WebExtension'ı güvenle stage eder ve Camoufox yerel uyumluluk raporunu döner |
+
+### CF-CLEAR — Cloudflare (2)
+
+| Tool | Ne işe yarar? |
+|------|---------------|
+| `kahin_cf_clear` | Mevcut oturumda Cloudflare challenge'ı temizle (embedded solver; interstitial title gate + host-scoped `cf_clearance` doğrular, tıklayamıyorsa `pause_for_human` döner) |
+| `kahin_cf_status` | Mevcut sayfanın Cloudflare clearance durumunu raporla (salt-okunur; gezinmez, tıklamaz) |
 
 ### Faz 4 — Performans (Zig sidecar + metrik yüzeyi)
 

@@ -2,9 +2,12 @@
 
 ## Unreleased
 
+- fix(sidecar): `Runtime.evaluate` artık gelen `executionContextId`'yi onurlandırır — `EvalFlow`'a pin'li context eklendi (`camoufox-harness/core/driver.zig`), `startEvaluate` id'yi flow'a işler (`camoufox-harness/core/ipc_main.zig`); frame-scoped evaluate main frame'e sessizce düşmez, pin'li id listede yoksa istek bekler/başarısız olur, başka frame'e kaymaz. Yeni Zig unit testi (`router: Runtime.evaluate honors an explicit executionContextId`); sidecar yeniden derlenip `camoufox-harness/vendor/bin/kahin-sidecar` yenilendi (önceki binary `/tmp/opencode/xframe-fix/kahin-sidecar.before` olarak yedeklendi). Python tarafındaki geçici `Runtime.callFunction` rotası kaldırıldı — frame eval yine `Runtime.evaluate` + executionContextId üzerinden gider
+- fix(frames): cross-origin/closed-shadow iframe erişimi üç kök nedenle açıldı — (1) launch policy artık `fission.autostart=false` (Camoufox'un `camoufox.cfg` default'u her iframe'i süreç-dışı yapıyordu; Juggler subframe'lere in-process window/context açamıyordu), (2) policy `config.forceScopeAccess=true` ile her frame'in default world'ü system-principal master sandbox'a bağlandı (shadowRootUnl + cross-origin `contentDocument` evaluate'ten okunur), (3) bkz. yukarıdaki sidecar düzeltmesi. `kahin_mirage_eval` (expression + frame_id) tool'u eklendi; kabul testi: kapalı shadow + sandbox'lı cross-origin iframe içindeki checkbox için `{frameFound, frameId, iframeRect, checkboxRect, absoluteCenter}` döner ve koordinat tıklaması checkbox'ı çevirir (tests/test_e2e_xframe_shadow.py)
 - feat(cf): rewrite `kahin_cf_clear` around the TR trust contract: frame-anchored native press/release, FakeShadowRoot-style shadow walk, 5 attempts with jittered 3s retries, and title-gate plus host-scoped `cf_clearance` evidence
 - feat(watch): add localhost-only `kahin_mirage_watch_start` / `kahin_mirage_watch_stop` MJPEG live watch fed by the existing screencast pump; manual frame calls may race the watch pump
 - verify(live): real nopecha Cloudflare attempt returned `cleared:false`, `method:timeout`, `clicks:0`; live watch `/snapshot.jpg` returned JPEG `ffd8ff`, and three screencast frames were ACKed with pending `0`
+- docs: `AGENTS.md`/`README.md` tool envanteri kod gerçeğine senkronlandı — 155 kayıtlı tool (Mirage 106 + CF-Clear 2 + paylaşılan 47); `kahin_ocr`, `kahin_cf_clear`/`kahin_cf_status`, `kahin_mirage_watch_start`/`kahin_mirage_watch_stop` artık dokümanda listeli
 
 ## [0.3.10] — 2026-08-09
 

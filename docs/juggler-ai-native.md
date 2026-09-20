@@ -367,7 +367,7 @@ tool'ları `engine="mirage"` aktifken kullanılır.
 - `kahin_mirage_dom_action`
 - `kahin_mirage_dom_stop`
 
-### DOM query/action (12)
+### DOM query/action (13)
 
 - `kahin_mirage_query`, `kahin_mirage_query_all`
 - `kahin_mirage_click`, `kahin_mirage_type`
@@ -375,6 +375,7 @@ tool'ları `engine="mirage"` aktifken kullanılır.
 - `kahin_mirage_set_attribute`, `kahin_mirage_focus`
 - `kahin_mirage_hover`, `kahin_mirage_get_html`
 - `kahin_mirage_wait_selector`, `kahin_mirage_get_value`
+- `kahin_mirage_eval` — serbest JS ifadesi (opsiyonel `frame_id`; ana frame master world'de shadowRootUnl + cross-origin contentDocument okunur)
 
 ### Reliability (9)
 
@@ -479,7 +480,7 @@ Sidecar'ın raw AX cevabı da bounded'dır; büyük belgelerde beklenen
 sonuç `truncated: true` olabilir. `result_too_large` veya `truncated` gördüğünüzde
 gerekirse DOM snapshot/selector ile hedef alanı daraltın.
 
-### Agent-native (10)
+### Agent-native (11)
 
 - `kahin_mirage_snapshot` — canlı DOM ağacını token bütçeli, ref'li satırlara
   çevirir; her ref canlı `nodeId`'dir ve `dom_action` üzerinde doğrudan
@@ -499,6 +500,7 @@ gerekirse DOM snapshot/selector ile hedef alanı daraltın.
   bookkeeping; snapshot sonrası live, reset/dropped/stale/stop sonrası geçersiz),
   pendingDialogs, networkEvents, consoleMessages, identity; engine yoksa
   yapılandırılmış idle yanıt döner ve asla hata fırlatmaz
+- `kahin_challenge_status` — CAPTCHA/access-denied/rate-limit algılar; `retryAfterSeconds` ve güvenli pause/backoff kararını döndürür; bypass etmez
 
 ### Stealth ve anti-detect (9)
 

@@ -1031,6 +1031,28 @@ async def mirage_get_value(selector: str, frame_id: str | None = None) -> str:
         return await _safe_mirage_evaluate("kahin_mirage_get_value", expr, frame_id)
 
 
+_MAX_EVAL_EXPRESSION_LENGTH = 100_000
+
+
+@mcp.tool(name="kahin_mirage_eval", annotations=_RW)
+async def mirage_eval(expression: str, frame_id: str | None = None) -> str:
+    """Mirage: evaluate a JavaScript expression; result.value as JSON.
+    frame_id: target an iframe (kahin_mirage_frame_tree); main frame default.
+    Main-frame expressions run in the isolated master world (forceScopeAccess):
+    Element.shadowRootUnl and cross-origin iframe contentDocument are readable
+    there; page-world JS globals are not."""
+    expression_value, error = _text_arg(
+        expression, tool="kahin_mirage_eval", field="expression",
+        maximum=_MAX_EVAL_EXPRESSION_LENGTH,
+    )
+    if error:
+        return error
+    if not expression_value or not expression_value.strip():
+        return _json_error("kahin_mirage_eval", "expression must not be empty", "invalid_argument", field="expression")
+    async with _healer_ref.safe("kahin_mirage_eval", frame_id=frame_id):
+        return await _safe_mirage_evaluate("kahin_mirage_eval", expression_value, frame_id)
+
+
 # ============================= Input (7) ===================================
 
 

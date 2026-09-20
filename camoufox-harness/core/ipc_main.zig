@@ -622,7 +622,19 @@ fn startEvaluate(d: *driver_mod.Driver, a: Allocator, out: *std.array_list.Align
         return;
     };
     const t = try allocTask(a, id, .evaluate);
-    t.flow = .{ .eval = try driver_mod.Driver.EvalFlow.init(d, p.target_id, p.session_id, expr, request_timeout_ms, 1) };
+    const flow = try driver_mod.Driver.EvalFlow.init(d, p.target_id, p.session_id, expr, request_timeout_ms, 1);
+    // Honor an explicit executionContextId: without this the driver's
+    // pickContext silently re-targets every frame-scoped evaluation to
+    // the main frame. Absent id keeps the legacy main-frame behavior.
+    if (getStringParam(params, "executionContextId")) |ctx_id| {
+        flow.pinContext(ctx_id) catch {
+            d.allocator.destroy(flow);
+            a.destroy(t);
+            try respondErr(a, out, id, -32600, "could not pin execution context");
+            return;
+        };
+    }
+    t.flow = .{ .eval = flow };
     try inflight.append(a, t);
 }
 
@@ -1763,6 +1775,50 @@ test "router: Runtime.evaluate keeps the evaluateWithRetry path" {
     const line = try runRequest(&d, "{\"id\":10,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"1+1\"}}");
     defer testing.allocator.free(line);
     try testing.expectEqualStrings("{\"id\":10,\"result\":{\"result\":{\"type\":\"number\",\"value\":2}}}\n", line);
+}
+
+test "router: Runtime.evaluate honors an explicit executionContextId" {
+    const rig = try testRig();
+    defer {
+        _ = std.os.linux.close(rig.cmd[0]);
+        _ = std.os.linux.close(rig.resp[1]);
+        _ = std.os.linux.close(rig.resp[0]);
+        _ = std.os.linux.close(rig.cmd[1]);
+    }
+    var d = rig.d;
+    defer d.deinit();
+
+    try seedPage(&d, rig.resp, "t1", "s1", "main");
+    try pipe.writeMessage(
+        testing.allocator,
+        rig.resp[1],
+        "{\"method\":\"Runtime.executionContextCreated\",\"params\":{\"executionContextId\":\"ctx-main\",\"auxData\":{\"frameId\":\"main\"}},\"sessionId\":\"s1\"}",
+    );
+    try d.pump(1000);
+    try pipe.writeMessage(
+        testing.allocator,
+        rig.resp[1],
+        "{\"method\":\"Runtime.executionContextCreated\",\"params\":{\"executionContextId\":\"ctx-sub\",\"auxData\":{\"frameId\":\"sub\"}},\"sessionId\":\"s1\"}",
+    );
+    try d.pump(1000);
+    try setCurrentTarget(testing.allocator, "t1");
+    defer {
+        if (current_target) |t| testing.allocator.free(t);
+        current_target = null;
+    }
+
+    // pickContext would choose the LAST main-frame context (or, when the
+    // main id is unknown, the newest context overall = ctx-sub). To prove
+    // the pin — not the fallback — is honored, both contexts must exist
+    // and the wire request must carry the requested one verbatim.
+    const expected = [_][]const u8{"{\"id\":1,\"sessionId\":\"s1\",\"method\":\"Runtime.evaluate\",\"params\":{\"executionContextId\":\"ctx-main\",\"expression\":\"2+2\",\"returnByValue\":true}}"};
+    const reply = [_][]const u8{"{\"id\":1,\"result\":{\"result\":{\"type\":\"number\",\"value\":4}}}"};
+    const thread = try std.Thread.spawn(.{}, FakePeer.thread, .{ rig.cmd[0], rig.resp[1], &expected, &reply, &[_][]const u8{} });
+    defer thread.join();
+
+    const line = try runRequest(&d, "{\"id\":11,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"2+2\",\"executionContextId\":\"ctx-main\"}}");
+    defer testing.allocator.free(line);
+    try testing.expectEqualStrings("{\"id\":11,\"result\":{\"result\":{\"type\":\"number\",\"value\":4}}}\n", line);
 }
 
 test "router: events forwarded verbatim (no CDP translation)" {

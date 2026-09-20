@@ -4,6 +4,22 @@ Faz 9 Task 3: the wire is the Juggler-native call schema
 ``Mirage.call(method, params, session_id)`` — send_cdp is gone.
 """
 
+
+def test_user_js_uses_json_booleans_not_python_repr():
+    """GODMODE 2026-09-19: user.js must be valid JS. The old
+    ``"user_pref({!r}, {!r})"`` formatting wrote Python repr
+    (``False``/``True``/single quotes), which Firefox silently drops —
+    fission stayed on and webgl prefs never applied. JSON dumps
+    emits JS-compatible literals."""
+    import json
+
+    prefs = {"fission.autostart": False, "webgl.force-enabled": True, "x": "y"}
+    lines = [f"user_pref({json.dumps(k)}, {json.dumps(v)});" for k, v in prefs.items()]
+    text = "\n".join(lines)
+    assert "False" not in text and "True" not in text and "'" not in text
+    assert 'user_pref("fission.autostart", false);' in text
+    assert 'user_pref("webgl.force-enabled", true);' in text
+
 import asyncio
 from pathlib import Path
 

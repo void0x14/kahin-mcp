@@ -391,6 +391,12 @@ pub const Driver = struct {
         session_id: []u8,
         target_id: []u8,
         expr: []u8,
+        /// Caller-requested execution context (owned copy) or null for the
+        /// legacy main-frame pick. When set, the flow NEVER falls back to
+        /// another context: a missing id waits for context events like the
+        /// legacy path, and the request fails instead of silently running
+        /// in the wrong frame.
+        ctx_id: ?[]u8 = null,
         timeout_ms: i32,
         deadline_ms: i64,
         call: ?*WireCall = null,
@@ -419,12 +425,21 @@ pub const Driver = struct {
             return f;
         }
 
+        /// Pin the flow to one execution context id. Takes ownership of a
+        /// copy; call right after init when the client supplied one.
+        pub fn pinContext(self: *EvalFlow, ctx_id: []const u8) !void {
+            const d = self.driver;
+            if (self.ctx_id) |old| d.allocator.free(old);
+            self.ctx_id = try d.allocator.dupe(u8, ctx_id);
+        }
+
         pub fn deinit(self: *EvalFlow) void {
             const d = self.driver;
             if (self.call) |c| d.cancelWireCall(c);
             d.allocator.free(self.session_id);
             d.allocator.free(self.target_id);
             d.allocator.free(self.expr);
+            if (self.ctx_id) |c| d.allocator.free(c);
             if (self.result) |*r| r.deinit(d.allocator);
             d.allocator.destroy(self);
         }
@@ -471,8 +486,29 @@ pub const Driver = struct {
             }
             const p = d.pages.get(self.target_id) orelse return self.fail(error.UnknownTarget);
             if (p.session_id.len == 0) return self.fail(error.TargetNotAttached);
-            const ctx = pickContext(p) orelse return; // wait for context events
-            const params = runtime.evaluateParams(d.allocator, ctx.id, self.expr, true) catch return self.fail(error.OutOfMemory);
+            // Pinned context (client-supplied executionContextId): resolve
+            // it and only it. Absent from the live list means not yet
+            // announced — wait for context events exactly like the legacy
+            // path waits; the deadline still bounds the wait.
+            var ctx_id: []const u8 = undefined;
+            if (self.ctx_id) |pinned| {
+                var found = false;
+                for (p.contexts.items) |*c| {
+                    if (std.mem.eql(u8, c.id, pinned)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    if (nowMs() >= self.deadline_ms) return self.fail(error.NoExecutionContext);
+                    return; // wait for context events
+                }
+                ctx_id = pinned;
+            } else {
+                const ctx = pickContext(p) orelse return; // wait for context events
+                ctx_id = ctx.id;
+            }
+            const params = runtime.evaluateParams(d.allocator, ctx_id, self.expr, true) catch return self.fail(error.OutOfMemory);
             defer d.allocator.free(params);
             self.deadline_ms = nowMs() + self.timeout_ms;
             self.call = d.sendAsync(p.session_id, runtime.method_evaluate, params, self.timeout_ms) catch |err| return self.fail(err);

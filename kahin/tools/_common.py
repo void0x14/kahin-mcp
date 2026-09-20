@@ -613,12 +613,11 @@ async def _mirage_eval_result(
 ) -> dict[str, Any] | str:
     """Run an expression in a frame's main world; raw Juggler result dict.
 
-    Default (frame_id=None) keeps the historical path: Runtime.evaluate,
-    whose sidecar handler always resolves the MAIN frame's context. With a
-    frame_id the context is resolved from the Mirage frame->context map and
-    the expression runs via Runtime.callFunction — a passthrough method that
-    accepts an explicit executionContextId (the browser's Juggler dispatcher
-    requires it) — so it executes inside that frame's own world.
+    Default (frame_id=None) keeps the historical path: Runtime.evaluate.
+    With a frame_id the context is resolved from the Mirage frame->context
+    map and the expression runs via Runtime.evaluate with an explicit
+    executionContextId — the sidecar honors it (pinned context, no
+    main-frame fallback) and runs the call in that frame's own world.
     Returns a JSON error string on engine/context failure.
     """
     err = await _require_mirage()
@@ -651,11 +650,13 @@ async def _mirage_eval_result(
                 "error": f"no execution context for frame {frame_id}; "
                 "list frames with kahin_mirage_frame_tree",
             }, option=orjson.OPT_INDENT_2).decode()
-        method = "Runtime.callFunction"
+        # The sidecar honors the explicit executionContextId (pinned
+        # EvalFlow context — never re-targets another frame), so the
+        # expression takes the Juggler evaluateScript path inside that
+        # frame's own world.
         params = {
             "executionContextId": ctx_id,
-            "functionDeclaration": "function(expr) { return eval(expr); }",
-            "args": [{"value": expression}],
+            "expression": expression,
             "returnByValue": True,
         }
     try:

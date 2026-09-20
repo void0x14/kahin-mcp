@@ -601,9 +601,16 @@ class Mirage(BrowserEngine):
         from kahin.stealth import launch_policy  # noqa: PLC0415 - pure helper
 
         policy = launch_policy(headless=headless)
+        # launch_options takes `config` and `firefox_user_prefs` as named
+        # parameters, so they must never ride inside **launch_kwargs — the
+        # identity path below passes its own `config=` and would collide.
+        policy_config: dict[str, Any] = dict(policy.get("config") or {})
+        policy_prefs: dict[str, Any] = dict(policy.get("firefox_user_prefs") or {})
         launch_kwargs: dict[str, Any] = {
-            **policy,
+            key: value for key, value in policy.items()
+            if key not in ("config", "firefox_user_prefs")
         }
+        launch_kwargs["firefox_user_prefs"] = policy_prefs
         if self._addons:
             launch_kwargs["addons"] = self._addons
         if validated_proxy_url is not None:
@@ -623,7 +630,7 @@ class Mirage(BrowserEngine):
             opts = {"env": {}, "firefox_user_prefs": {}}
         else:
             try:
-                opts = launch_options(**launch_kwargs)
+                opts = launch_options(config=policy_config, **launch_kwargs)
             except Exception as exc:  # noqa: BLE001 - geoip is an optional proxy seam
                 if validated_proxy_url is None or launch_kwargs.get("geoip") is not True:
                     raise
@@ -636,7 +643,7 @@ class Mirage(BrowserEngine):
                     type(exc).__name__,
                 )
                 launch_kwargs = {**launch_kwargs, "geoip": False}
-                opts = launch_options(**launch_kwargs)
+                opts = launch_options(config=policy_config, **launch_kwargs)
         # Identity config (Faz 2 Task 5): merge through the same seam that
         # applies the default fingerprint. ``launch_options(config=...)``
         # regenerates the full option set (env with CAMOU_CONFIG_*, user.js
@@ -650,7 +657,7 @@ class Mirage(BrowserEngine):
             else:
                 try:
                     opts = launch_options(
-                        config=self._identity_config,
+                        config={**policy_config, **self._identity_config},
                         i_know_what_im_doing=True,
                         **launch_kwargs,
                     )
@@ -658,6 +665,9 @@ class Mirage(BrowserEngine):
                     logger.warning("identity config injection failed; using defaults", exc_info=True)
         opts_ms = (time.monotonic() - opts_t0) * 1000
         env = {**os.environ, **opts["env"]}
+        # Allow hardware GPU acceleration unless explicitly overridden by environment
+        if os.environ.get("KAHIN_FORCE_SOFTWARE_GL") == "1":
+            env["LIBGL_ALWAYS_SOFTWARE"] = "1"
         # Proxy (Faz 3 Task 5): merge through the same env seam the sidecar
         # passes to the Camoufox child (create_subprocess_exec env below).
         # Firefox honors ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY for its
@@ -694,7 +704,7 @@ class Mirage(BrowserEngine):
         try:
             prefs = opts.get("firefox_user_prefs") or {}
             if prefs:
-                lines = ["user_pref({!r}, {!r});".format(k, v) for k, v in prefs.items()]
+                lines = [f"user_pref({json.dumps(k)}, {json.dumps(v)});" for k, v in prefs.items()]
                 (profile_dir / "user.js").write_text("\n".join(lines) + "\n")
 
             # Binary discovery may invoke the official networked fetch. Keep

@@ -109,12 +109,24 @@ def launch_policy(headless: bool = True) -> dict[str, Any]:
             humanize = max(0.5, min(5.0, float(raw)))
         except ValueError:
             humanize = False
+    import sys as _sys
+
+    target_os = "linux" if _sys.platform.startswith("linux") else ("macos" if _sys.platform == "darwin" else "windows")
     return {
         "headless": bool(headless),
         "humanize": humanize,
         "enable_cache": True,
         "block_webgl": False,
         "main_world_eval": False,
+        "os": target_os,
+        "config": {"forceScopeAccess": True},
+        # PR #550: Fission autostart TRUE + webContentIsolationStrategy 0
+        # Keeps Fission active for WAF/Cloudflare checks while keeping subframes
+        # in the same web process so Juggler has in-process DOM context.
+        "firefox_user_prefs": {
+            "fission.autostart": True,
+            "fission.webContentIsolationStrategy": 0,
+        },
     }
 
 

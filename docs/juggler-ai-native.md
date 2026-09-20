@@ -268,6 +268,17 @@ cache ve replay proxy yoktur. 2026-09-15 canlı denemesinde title gate geçmedi:
 sonuç `cleared:false`, `method:timeout`, `clicks:0` oldu; bu dürüst bir
 başarısızlık kanıtıdır, Cloudflare başarısı değildir.
 
+Hızlı yol (düz CF, browser'sız): `kahin_cf_clear` önce tarayıcısız
+fingerprint geçişi dener (curl_cffi impersonate: safari18_0 → chrome131)
+— yalnızca python komutu, browser açılmyor. Düz CF burada geçilir
+(`method: fast:<profile>`, `browser: false`). Yalnızca hızlı yol 200
+vermedi / interstitial sürdü (JS/challenge/canvas kanıtı) ise yukarıdaki
+browser yoluna düşülür. Canlı kanıt (2026-09-20): `use.ai` →
+`{cleared:true, method:fast:safari18_0, status:200, browser:false,
+elapsedMs:185}`.
+sonuç `cleared:false`, `method:timeout`, `clicks:0` oldu; bu dürüst bir
+başarısızlık kanıtıdır, Cloudflare başarısı değildir.
+
 ### 3.6 Uzun süreli crawler job sözleşmesi
 
 Tek tek navigate çağrıları yerine uzun ve gözlenebilir bir crawl için şu ORBIT

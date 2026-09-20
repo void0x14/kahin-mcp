@@ -17,6 +17,7 @@ dependencies = [
     "Levenshtein>=0.26",
     "websockets>=14.0",
     "httpx>=0.28",
+    "curl-cffi>=0.11",
     "Pillow>=11.0",
     # Mirage/Camoufox is the default engine and therefore a core runtime
     # dependency; a fresh install must be able to start the declared engine.

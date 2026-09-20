@@ -65,6 +65,12 @@ _TOOL = "kahin_cf_clear"
 # managed challenge (JS proof-of-work + a Turnstile click + settle).
 # Mirrors the Türk bypasser constants (cf_bypasser/utils/constants.py):
 # DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5, RETRY_POLL_SECONDS=3.
+# Fast path (düz CF): curl_cffi impersonate ile tarayıcısız fingerprint
+# geçişi dener (safari18_0 → chrome131). Başarırsa browser ASLA açılmaz;
+# yalnızca JS/challenge/canvas gerektiğinde browser yoluna düşülür.
+# managed challenge (JS proof-of-work + a Turnstile click + settle).
+# Mirrors the Türk bypasser constants (cf_bypasser/utils/constants.py):
+# DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5, RETRY_POLL_SECONDS=3.
 _MAX_URL_LENGTH = 4096
 _DEFAULT_TIMEOUT = 60.0
 _MAX_TIMEOUT = 180.0
@@ -72,6 +78,9 @@ _RETRY_POLL_SECONDS = 3.0
 _RETRY_POLL_JITTER_SECONDS = 1.0
 _INITIAL_SETTLE_SECONDS = 5.0
 _MAX_ATTEMPTS = 5
+# Hızlı yol: tarayıcısız fingerprint profilleri, sırayla deneinecek.
+_FAST_IMPERSONATE = ("safari18_0", "chrome131")
+_FAST_TIMEOUT = 30.0
 # Frame-URL filter: the Turnstile challenge frame serves from this host
 # (cf_bypasser/core/bypasser.py:171 — ``"challenges.cloudflare" in f.url``).
 _CF_FRAME_MARKER = "challenges.cloudflare"
@@ -95,7 +104,7 @@ _FIND_CHECKBOX_JS = """() => {
         const direct = root.querySelector && root.querySelector('input[type=checkbox]');
         if(direct) return direct;
         for(const el of (root.querySelectorAll ? root.querySelectorAll('*') : [])){
-            const sr = el.fakeShadowRoot || el.shadowRoot;
+            const sr = el.shadowRootUnl || el.openOrClosedShadowRoot || el.fakeShadowRoot || el.shadowRoot;
             if(sr){ const r = find(sr); if(r) return r; }
         }
         return null;
@@ -113,10 +122,13 @@ _IS_BYPASSED_JS = (
     "    const title = String(document.title || '').toLowerCase();"
     "    if(title.includes('just a moment')) return {bypassed:false, reason:'title'};"
     "    const html = String(document.documentElement ? document.documentElement.innerHTML : '')"
-    ".slice(0, 60000).toLowerCase();"
+    "    .slice(0, 60000).toLowerCase();"
     "    if(html.includes('please complete the captcha')) return {bypassed:false, reason:'captcha-text'};"
     f"    const markers = {_BLOCK_MARKERS_JSON};"
     "    for(const m of markers){ if(html.includes(m)) return {bypassed:false, reason:'block:'+m}; }"
+    "    const respInput = document.querySelector('input[name=\"cf-turnstile-response\"], input[name=\"g-recaptcha-response\"]');"
+    "    const token = respInput && respInput.value ? respInput.value : (window.__turnstile_token || '');"
+    "    if(token && token.length > 20) return {bypassed:true, token: token};"
     "    return {bypassed:true};"
     "})()"
 )
@@ -331,23 +343,75 @@ async def _screenshot_widget_point(session_id: str) -> dict[str, float] | None:
                     best = {"x": (xx - run / 2) / sx + 40.0 / sx,
                             "y": yy / sy}
     return best
-    """Visual fallback: widget centre from screenshot geometry.
+    return best
 
-    Live truth (2026-09-16, nopecha.com/demo/cloudflare, 1920x989
-    viewport): the Turnstile iframe renders on screen while staying
-    invisible to every DOM API (querySelector, shadow walk, snapshot).
-    The widget band is stable at x=480-810, y=330-395 page coords —
-    centre (506, 353). Returned only when the challenge probe still
-    detects an interactive widget, so a dead page never gets clicks.
+
+async def _key_press(session_id: str, key: str, code: str, key_code: int = 0) -> bool:
+    """Trusted keyDown+keyUp via Page.dispatchKeyEvent. True when both land.
+
+    ``Page.keyPress`` does not exist on Juggler — the real surface is
+    ``Page.dispatchKeyEvent`` with lowercase keydown/keyup types (same
+    contract ``mirage_key_press`` uses in pilot_mirage.py).
     """
-    probe = await _challenge_probe(session_id)
-    if not (isinstance(probe, dict) and probe.get("detected")):
-        return None
-    return {"x": 506.0, "y": 353.0}
+    engine = _mirage_engine()
+    base: dict[str, object] = {
+        "key": key, "keyCode": key_code, "location": 0,
+        "code": code, "repeat": False,
+    }
+    try:
+        down = await engine.call(
+            "Page.dispatchKeyEvent", {**base, "type": "keydown"},
+            session_id=session_id)
+        if isinstance(down, dict) and down.get("error"):
+            return False
+        up = await engine.call(
+            "Page.dispatchKeyEvent", {**base, "type": "keyup"},
+            session_id=session_id)
+        if isinstance(up, dict) and up.get("error"):
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - key path returns bool, never raises
+        return False
+    """Single trusted key press via Juggler dispatch. True when accepted."""
+    engine = _mirage_engine()
+    params: dict[str, object] = {"key": key}
+    if code:
+        params["code"] = code
+    try:
+        resp = await engine.call("Page.keyPress", params, session_id=session_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return not _is_error_response(resp)
 
+
+async def _tab_space_turnstile(session_id: str) -> tuple[bool, str]:
+    """Tab-walk focus into the widget, Space toggles it. Single shot.
+
+    CloakBrowser #343: mouse clicks rejected while keyboard-driven Space
+    on the focused checkbox produced the trusted event that minted the
+    token. No coordinates, no mouse travel — the browser's own toggle
+    path fires, so there is no synthetic-pointer behavior to score.
+    Returns (dispatched, focused_tag_before_space).
+    """
+    for _ in range(12):
+        if not await _key_press(session_id, "Tab", "Tab", 9):
+            return False, ""
+        await asyncio.sleep(0.4)
+        focused = await _eval_value(
+            "document.activeElement ? document.activeElement.tagName : 'none'",
+            session_id,
+        )
+        tag = str(focused) if isinstance(focused, str) else ""
+        if tag.upper() in ("INPUT", "IFRAME", "BUTTON"):
+            break
+    else:
+        tag = ""
+    if not await _key_press(session_id, " ", "Space", 32):
+        return False, tag
+    await asyncio.sleep(2.0)
+    return True, tag
 
 async def _find_checkbox(session_id: str) -> tuple[str, dict[str, float]] | None:
-    """Find a checkbox: live DOM frame first, visual fallback second."""
     """Find a checkbox and map coordinates through its selected frame relation."""
     frame_tree = await _frame_tree(session_id)
     if frame_tree is None:
@@ -398,6 +462,7 @@ async def _flow_click(session_id: str, x: float, y: float) -> bool:
 async def _click_at(session_id: str, x: float, y: float) -> bool:
     """Native press/release at page coords. True when both dispatched."""
     """Native press/release at page coords. True when both dispatched."""
+    """Native press/release at page coords. True when both dispatched."""
     down = await _dispatch_mouse("mousedown", x, y, buttons=1, session_id=session_id)
     if _is_error_response(down):
         return False
@@ -415,27 +480,25 @@ async def _verify_checkbox(session_id: str, frame_id: str) -> bool:
 
 
 async def _click_turnstile(session_id: str) -> tuple[bool, bool]:
-    """Find and flow-click the Turnstile checkbox (DOM or visual)."""
+    """Turnstile path: DOM click, visual click, Tab+Space. First hit wins.
+
+    Order is deliberate: precise DOM click first; screenshot-located click
+    second; keyboard toggle last (no coordinates at all). Single pass each
+    — no loops, no retries, no coordinate guessing.
+    """
     found = await _find_checkbox(session_id)
     if found is not None:
         frame_id, point = found
-        if not await _flow_click(session_id, point["x"], point["y"]):
-            return False, False
-        return True, await _verify_checkbox(session_id, frame_id)
+        if await _flow_click(session_id, point["x"], point["y"]):
+            return True, await _verify_checkbox(session_id, frame_id)
     visual = await _screenshot_widget_point(session_id)
-    if visual is None:
-        return False, False
-    if not await _flow_click(session_id, visual["x"], visual["y"]):
-        return False, False
-    return True, await _is_bypassed(session_id)
-    """Find and natively click the first actionable Turnstile checkbox."""
-    found = await _find_checkbox(session_id)
-    if found is None:
-        return False, False
-    frame_id, point = found
-    if not await _click_at(session_id, point["x"], point["y"]):
-        return False, False
-    return True, await _verify_checkbox(session_id, frame_id)
+    if visual is not None:
+        if await _flow_click(session_id, visual["x"], visual["y"]):
+            return True, await _is_bypassed(session_id)
+    tabbed, _focused = await _tab_space_turnstile(session_id)
+    if tabbed:
+        return True, await _is_bypassed(session_id)
+    return False, False
 
 
 async def _cf_cookies(session_id: str, host: str) -> dict[str, str]:
@@ -483,6 +546,47 @@ async def _page_cf_cookie_names(session_id: str) -> list[str]:
     return [str(n) for n in value] if isinstance(value, list) else []
 
 
+async def _fast_fingerprint_clear(url: str, host: str, started: float) -> dict[str, Any] | None:
+    """Düz CF için tarayıcısız hızlı yol: curl_cffi impersonate.
+
+    Browser ASLA açılmaz — yalnızca python komutu yürütülür. Profiller
+    sırayla denenir (safari18_0 → chrome131). Başarı = HTTP 200/301/302
+    + interstitial yok (title/body'de 'just a moment' / captcha metni
+    yok). Başarısızlıkta None döner, çağıran browser yoluna düşer —
+    yani JS/challenge/canvas gerektiği kanıtlanınca Kahin açılır."""
+    def elapsed_ms() -> int:
+        return int((time.monotonic() - started) * 1000)
+    try:
+        from curl_cffi import requests as _cf_requests
+    except ImportError:
+        return None
+    from urllib.parse import urlparse as _up
+    try:
+        origin = f"{_up(url).scheme}://{_up(url).hostname}"
+    except Exception:  # noqa: BLE001
+        origin = f"https://{host}"
+    for profile in _FAST_IMPERSONATE:
+        try:
+            session = _cf_requests.Session(impersonate=profile)
+            session.headers.update({"Origin": origin, "Referer": origin + "/"})
+            resp = session.get(url, timeout=_FAST_TIMEOUT)
+            status = resp.status_code
+            body = (resp.text or "")[:60000].lower()
+            cookies = sorted({c.name for c in session.cookies.jar
+                              if c.name.startswith(("cf_", "__cf"))})
+            interstitial = ("just a moment" in body
+                            or "please complete the captcha" in body
+                            or "challenges.cloudflare" in body)
+            if status in (200, 301, 302) and not interstitial:
+                return {"cleared": True, "method": f"fast:{profile}",
+                        "url": url, "status": status,
+                        "cfCookies": cookies, "browser": False,
+                        "elapsedMs": elapsed_ms()}
+        except Exception:  # noqa: BLE001 - sıradaki profile düş
+            continue
+    return None
+
+
 # kept for future refusal-evidence / debugging; currently unused.
 async def _ray_id(session_id: str) -> str | None:
     """CF Ray ID from page text; None when unreadable. Rotation detector."""
@@ -495,20 +599,22 @@ async def _ray_id(session_id: str) -> str | None:
 
 @mcp.tool(name="kahin_cf_clear", annotations=_RW)
 async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
-    """Clear a Cloudflare challenge in the current session (embedded solver).
+    """Clear a Cloudflare challenge, fast path first (no browser for düz CF).
 
-    Navigates to ``url`` inside Kahin's already-open Camoufox browser, waits
-    out non-interactive managed challenges, clicks an interactive Turnstile
-    checkbox with native events when one is on screen, and verifies the page
-    itself opened (title gate). No second browser, no cookie cache, no replay
-    proxy.
+    Önce tarayıcısız fingerprint geçişi denenir (curl_cffi impersonate:
+    safari18_0 → chrome131) — yalnızca python komutu, browser açılmyor.
+    Düz CF burada geçilir. Yalnızca JS/challenge/canvas gerektiği
+    kanıtlanınca (hızlı yol 200 vermedi / interstitial sürdü) Kahin'in
+    Camoufox browser yoluna düşülür: navigate + managed-challenge bekleme
+    + Turnstile native click + title-gate doğrulama. No second browser,
+    no cookie cache, no replay proxy.
 
-    Returns ``{cleared, method, url, cfCookies, elapsedMs}``. ``cleared`` is
-    true ONLY when the interstitial title is gone AND host-scoped
-    ``cf_clearance`` is present; host-scoped cf_ cookies are reported as
-    supporting evidence. CF may refuse clicks — then ``cleared`` is false
-    with evidence and the ``pause_for_human`` contract ``challenge_status``
-    uses.
+    Returns ``{cleared, method, url, cfCookies, elapsedMs}``. ``method``
+    ``fast:<profile>`` ile başlıyorsa browser açılmadan geçilmiştir
+    (``browser: False``). ``cleared`` browser yolunda true ONLY when the
+    interstitial title is gone AND host-scoped ``cf_clearance`` is present.
+    CF may refuse clicks — then ``cleared`` is false with evidence and
+    the ``pause_for_human`` contract ``challenge_status`` uses.
     """
     if not isinstance(url, str) or not url or len(url) > _MAX_URL_LENGTH:
         return _json_error(_TOOL, "url must be a non-empty string", "invalid_argument", field="url")
@@ -528,19 +634,48 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
     if not host:
         return _json_error(_TOOL, "url must include a hostname", "invalid_argument", field="url")
 
+    # HIZLI YOL: düz CF — browser yok, healer yok, sadece python.
+    # _healer_ref.safe ÖNCESİNDE: engine'siz çalışır, geçerse dön.
+    _fast_started = time.monotonic()
+    fast = await _fast_fingerprint_clear(url, host, _fast_started)
+    if fast is not None:
+        return _dump(fast)
+
     async with _healer_ref.safe(_TOOL, url=url[:80], timeout=budget):
-        session_id, error = await _capture_page_session(_TOOL)
-        if error:
-            return error
-        assert session_id is not None
-        engine = _mirage_engine()
         started = time.monotonic()
 
         def elapsed_ms() -> int:
             return int((time.monotonic() - started) * 1000)
 
+        # YAVAŞ YOL: JS/challenge/canvas kanıtlandı — şimdi browser açılır.
+
+        # YAVAŞ YOL: JS/challenge/canvas kanıtlandı — şimdi browser açılır.
+        session_id, error = await _capture_page_session(_TOOL)
+        if error:
+            return error
+        assert session_id is not None
+        assert session_id is not None
+        engine = _mirage_engine()
+
+        # Inject message listener in window BEFORE navigation/rendering to capture postMessage token instantly
+        _INIT_LISTENER_JS = (
+            "(() => {"
+            "  if(window.__cf_listener_installed) return;"
+            "  window.__cf_listener_installed = true;"
+            "  window.__turnstile_token = '';"
+            "  window.addEventListener('message', (e) => {"
+            "    try {"
+            "      const data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;"
+            "      if(data && (data.source === 'cloudflare-challenge' || data.source === 'turnstile') && data.event === 'success') {"
+            "        window.__turnstile_token = data.token || '';"
+            "      }"
+            "    } catch(_) {}"
+            "  });"
+            "})()"
+        )
         try:
             await engine.call("Page.navigate", {"url": url}, session_id=session_id)
+            await _eval_value(_INIT_LISTENER_JS, session_id)
         except Exception as exc:  # noqa: BLE001 - public tool returns JSON
             return _json_error(_TOOL, f"navigation failed: {exc}", "navigation_failed")
 
@@ -583,7 +718,18 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
         for _ in range(_MAX_ATTEMPTS):
             # Ground truth: the interstitial title is gone. Cookies are only
             # supporting evidence (host-scoped + page-context agreement).
-            if await _is_bypassed(session_id):
+            bypassed = await _eval_value(_IS_BYPASSED_JS, session_id)
+            if isinstance(bypassed, dict) and bypassed.get("bypassed"):
+                token = bypassed.get("token")
+                cf = await _cf_cookies(session_id, host)
+                page_names = await _page_cf_cookie_names(session_id)
+                if "cf_clearance" in cf or (token and len(token) > 20):
+                    return _dump({"cleared": True,
+                                  "method": "token" if token else ("click" if clicks else "auto"),
+                                  "url": url, "cfCookies": sorted(cf),
+                                  "pageCfCookies": sorted(page_names),
+                                  "token": (token[:32] + "...") if token else None,
+                                  "clicks": clicks, "elapsedMs": elapsed_ms()})
                 cf = await _cf_cookies(session_id, host)
                 page_names = await _page_cf_cookie_names(session_id)
                 if "cf_clearance" in cf:

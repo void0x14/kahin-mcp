@@ -326,7 +326,7 @@ rate-limit kaçış yolu olarak kullanmaz.
 
 | Tool | Ne işe yarar? |
 |------|---------------|
-| `kahin_cf_clear` | Mevcut oturumda Cloudflare challenge'ı temizle (embedded solver; interstitial title gate + host-scoped `cf_clearance` doğrular, tıklayamıyorsa `pause_for_human` döner) |
+| `kahin_cf_clear` | Cloudflare challenge'ı temizle — önce tarayıcısız hızlı yol (curl_cffi impersonate: safari18_0 → chrome131, yalnızca python, browser açılmyor); düz CF burada geçilir (`method: fast:<profile>`, `browser: false`). Yalnızca JS/challenge/canvas kanıtlanınca browser yoluna düşülür (embedded solver; interstitial title gate + host-scoped `cf_clearance` doğrular, tıklayamıyorsa `pause_for_human` döner) |
 | `kahin_cf_status` | Mevcut sayfanın Cloudflare clearance durumunu raporla (salt-okunur; gezinmez, tıklamaz) |
 
 ### Faz 4 — Performans (Zig sidecar + metrik yüzeyi)

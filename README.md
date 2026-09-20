@@ -154,7 +154,7 @@ DOM akışı için [AI-native Juggler kılavuzuna](docs/juggler-ai-native.md) ba
 
 ## Bağımlılıklar
 
-mcp · orjson · Levenshtein · websockets · httpx · camoufox · Pillow · pydantic
+mcp · orjson · Levenshtein · websockets · httpx · camoufox · Pillow · pydantic · curl-cffi
 
 ## Port Uyarısı
 
@@ -211,7 +211,7 @@ camoufox-harness/       → Zig sidecar (Juggler protocol, vendor binary gömül
 - [x] **Tek tık kurulum** — `pnpm add -g @kahinmcp/kahin`, sonra `kahin` (ilk çalıştırmada Python ortamını otomatik kurar)
 - [ ] **Zero-dependency** hedefi (Go/Rust portu)
 - [ ] **LSP modu** — kod içinde hata yakalama, AI'a yanlışını yüzüne vurma
-- [x] **Tool sayısı 155** — Camoufox Juggler-native 106 tool (gerçek-zamanlı DOM stream, DOM, Reliability, Input, Network, Storage, Emulation, Dialog, Tab, Worker/WS, Upload, Screencast + Watch, Accessibility, Engine sağlığı/istatistik, Agent-native snapshot/form/state/identity/status, Stealth audit/humanized input/identity pins/proxy geo) + CF-Clear 2 (embedded solver + status) + paylaşılan 47 çekirdek (Grimoire 7, Seraph 3, Pilot 9, Trainman 4, DejaVu 4, Prophecy 5, Healer 1, Crawler 7, Engine 2, Visualization 1, Extensions 1, OCR dahil)
+- [x] **Tool sayısı 155** — Camoufox Juggler-native 106 tool (gerçek-zamanlı DOM stream, DOM, Reliability, Input, Network, Storage, Emulation, Dialog, Tab, Worker/WS, Upload, Screencast + Watch, Accessibility, Engine sağlığı/istatistik, Agent-native snapshot/form/state/identity/status, Stealth audit/humanized input/identity pins/proxy geo) + CF-Clear 2 (tarayıcısız hızlı yol: curl_cffi impersonate safari18_0 → chrome131, düz CF'yi browser'sız geçer + JS/challenge/canvas için embedded solver + status) + paylaşılan 47 çekirdek (Grimoire 7, Seraph 3, Pilot 9, Trainman 4, DejaVu 4, Prophecy 5, Healer 1, Crawler 7, Engine 2, Visualization 1, Extensions 1, OCR dahil)
 - [x] **Faz 4 performans yüzeyi** — non-blocking Zig sidecar (N=20 probe: paralel duvar 56.89 → 8.71 ms, ratio 1.314 → 3.281), `kahin_engine_stats` (monotonic uptime + per-tool rollup, top_slow ≤ 10) ve identity başına bounded prewarm metadata (launch asla atlanmaz; dürüst reuse kaydı)
 - [ ] **Obscura ayrı tool'ları** — CDP-yeteneklerine özel pilot_obscura/trainman_obscura/dejavu_obscura kategorilerini doldur
 

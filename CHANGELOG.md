@@ -8,6 +8,7 @@
 - feat(watch): add localhost-only `kahin_mirage_watch_start` / `kahin_mirage_watch_stop` MJPEG live watch fed by the existing screencast pump; manual frame calls may race the watch pump
 - verify(live): real nopecha Cloudflare attempt returned `cleared:false`, `method:timeout`, `clicks:0`; live watch `/snapshot.jpg` returned JPEG `ffd8ff`, and three screencast frames were ACKed with pending `0`
 - docs: `AGENTS.md`/`README.md` tool envanteri kod gerçeğine senkronlandı — 155 kayıtlı tool (Mirage 106 + CF-Clear 2 + paylaşılan 47); `kahin_ocr`, `kahin_cf_clear`/`kahin_cf_status`, `kahin_mirage_watch_start`/`kahin_mirage_watch_stop` artık dokümanda listeli
+- feat(cf): `kahin_cf_clear` artık önce tarayıcısız hızlı yol dener (curl_cffi impersonate: safari18_0 → chrome131, yalnızca python, browser açılmyor); düz CF burada geçilir (`method: fast:<profile>`, `browser: false`). Yalnızca JS/challenge/canvas kanıtlanınca browser yoluna düşülür (embedded solver). Yeni bağımlılık: `curl-cffi>=0.11`. Canlı kanıt: `use.ai` → `{cleared:true, method:fast:safari18_0, status:200, browser:false, elapsedMs:185}`
 
 ## [0.3.10] — 2026-08-09
 

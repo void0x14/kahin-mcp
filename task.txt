@@ -1,0 +1,57 @@
+ÇÖZÜLEMEYEN — ve nedeni, kanıt düzeyinde:
+iframe içine JS enjeksiyonu. Üç kapalı kapı:
+1. Widget iframe Juggler frame ağacında listelenmiyor (cross-origin OOPIF + closed shadow) → frame_id yok → Juggler frame eval'e erişim yok. Kanıt: Page.getFrameTree sadece challenge kopyasını veriyor; gerçek widget iframe ağaçta yok.
+2. Ana dünyadan contentDocument: "Permission denied". forceScopeAccess=true config'te, camouGetBool canlı true dönüyor — ama evaluate master sandbox'ta KOŞMUYOR (window===globalThis testi page-world gösterdi). Master sandbox'ın neden devreye girmediği: çözülmemiş, en net açık soru. System principal olsaydı cross-origin okuma açılacaktı.
+3. Kahin yüzeyinde custom expression + frame_id alan tool yok. Helper (_mirage_eval_result) kodda hazır, hiçbir tool'a bağlanmamış.
+Koordinat tıklamasının neden işlemediği: BİLİNMİYOR. Ayırt eden testi (shadow içi cross-origin tıklama probu) kurdum, sayfa yenilenmesi probu öldürdü, koşmadım. Sebep uydurmadım — kanıt yok.
+
+GÖREV: Camoufox (Firefox fork) tarayıcısında, bir web sayfasındaki çapraz-kökenli (cross-origin) iframe elementine programatik erişim sağlamak.
+
+ORTAM (doğrulanmış gerçekler, tekrar doğrulanmadan varsayılmasın):
+- Tarayıcı: Camoufox 152.0.4-beta.30, dizin: ~/.cache/camoufox/browsers/official/152.0.4-beta.30-5720d45b/
+- Kontrol katmanı: cdp-kahin-mcp projesi, Juggler pipe protokolü üzerinden konuşur (CDP değil; CDP şeması geçerli değil)
+- Engine sürüm durumu: beta.30 omni.ja içinde Juggler JS kodu günceldir:
+  - FrameTree.js: _getMasterSandbox() → Cu.Sandbox(systemPrincipal, {sandboxPrototype: domWindow, wantXrays: true, freshCompartment: true})
+  - FrameTree.js: _createIsolatedContext(name, useMaster=false) → useMaster=true VE ChromeUtils.camouGetBool('forceScopeAccess', false) ise master sandbox kullanılır
+  - FrameTree.js: _onGlobalObjectCleared() → _createIsolatedContext('', true) çağrısı yapar (varsayılan dünya, useMaster=true)
+  - Runtime.js: mainWorldContext() + "mw:" ön ekli script yolu mevcut; gate: ChromeUtils.camouGetBool('allowMainWorld', false)
+- Konfigürasyon: CAMOU_CONFIG ortam değişkeninde "forceScopeAccess": true kanıtlandı (/proc/<pid>/environ); canlı ChromeUtils.camouGetBool('forceScopeAccess') == true döndü
+
+DOĞRULANMIŞ MEVCUT DURUM:
+1. Ana sayfa JS bağlamından, Element.shadowRootUnl WebIDL özniteliği çalışıyor:
+   kapalı shadow root (attachShadow({mode:'closed'})) döndürülebiliyor ve içi sorgulanabiliyor.
+2. Hedef element bulundu: <iframe> elementi, kapalı shadow root içinde, src="https://challenges.cloudflare.com/...", viewport dikdörtgeni (x:512, y:304, w:300, h:65).
+3. Ana bağlamdan ifr.contentDocument → null döndü.
+4. Ana bağlamdan ifr.contentWindow.document → "Permission denied to access property document on cross-origin object".
+5. ChromeUtils.waiveXrays(ifr.contentWindow) çalıştı ama ardından .document erişimi aynı hatayı verdi.
+6. contentWindow.wrappedJSObject → aynı hata.
+7. Juggler Page.getFrameTree yalnızca bir alt frame listeliyor: subframe-17179869188, url alanı boş string. Widget iframe'i ağaçta YOK.
+8. Kahin'de _mirage_eval_result(expression, frame_id) yardımcı fonksiyonu mevcut (kahin/tools/_common.py:609-672): frame_id verilirse Runtime.evaluate + executionContextId parametreleriyle çağrı yapıyor; frame_id yoksa ana frame'e gidiyor.
+9. Kontrollü deneyler: (a) kapalı shadow root içindeki <button> elementine Page.dispatchMouseEvent ile tıklama → click event alındı (kanıt: sayaç 1). (b) sandbox'lı srcdoc iframe (cross-origin izolasyonu) içindeki <button> elementine aynı yöntemle tıklama → click event alındı (kanıt: sayaç 1).
+
+GÖREV: Aşağıdaki iki hedeften birini ÇALIŞIR hale getir; hangisi önce çalışırsa o kabul edilir:
+- Hedef A: ana bağlamdan, adımı 3-6'da belirtilen cross-origin iframe'in iç DOM'una erişim (contentDocument veya eşdeğeri), ya da
+- Hedef B: o iframe'in kendi JS bağlamında rastgele JS ifadesi çalıştırma (frame_id ile evaluate).
+
+KISITLAR:
+1. Sıfır derleme (build yok): yalnızca JS/Python kaynak dosyası düzenlemesi ve zip repack (omni.ja) izinli; her yama öncesi dosya yedekleri alınır.
+2. Her varsayım, doğrulanabilir bir komut veya kod satırıyla eşlenmelidir. Varsayım listesi + kanıt listesi ayrı tutulur.
+3. Başarısızlıkta: hangi adımın, hangi hata mesajıyla, hangi kanıt dosyasında bıraktığını kaydet; ayrıca o hatanın A, B, C hangi kapıyı kapattığını etiketle.
+4. Erişim sağlandığında üretilecek çıktı kesin şu formatta bir nesne:
+   {frameFound: bool, frameId: string|null, iframeRect: {x,y,w,h}, checkboxRect: {x,y,w,h}|null, absoluteCenter: {x,y}|null}
+5. Test hedefi: herhangi bir sayfada kapalı shadow root içine gömülmüş sandbox'lı cross-origin iframe (kendi probunla üretilebilir; harici siteye bağımlılık yok).
+
+ARAŞTIRMA SORULARI (sırayla yanıtlanacak, her biri kanıtlı):
+Q1: Runtime.evaluate çağrısında executionContextId verilmediğinde, çağrı hangi executionContext'e gidiyor? (_common.py ve Juggler Runtime.js kaynak okuma ile karar ver; iddialı değil, satır referanslı)
+Q2: Beta.30'da _createIsolatedContext('', true) gerçekten çalışıyor mu? (canlı test: evaluate içinde ChromeUtils.camouGetBool('forceScopeAccess') kontrolü yeterli ama YETMEZ; sandbox'ın system-principal olduğunu kanıtlayan ikinci bir test gerekiyor — örn. system-principal'e özgü bir API çağrısı)
+Q3: Eğer evaluate master sandbox'ta koşmuyorsa, hangi code path ana dünyaya gidiyor? Kaynak satırıyla göster.
+Q4: Juggler frame ağacına, kapalı shadow root içindeki iframe'lerin eklenmesini engelleyen kod nerede? (FrameTree.js / TargetRegistry.js satır referansı) — bulursan, minimal yamayı yaz.
+Q5: OOPIF (out-of-process iframe) durumunda Juggler'ın frame-level evaluate mekanizması nasıl çalışıyor? TargetRegistry.js ve PageHandler.js'ten izle; beta.30'da OOPIF frame'lerin kendi sessionId'si var mı?
+
+KABUL KRİTERİ (kesin, tartışmasız):
+Kendi ürettiğin test sayfasında: kapalı shadow root içindeki sandbox'lı cross-origin iframe içindeki <input type=checkbox> elementi için yukarıdaki 4. maddede tanımlı JSON çıktısı döner. Bu tek test. Hiçbir şey bu testi geçmeden "çözüldü" sayılmaz.
+
+RAPOR FORMATI (tek bölüm, çelişkisiz):
+- ÇÖZÜLDÜ: hangi hedef (A/B), kanıt komutu, kanıt çıktı
+- ÇÖZÜLEMEDİ: hangi adım, hangi hata, hangi kapı (A: frame ağacı eksik / B: cross-origin Xray duvarı / C: yüzey eksikliği), hangi kanıt dosyası
+- Her iddia satırına komut veya dosya-satır referansı ekle. Referansı olmayan cümle raporda yer almaz.

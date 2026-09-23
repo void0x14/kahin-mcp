@@ -70,8 +70,8 @@ def test_server_initialize_and_list_tools() -> None:
     # Faz 4 crawler contract: +1 challenge status + 6 single-engine crawler
     # lifecycle tools = 146. Live crawl event deltas and visualization add
     # Extension staging adds 1 = 149. OCR adds 1 = 150. Live watch adds 2 = 152;
-    # cf_clear/status add 2 = 154.
-    assert len(tools) == 154
+    # cf_clear/status add 2 = 154; kahin_mirage_eval adds 1 = 155.
+    assert len(tools) == 155
     assert "kahin_mirage_watch_start" in tool_names
     assert "kahin_mirage_watch_stop" in tool_names
     assert "kahin_mirage_dom_start" in tool_names

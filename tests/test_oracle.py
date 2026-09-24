@@ -71,7 +71,9 @@ def test_server_initialize_and_list_tools() -> None:
     # lifecycle tools = 146. Live crawl event deltas and visualization add
     # Extension staging adds 1 = 149. OCR adds 1 = 150. Live watch adds 2 = 152;
     # cf_clear/status add 2 = 154; kahin_mirage_eval adds 1 = 155.
-    assert len(tools) == 155
+    # Passkey mode adds 4 Bitwarden setup tools = 159.
+    assert "kahin_passkey_setup_open" in tool_names
+    assert len(tools) == 159
     assert "kahin_mirage_watch_start" in tool_names
     assert "kahin_mirage_watch_stop" in tool_names
     assert "kahin_mirage_dom_start" in tool_names

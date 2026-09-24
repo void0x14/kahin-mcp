@@ -21,7 +21,8 @@ dependencies = [
     "Pillow>=11.0",
     # Mirage/Camoufox is the default engine and therefore a core runtime
     # dependency; a fresh install must be able to start the declared engine.
-    "camoufox[geoip]>=0.1",
+    "camoufox[geoip]>=0.5.4,<1",
+    "marionette-driver>=3.7,<4",
 ]
 
 [project.scripts]

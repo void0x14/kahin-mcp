@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -414,6 +415,9 @@ class Mirage(BrowserEngine):
         self._stderr_path: Path | None = None
         self._profile_dir: Path | None = None
         self._persistent_profile = False
+        self._headless = True
+        self._marionette_port: int | None = None
+        self._passkey_mode = False
         self._addons: list[str] = []
         # Active identity applied at launch (Faz 2 Task 5): the resolved
         # fingerprint config plus the saved identity name it came from.
@@ -506,8 +510,16 @@ class Mirage(BrowserEngine):
             self._screencast_event.clear()
             self._network_signal.clear()
 
-    async def start(self, headless: bool = True, port: int = 0, **kwargs: Any) -> EngineContext:
+    async def start(
+        self,
+        headless: bool = True,
+        port: int = 0,
+        *,
+        passkey_mode: bool = False,
+        **kwargs: Any,
+    ) -> EngineContext:
         del port  # Juggler pipe: no port.
+        self._headless = bool(headless)
         # A Mirage object is normally single-use, but resetting these fields
         # makes a stop/start cycle deterministic and prevents stale tab or
         # liveness state from leaking into a replacement browser.
@@ -533,14 +545,28 @@ class Mirage(BrowserEngine):
         self._launch_policy = None
         self._started_monotonic = None
         self._persistent_profile = False
+        self._marionette_port = None
+        self._passkey_mode = False
         configured_profile = kwargs.get("profile_dir")
         persistent_profile = kwargs.get("persistent_profile", True)
         if not isinstance(persistent_profile, bool):
             raise ValueError("persistent_profile must be a boolean")
+        if not isinstance(passkey_mode, bool):
+            raise ValueError("passkey_mode must be a boolean")
+        if passkey_mode and not persistent_profile:
+            raise ValueError("passkey_mode requires persistent_profile=True")
+        self._passkey_mode = passkey_mode
         profile_dir, self._persistent_profile = _profile_directory(
             persistent_profile,
             configured_profile,
         )
+        if passkey_mode:
+            # Firefox Marionette shares the existing Camoufox process. Bind
+            # to loopback only and release immediately so Firefox can claim
+            # this ephemeral port during startup.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                self._marionette_port = int(sock.getsockname()[1])
         addons_input = kwargs.get("addons")
         validated_addons: list[str] = []
         if addons_input is not None:
@@ -665,6 +691,10 @@ class Mirage(BrowserEngine):
                     logger.warning("identity config injection failed; using defaults", exc_info=True)
         opts_ms = (time.monotonic() - opts_t0) * 1000
         env = {**os.environ, **opts["env"]}
+        if self._passkey_mode:
+            env["MOZ_MARIONETTE"] = "1"
+        else:
+            env.pop("MOZ_MARIONETTE", None)
         # Allow hardware GPU acceleration unless explicitly overridden by environment
         if os.environ.get("KAHIN_FORCE_SOFTWARE_GL") == "1":
             env["LIBGL_ALWAYS_SOFTWARE"] = "1"
@@ -703,6 +733,8 @@ class Mirage(BrowserEngine):
         profile_t0 = time.monotonic()
         try:
             prefs = opts.get("firefox_user_prefs") or {}
+            if self._passkey_mode:
+                prefs = {**prefs, "marionette.port": self._marionette_port}
             if prefs:
                 lines = [f"user_pref({json.dumps(k)}, {json.dumps(v)});" for k, v in prefs.items()]
                 (profile_dir / "user.js").write_text("\n".join(lines) + "\n")
@@ -2099,6 +2131,8 @@ class Mirage(BrowserEngine):
         self._prewarm_info = None
         self._launch_policy = None
         self._started_monotonic = None
+        self._marionette_port = None
+        self._passkey_mode = False
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.cancel()

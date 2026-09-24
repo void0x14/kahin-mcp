@@ -385,6 +385,7 @@ async def browser_start(
     persistent_profile: bool = True,
     profile_dir: str | None = None,
     addons: list[str] | None = None,
+    passkey_mode: bool = False,
 ) -> str:
     """Start or reuse one browser engine.
 
@@ -408,7 +409,9 @@ async def browser_start(
     By default the Mirage profile is persistent, so native cookies and web
     storage survive a clean browser restart. Set ``persistent_profile=False``
     for a disposable profile; ``profile_dir`` selects an explicit absolute
-    persistent directory.
+    persistent directory. ``passkey_mode`` installs the signed Bitwarden XPI
+    into the persistent profile before launch; it reports installation only,
+    and does not inspect whether the vault is logged in or unlocked.
     """
     if not isinstance(engine, str):
         return _json_error("kahin_browser_start", "engine must be a string", "invalid_argument", field="engine")
@@ -429,6 +432,13 @@ async def browser_start(
             "persistent_profile must be a boolean",
             "invalid_argument",
             field="persistent_profile",
+        )
+    if not isinstance(passkey_mode, bool):
+        return _json_error(
+            "kahin_browser_start",
+            "passkey_mode must be a boolean",
+            "invalid_argument",
+            field="passkey_mode",
         )
     if profile_dir is not None:
         profile_dir, profile_error = _validate_text(
@@ -620,6 +630,20 @@ async def browser_start(
             "unknown_engine",
             field="engine",
         )
+    if passkey_mode and engine not in ("mirage", "camoufox"):
+        return _json_error(
+            "kahin_browser_start",
+            "passkey_mode requires the Mirage/Camoufox engine",
+            "invalid_argument",
+            field="engine",
+        )
+    if passkey_mode and not requested_persistent:
+        return _json_error(
+            "kahin_browser_start",
+            "passkey_mode requires a persistent profile",
+            "invalid_argument",
+            field="persistent_profile",
+        )
 
     async with state._lifecycle_lock:
         async with _healer_ref.safe("kahin_browser_start", engine=engine, headless=headless, port=port):
@@ -629,6 +653,18 @@ async def browser_start(
                     current_kind = "shadow" if isinstance(current, Obscura) else "mirage"
                     requested_kind = "shadow" if engine == "shadow" else "mirage"
                     if current_kind == requested_kind:
+                        active_passkey_mode = bool(getattr(current, "_passkey_mode", False))
+                        if passkey_mode and not active_passkey_mode:
+                            return orjson.dumps(
+                                {
+                                    "error": "The active Mirage engine was started without passkey mode; stop it before enabling passkeys.",
+                                    "hint": "Stop the engine with kahin_browser_stop, then start it again with passkey_mode=true.",
+                                    "code": "engine_config_conflict",
+                                    "requested": {"passkey_mode": True},
+                                    "active": {"passkey_mode": False},
+                                },
+                                option=orjson.OPT_INDENT_2,
+                            ).decode()
                         # Same browser, same process: callers may safely make
                         # start part of their setup without leaking a child.
                         # A requested identity/proxy that differs from the
@@ -669,7 +705,7 @@ async def browser_start(
                         current_port = (
                             getattr(current, "port", None) if current_kind == "shadow" else 0
                         )
-                        return orjson.dumps({
+                        reuse_result = {
                             "status": "reused",
                             "engine": current_kind,
                             "capabilities": capabilities_for(current_kind),
@@ -679,7 +715,20 @@ async def browser_start(
                             "message": "Engine already running; reusing the existing browser and tabs.",
                             "port": current_port or 0,
                             "tabs": tabs,
-                        }, option=orjson.OPT_INDENT_2).decode()
+                        }
+                        if passkey_mode:
+                            reuse_result["passkey_mode"] = True
+                            reuse_result["passkey_extension"] = {
+                                "state": "installed_in_profile",
+                                "vault_state": "unknown",
+                            }
+                        elif active_passkey_mode:
+                            reuse_result["passkey_mode"] = True
+                            reuse_result["passkey_extension"] = {
+                                "state": "installed_in_profile",
+                                "vault_state": "unknown",
+                            }
+                        return orjson.dumps(reuse_result, option=orjson.OPT_INDENT_2).decode()
                     return orjson.dumps({
                         "error": f"Engine {current_kind} already running. Stop it before switching to {engine}.",
                         "hint": "Reuse the current engine or use its tab tools; no second browser was started.",
@@ -712,6 +761,22 @@ async def browser_start(
                     **browser_lock_error,
                 )
 
+            if passkey_mode:
+                try:
+                    from kahin.bitwarden import install_bitwarden_into_profile
+
+                    await asyncio.to_thread(install_bitwarden_into_profile, requested_profile)
+                except asyncio.CancelledError:
+                    state.release_browser_lock()
+                    raise
+                except Exception:  # noqa: BLE001 - installer details may contain local paths
+                    state.release_browser_lock()
+                    return _json_error(
+                        "kahin_browser_start",
+                        "Could not install the built-in passkey extension into the browser profile",
+                        "passkey_extension_unavailable",
+                    )
+
             if engine == "shadow":
                 candidate: Any = Obscura()
                 actual_port = port
@@ -731,6 +796,8 @@ async def browser_start(
                         "profile_dir": profile_dir,
                         "addons": addons,
                     }
+                    if passkey_mode:
+                        start_kwargs["passkey_mode"] = True
                 await asyncio.wait_for(
                     candidate.start(headless=headless, port=actual_port, **start_kwargs),
                     timeout=_ENGINE_START_TIMEOUT,
@@ -790,7 +857,7 @@ async def browser_start(
                 state.clear_state()
                 raise
 
-            return orjson.dumps({
+            start_result = {
                 "status": "started",
                 "engine": "mirage" if engine == "camoufox" else engine,
                 "capabilities": capabilities_for("mirage" if engine == "camoufox" else engine),
@@ -800,7 +867,14 @@ async def browser_start(
                 "port": actual_port,
                 "tabs": tabs,
                 "hint": "Reuse this browser; for separate work create/switch a Mirage tab.",
-            }, option=orjson.OPT_INDENT_2).decode()
+            }
+            if passkey_mode:
+                start_result["passkey_mode"] = True
+                start_result["passkey_extension"] = {
+                    "state": "installed_in_profile",
+                    "vault_state": "unknown",
+                }
+            return orjson.dumps(start_result, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_browser_stop", annotations=_RW)

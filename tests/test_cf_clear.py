@@ -2,6 +2,11 @@
 
 Covers argument validation and the static JS contracts. Live challenge
 solving is covered by test_e2e_cf_clear.py against a real Camoufox.
+
+NOTE: unit tests never touch the network. ``_fast_fingerprint_clear`` is
+always mocked to None so the browser path is exercised deterministically;
+``example.com`` has no Cloudflare protection and must never appear as a
+challenge host — tests use the reserved fake host ``cf-challenge.test``.
 """
 
 from __future__ import annotations
@@ -13,6 +18,12 @@ from typing import Any
 import pytest
 
 from kahin.tools import cf_clear_mirage as cf
+
+_TEST_URL = "https://cf-challenge.test/"
+
+
+async def _no_fast(_url: str, _host: str, _started: float) -> None:
+    return None
 
 
 @pytest.mark.asyncio
@@ -41,8 +52,10 @@ async def test_cf_clear_rejects_hostless_url() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cf_clear_without_engine_reports_unavailable() -> None:
-    resp = json.loads(await cf.cf_clear(url="https://example.com", timeout=5))
+async def test_cf_clear_without_engine_reports_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Fast path mocked: unit tests never touch the network.
+    monkeypatch.setattr(cf, "_fast_fingerprint_clear", _no_fast)
+    resp = json.loads(await cf.cf_clear(url=_TEST_URL, timeout=5))
     assert resp["code"] == "engine_unavailable"
 
 
@@ -199,6 +212,8 @@ async def test_fast_path_requires_host_scoped_clearance(monkeypatch: pytest.Monk
 
     async def no_sleep(_seconds: float) -> None:
         return None
+    monkeypatch.setattr(cf, "_fast_fingerprint_clear", _no_fast)
+    monkeypatch.setattr(cf, "_eval_value", lambda *a, **k: _async_value(None))
 
     monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
     monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
@@ -208,7 +223,7 @@ async def test_fast_path_requires_host_scoped_clearance(monkeypatch: pytest.Monk
     monkeypatch.setattr(cf, "_find_checkbox", lambda _sid: _async_value({"x": 10.0, "y": 10.0}))
     monkeypatch.setattr(cf, "_click_turnstile", fake_click)
     monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
-    result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
+    result = json.loads(await cf.cf_clear(_TEST_URL, timeout=5))
     assert result["cleared"] is False
     assert result["method"] == "timeout"
 
@@ -223,6 +238,8 @@ async def test_no_widget_fails_fast_without_clicks(monkeypatch: pytest.MonkeyPat
     async def no_sleep(_seconds: float) -> None:
         return None
 
+    monkeypatch.setattr(cf, "_fast_fingerprint_clear", _no_fast)
+    monkeypatch.setattr(cf, "_eval_value", lambda *a, **k: _async_value(None))
     monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
     monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
     monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value({"detected": True, "kind": "turnstile"}))
@@ -230,11 +247,14 @@ async def test_no_widget_fails_fast_without_clicks(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(cf, "_is_blocked", lambda _sid: _async_value(None))
     monkeypatch.setattr(cf, "_find_checkbox", lambda _sid: _async_value(None))
     monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value({}))
+    monkeypatch.setattr(cf, "_page_cf_cookie_names", lambda _sid: _async_value([]))
     monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
-    result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
+    result = json.loads(await cf.cf_clear(_TEST_URL, timeout=5))
+    # No checkbox, no clearance, keyboard path dispatches nothing testable:
+    # bounded loop exhausts into timeout with zero clicks, never a hammer.
     assert result["cleared"] is False
-    assert result["method"] == "no_widget"
-    assert "clicks" not in result
+    assert result["method"] == "timeout"
+    assert result["clicks"] == 0
     assert result["action"] == "pause_for_human_or_authorized_provider"
 
 
@@ -251,6 +271,9 @@ async def test_stale_clearance_terminal_diagnosis(monkeypatch: pytest.MonkeyPatc
     async def no_sleep(_seconds: float) -> None:
         return None
 
+    monkeypatch.setattr(cf, "_fast_fingerprint_clear", _no_fast)
+    monkeypatch.setattr(cf, "_eval_value", lambda *a, **k: _async_value(None))
+    monkeypatch.setattr(cf, "_scrub_host_cf_cookies", lambda _sid, _host: _async_value(1))
     monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
     monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
     monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value({"detected": True, "kind": "turnstile"}))
@@ -260,12 +283,109 @@ async def test_stale_clearance_terminal_diagnosis(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(cf, "_click_turnstile", fake_click)
     monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value({"cf_clearance": "dead-token"}))
     monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
-    result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
+    result = json.loads(await cf.cf_clear(_TEST_URL, timeout=5))
     assert result["cleared"] is False
     assert result["method"] == "stale_clearance"
     assert result["clicks"] >= 1
+    assert result["scrubbed"] == 1
     assert result["action"] == "pause_for_human_or_authorized_provider"
 
+
+@pytest.mark.asyncio
+async def test_stale_clearance_recovers_with_fresh_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Self-heal: scrub dead jar -> ONE re-navigate inside the same budget ->
+    # fresh cf_clearance + open page = cleared:true with method stale_recovered.
+    # Both eval layers stay consistent: _eval_value answers _IS_BYPASSED_JS
+    # with a bypassed dict (wall phase first, open phase after scrub).
+    class FakeEngine:
+        async def call(self, method: str, params: dict[str, Any], session_id: str | None = None) -> Any:
+            assert method in ("Page.navigate", "Browser.getCookies")
+            if method == "Page.navigate":
+                return {"frameId": "main"}
+            return {"cookies": []}
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    phase = {"open": False}
+
+    async def fake_eval(expression: str, session_id: str, frame_id: str | None = None) -> Any | None:
+        if "just a moment" in expression:
+            return {"bypassed": phase["open"]}
+        return None
+
+    async def fake_click(_sid: str) -> tuple[bool, bool]:
+        return True, False
+
+    async def fake_scrub(_sid: str, _host: str) -> int:
+        phase["open"] = True
+        return 2
+
+    jar = {"cookies": {"cf_clearance": "dead-token"}}
+
+    async def fake_cookies(_sid: str, _host: str) -> dict[str, str]:
+        return dict(jar["cookies"])
+
+    async def post_scrub_cookies(_sid: str, _host: str) -> dict[str, str]:
+        # After scrub the dead jar is gone; the re-navigated challenge
+        # mints a fresh token once the wall opens.
+        if phase["open"]:
+            return {"cf_clearance": "fresh-token"}
+        return {"cf_clearance": "dead-token"}
+
+    monkeypatch.setattr(cf, "_fast_fingerprint_clear", _no_fast)
+    monkeypatch.setattr(cf, "_eval_value", fake_eval)
+    monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
+    monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
+    monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value({"detected": True, "kind": "turnstile"}))
+    monkeypatch.setattr(cf, "_is_blocked", lambda _sid: _async_value(None))
+    monkeypatch.setattr(cf, "_find_checkbox", lambda _sid: _async_value({"x": 10.0, "y": 10.0}))
+    monkeypatch.setattr(cf, "_click_turnstile", fake_click)
+    monkeypatch.setattr(cf, "_cf_cookies", post_scrub_cookies)
+    monkeypatch.setattr(cf, "_scrub_host_cf_cookies", fake_scrub)
+    monkeypatch.setattr(cf, "_page_cf_cookie_names", lambda _sid: _async_value([]))
+    monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
+    result = json.loads(await cf.cf_clear(_TEST_URL, timeout=60))
+    assert result["cleared"] is True
+    assert result["method"] == "stale_recovered"
+    assert result["scrubbed"] == 2
+
+@pytest.mark.asyncio
+async def test_scrub_expires_only_host_cf_cookies(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Targeting via Browser.setCookies (the only cookie-write surface in the
+    # Juggler schema): only cf_/__cf names on the target host are expired,
+    # each (name, domain, path) copy individually; session cookies and
+    # other sites' clearance survive. Unknown engine methods raise like
+    # the real Mirage call() does (RuntimeError on -32601).
+    expired: list[dict[str, Any]] = []
+
+    class FakeEngine:
+        async def call(self, method: str, params: dict[str, Any], session_id: str | None = None) -> Any:
+            if method == "Browser.getCookies":
+                return {"cookies": [
+                    {"name": "cf_clearance", "value": "dead", "domain": ".cf-challenge.test", "path": "/"},
+                    {"name": "cf_clearance", "value": "dead2", "domain": "cf-challenge.test", "path": "/cdn-cgi/"},
+                    {"name": "__cf_bm", "value": "x", "domain": "cf-challenge.test", "path": "/"},
+                    {"name": "cf_clearance", "value": "other", "domain": ".other.test", "path": "/"},
+                    {"name": "session", "value": "keep", "domain": ".cf-challenge.test", "path": "/"},
+                ]}
+            if method == "Browser.setCookies":
+                expired.extend(params["cookies"])
+                return {}
+            raise RuntimeError(f"CDP error -32601: '{method}' wasn't found")
+
+    monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
+    out = await cf._scrub_host_cf_cookies("sid", "cf-challenge.test")
+    assert out == 3
+    assert sorted(c["name"] for c in expired) == ["__cf_bm", "cf_clearance", "cf_clearance"]
+    assert all("cf-challenge.test" in c["domain"] for c in expired)
+    assert all(c["expires"] == 1 and c["value"] == "" for c in expired)
+    assert len({(c["name"], c["domain"], c["path"]) for c in expired}) == 3
+
+@pytest.mark.asyncio
+async def test_scrub_returns_zero_without_cf_cookies(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value({}))
+    assert await cf._scrub_host_cf_cookies("sid", "cf-challenge.test") == 0
 
 async def _session() -> tuple[str, None]:
     return "sid", None
@@ -301,13 +421,15 @@ async def test_fast_path_clears_with_host_clearance_and_empty_page_names(
     async def no_sleep(_seconds: float) -> None:
         return None
 
+    monkeypatch.setattr(cf, "_fast_fingerprint_clear", _no_fast)
+    monkeypatch.setattr(cf, "_eval_value", lambda *a, **k: _async_value(None))
     monkeypatch.setattr(cf, "_capture_page_session", lambda _tool: _session())
     monkeypatch.setattr(cf, "_mirage_engine", lambda: FakeEngine())
     monkeypatch.setattr(cf, "_challenge_probe", lambda _sid: _async_value(_ready()))
     monkeypatch.setattr(cf, "_is_bypassed", lambda _sid: _true())
     monkeypatch.setattr(cf, "_cf_cookies", lambda _sid, _host: _async_value(_cookies_with_clearance()))
     monkeypatch.setattr(cf.asyncio, "sleep", no_sleep)
-    result = json.loads(await cf.cf_clear("https://example.com", timeout=5))
+    result = json.loads(await cf.cf_clear(_TEST_URL, timeout=5))
     assert result["cleared"] is True
     assert result["method"] == "none"
     assert "cf_clearance" in result["cfCookies"]
@@ -315,7 +437,7 @@ async def test_fast_path_clears_with_host_clearance_and_empty_page_names(
 
 @pytest.mark.asyncio
 async def test_empty_frame_url_requires_selected_frame_origin(monkeypatch: pytest.MonkeyPatch) -> None:
-    tree = {"frame": {"id": "main", "url": "https://example.com"}, "childFrames": [
+    tree = {"frame": {"id": "main", "url": _TEST_URL}, "childFrames": [
         {"frame": {"id": "challenge", "parentId": "main", "url": ""}},
     ]}
     monkeypatch.setattr(cf, "_frame_tree", lambda _sid: _async_value(tree))

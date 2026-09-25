@@ -537,6 +537,63 @@ async def _cf_cookies(session_id: str, host: str) -> dict[str, str]:
     return out
 
 
+async def _scrub_host_cf_cookies(session_id: str, host: str) -> int:
+    """Expire host-scoped CF cookies so a voided token cannot pin the jar.
+
+    Juggler has no ``Network.deleteCookies`` — the only cookie-write
+    surface is ``Browser.setCookies`` (schema-verified: name/value plus
+    optional domain/path/expires). Deletion = overwrite the same
+    (name, domain, path) with ``value=""`` and ``expires=1`` — the
+    standard expire-to-delete pattern Playwright documents for
+    ``context.clearCookies({name, domain})`` scoping.
+    Only CF names (``cf_`` / ``__cf`` prefix) whose domain covers ``host``
+    are touched — every copy (each domain/path pair) is expired
+    individually; every other cookie in the persistent profile survives.
+    Best-effort: any failure returns how many were expired so far; the
+    caller retries the challenge either way. Returns the count.
+    """
+    engine = _mirage_engine()
+    cf = await _cf_cookies(session_id, host)
+    if not cf:
+        return 0
+    try:
+        payload = await engine.call("Browser.getCookies", {}, session_id=session_id)
+    except Exception:  # noqa: BLE001
+        return 0
+    cookies = (payload or {}).get("cookies") if isinstance(payload, dict) else None
+    if not isinstance(cookies, list):
+        return 0
+    host = host.lower()
+    targets: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        name = cookie.get("name")
+        domain = str(cookie.get("domain") or "").lower().lstrip(".")
+        path = str(cookie.get("path") or "/")
+        if not (isinstance(name, str) and name in cf):
+            continue
+        if not domain or not (host == domain or host.endswith("." + domain)):
+            continue
+        key = (name, domain, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append({"name": name, "value": "", "domain": domain, "path": path})
+    if not targets:
+        return 0
+    try:
+        await engine.call(
+            "Browser.setCookies",
+            {"cookies": [{**t, "expires": 1} for t in targets]},
+            session_id=session_id,
+        )
+    except Exception:  # noqa: BLE001 - expire write failed, jar untouched
+        return 0
+    return len(targets)
+
+
 async def _page_cf_cookie_names(session_id: str) -> list[str]:
     """cf_ cookies visible in page context (non-httpOnly, this document)."""
     value = await _eval_value(
@@ -758,17 +815,40 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
         # Live truth (Chromium control, 2026-09-16): CF can issue a
         # host-scoped cf_clearance yet keep serving the interstitial —
         # clearance written, page never opens, reload does not help.
-        # That cookie is dead weight, not progress: retrying clicks
-        # against it is wasted work. Report it as its own terminal
-        # diagnosis so callers stop instead of looping.
+        # That cookie is dead weight: the jar keeps sending a token CF
+        # already voided, so every retry re-presents the same dead token.
+        # Self-heal instead of stopping: scrub the host-scoped CF cookies
+        # (this host only — the rest of the persistent profile survives),
+        # re-navigate for ONE fresh-challenge attempt inside the same
+        # budget, then fall through to the terminal diagnosis when the
+        # wall still stands. No caller initiative required.
         if "cf_clearance" in cf:
+            scrubbed = await _scrub_host_cf_cookies(session_id, host)
+            remaining = time.monotonic()
+            if scrubbed and remaining < deadline:
+                try:
+                    await engine.call("Page.navigate", {"url": url}, session_id=session_id)
+                    await asyncio.sleep(_INITIAL_SETTLE_SECONDS)
+                    if await _is_bypassed(session_id):
+                        fresh = await _cf_cookies(session_id, host)
+                        if "cf_clearance" in fresh:
+                            return _dump({"cleared": True,
+                                          "method": "stale_recovered",
+                                          "url": url, "cfCookies": sorted(fresh),
+                                          "clicks": clicks, "scrubbed": scrubbed,
+                                          "elapsedMs": elapsed_ms()})
+                except Exception:  # noqa: BLE001 - recovery is best-effort, diagnosis below is the floor
+                    pass
+            probe = await _challenge_probe(session_id)
+            kind = (probe or {}).get("kind") if isinstance(probe, dict) else None
+            cf = await _cf_cookies(session_id, host)
             return _dump({"cleared": False, "method": "stale_clearance",
                           "url": url,
                           "reason": "host-scoped cf_clearance present but the "
                                     "interstitial still serves — CF voided the "
                                     "token, further clicks will not revive it",
                           "kind": kind, "cfCookies": sorted(cf),
-                          "clicks": clicks,
+                          "clicks": clicks, "scrubbed": scrubbed,
                           "action": "pause_for_human_or_authorized_provider",
                           "elapsedMs": elapsed_ms()})
         return _dump({"cleared": False, "method": "timeout", "url": url,

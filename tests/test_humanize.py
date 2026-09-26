@@ -13,9 +13,21 @@ def test_trajectory_endpoints_and_length() -> None:
 
 
 def test_trajectory_progresses_toward_target() -> None:
-    points = bezier_trajectory(0, 0, 1000, 0, steps=10, jitter=0.0)
+    # Core contract: along the segment axis the path never backtracks.
+    # (overshoot=False isolates this from the intentional end settle.)
+    points = bezier_trajectory(0, 0, 1000, 0, steps=10, jitter=0.0, overshoot=False)
     xs = [p[0] for p in points]
     assert xs == sorted(xs)
+    assert xs[-1] == 1000.0
+
+
+def test_trajectory_overshoot_is_bounded_and_settles() -> None:
+    # The optional overshoot stays within a few pixels and always settles
+    # exactly on the target as the final point.
+    points = bezier_trajectory(0, 0, 1000, 0, steps=12, jitter=0.0, seed=4, overshoot=True)
+    xs = [p[0] for p in points]
+    assert max(xs) > 1000.0  # seed 4 actually overshoots
+    assert max(xs) <= 1004.0  # bounded by the small correction
     assert xs[-1] == 1000.0
 
 

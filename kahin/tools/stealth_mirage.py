@@ -12,11 +12,12 @@ recommendations); `browser_start(proxy=...)` applies the proxy env.
 from __future__ import annotations
 
 import asyncio
+import math
 
 import orjson
 
 from kahin._mcp import mcp
-from kahin.humanize import bezier_trajectory, jittered_delay, typing_cadence
+from kahin.humanize import bezier_trajectory, jittered_delay, step_delays, typing_cadence
 from kahin.stealth import (
     STEALTH_PROBE_JS,
     _redact_proxy,
@@ -49,6 +50,26 @@ from kahin.tools.pilot_mirage import (
     get_last_mouse_position,
     mirage_key_text_fast,
 )
+
+
+# Momentum state: unit direction of the last generated trajectory so
+# consecutive calls form one continuous gesture instead of independent
+# arcs. Bounded: a single unit tuple, updated in place.
+_last_direction: tuple[float, float] | None = None
+
+
+def _remember_direction(points: list[tuple[float, float]]) -> tuple[float, float] | None:
+    """Store and return the unit direction of the last few movement points."""
+    global _last_direction
+    if len(points) < 2:
+        return _last_direction
+    tail = points[-min(6, len(points)):]
+    dx = tail[-1][0] - tail[0][0]
+    dy = tail[-1][1] - tail[0][1]
+    length = math.hypot(dx, dy)
+    if length > 1e-6:
+        _last_direction = (dx / length, dy / length)
+    return _last_direction
 
 
 @mcp.tool(name="kahin_stealth_audit", annotations=_RO)
@@ -98,12 +119,19 @@ async def stealth_audit(frame_id: str | None = None) -> str:
 
 @mcp.tool(name="kahin_mirage_mouse_trajectory", annotations=_DW)
 async def mirage_mouse_trajectory(
-    x: float, y: float, steps: int = 24, jitter: float = 2.0, seed: int | None = None,
+    x: float, y: float, steps: int = 0, jitter: float = 2.0, seed: int | None = None,
+    delay_ms: float = 4.0, delay_jitter_ms: float = 2.0,
 ) -> str:
-    """Mirage: move the mouse from its last position to (x, y) along a
-    jittered Bézier path — one Page.dispatchMouseEvent mousemove per step.
-    Returns {moved, from, to}; humanizes cursor travel between actions.
-    Bounds: steps 2..200, jitter 0..20px."""
+    """Mirage: move the mouse from its last position to (x, y) with one
+    continuous, human-like gesture — distance-adaptive step count,
+    ease-in-out speed profile (slow → fast → slow), tapered organic
+    wobble (no constant per-point jitter), momentum blended from the
+    previous movement so chained calls read as a single path, and an
+    optional slight overshoot with a natural settle.
+    ``steps=0`` auto-adapts to the distance; an explicit count 2..200 is
+    honoured. Returns {moved, from, to, points:[...]} containing the
+    REAL dispatched points. Bounds: steps 0..200, jitter 0..20px,
+    delay 0.5..30ms."""
     x_value, error = _strict_float(
         x, tool="kahin_mirage_mouse_trajectory", field="x",
         minimum=0.0, maximum=_MAX_COORDINATE,
@@ -116,8 +144,10 @@ async def mirage_mouse_trajectory(
     )
     if error:
         return error
-    steps_value = _bounded_int(steps, minimum=2, maximum=200, default=24)
+    steps_value = _bounded_int(steps, minimum=0, maximum=200, default=0)
     jitter_value = _bounded_float(jitter, minimum=0.0, maximum=20.0, default=2.0)
+    delay_value = _bounded_float(delay_ms, minimum=0.5, maximum=30.0, default=4.0)
+    delay_jitter = _bounded_float(delay_jitter_ms, minimum=0.0, maximum=15.0, default=2.0)
     async with _healer_ref.safe(
         "kahin_mirage_mouse_trajectory", x=x_value, y=y_value,
         steps=steps_value, jitter=jitter_value, seed=seed,
@@ -127,10 +157,13 @@ async def mirage_mouse_trajectory(
             return capture_error
         assert session_id is not None
         start_x, start_y = get_last_mouse_position()
+        entry_dir = _last_direction
         points = bezier_trajectory(
             start_x, start_y, x_value, y_value,
-            steps=steps_value, jitter=jitter_value, seed=seed,
+            steps=(steps_value if steps_value > 0 else None),
+            jitter=jitter_value, seed=seed, entry_dir=entry_dir,
         )
+        _remember_direction(points)
         if points and points[0] == (start_x, start_y):
             next_point = next((point for point in points[1:] if point != points[0]), None)
             if next_point is None:
@@ -146,19 +179,23 @@ async def mirage_mouse_trajectory(
                     (start_x + next_point[0]) / 2,
                     (start_y + next_point[1]) / 2,
                 )
-        for px, py in points:
+        delays = step_delays(len(points), base_ms=delay_value, jitter_ms=delay_jitter, seed=seed)
+        for index, (px, py) in enumerate(points):
             move = await _dispatch_mouse("mousemove", px, py, button=0, buttons=0, session_id=session_id)
             if _is_error_response(move):
                 return move
+            if index < len(points) - 1:
+                await asyncio.sleep(delays[index] / 1000.0)
         return orjson.dumps({
             "moved": len(points), "from": [start_x, start_y], "to": [x_value, y_value],
+            "points": [[p[0], p[1]] for p in points],
         }, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_mirage_click_humanized", annotations=_DW)
 async def mirage_click_humanized(
     selector: str,
-    steps: int = 24,
+    steps: int = 0,
     jitter: float = 2.0,
     click_delay_ms: float = 80.0,
     click_jitter_ms: float = 20.0,
@@ -166,10 +203,13 @@ async def mirage_click_humanized(
     timeout: float = 10.0,
     frame_id: str | None = None,
 ) -> str:
-    """Mirage: humanized click — actionability wait, jittered Bézier mouse
-    travel to the element center, then real mousedown, a jittered press
-    delay, and mouseup. The DOM click fires exactly like mirage_click's.
-    Returns {clicked, moved, from, to, press_delay_ms}."""
+    """Mirage: humanized click — actionability wait, one continuous
+    ease-in-out mouse travel to the element center (distance-adaptive
+    steps, momentum from the previous movement, tapered wobble), then
+    real mousedown, a jittered press delay, and mouseup. The DOM click
+    fires exactly like mirage_click's.
+    Returns {clicked, moved, from, to, press_delay_ms, points:[...]}.
+    ``steps=0`` auto-adapts to the distance."""
     selector_value, error = _text_arg(
         selector, tool="kahin_mirage_click_humanized", field="selector",
         maximum=_MAX_SELECTOR_LENGTH,
@@ -183,7 +223,7 @@ async def mirage_click_humanized(
             "invalid_argument",
             field="selector",
         )
-    steps_value = _bounded_int(steps, minimum=2, maximum=200, default=24)
+    steps_value = _bounded_int(steps, minimum=0, maximum=200, default=0)
     jitter_value = _bounded_float(jitter, minimum=0.0, maximum=20.0, default=2.0)
     delay_value = _bounded_float(click_delay_ms, minimum=10.0, maximum=2_000.0, default=80.0)
     delay_jitter = _bounded_float(click_jitter_ms, minimum=0.0, maximum=500.0, default=20.0)
@@ -204,10 +244,14 @@ async def mirage_click_humanized(
             return ready
         target_x, target_y = ready
         start_x, start_y = get_last_mouse_position()
+        entry_dir = _last_direction
         points = bezier_trajectory(
             start_x, start_y, target_x, target_y,
-            steps=steps_value, jitter=jitter_value, seed=seed,
+            steps=(steps_value if steps_value > 0 else None),
+            jitter=jitter_value, seed=seed, entry_dir=entry_dir,
         )
+        _remember_direction(points)
+        travel_delays = step_delays(len(points), base_ms=4.0, jitter_ms=2.0, seed=seed)
         for index, (px, py) in enumerate(points):
             if index == len(points) - 1:
                 down = await _dispatch_mouse("mousedown", px, py, button=0, buttons=1, session_id=session_id)
@@ -217,6 +261,7 @@ async def mirage_click_humanized(
                 move = await _dispatch_mouse("mousemove", px, py, button=0, buttons=0, session_id=session_id)
                 if _is_error_response(move):
                     return move
+                await asyncio.sleep(travel_delays[index] / 1000.0)
         await asyncio.sleep(jittered_delay(delay_value, delay_jitter, seed=seed) / 1000.0)
         up = await _dispatch_mouse("mouseup", target_x, target_y, button=0, buttons=0, session_id=session_id)
         if _is_error_response(up):
@@ -225,6 +270,137 @@ async def mirage_click_humanized(
             "clicked": selector_value, "moved": len(points),
             "from": [start_x, start_y], "to": [target_x, target_y],
             "press_delay_ms": delay_value,
+            "points": [[p[0], p[1]] for p in points],
+        }, option=orjson.OPT_INDENT_2).decode()
+
+
+_OVERLAY_CLEAR_JS = r"""
+((x, y) => {
+  // Residual overlay classes seen blocking real clicks (semantic-ui dimmers
+  // and modals, generic dimmers/modals/overlays/tips popups).
+  const KNOWN_OVERLAY_SELECTOR = [
+    ".ui.dimmer", ".ui.modal",
+    "[class*='dimmer']", "[class*='modal']", "[class*='overlay']", "[class*='tips']",
+  ].join(",");
+  const isOverlay = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    try {
+      if (el.matches && el.matches(KNOWN_OVERLAY_SELECTOR)) return true;
+    } catch (e) { /* ignore selector errors */ }
+    // Generic full-viewport fixed/absolute layer above the page content.
+    const style = getComputedStyle(el);
+    if (style.position !== "fixed" && style.position !== "absolute") return false;
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    if (Number(style.zIndex) <= 0) return false;
+    const rect = el.getBoundingClientRect();
+    const vw = window.innerWidth || 0;
+    const vh = window.innerHeight || 0;
+    if (vw <= 0 || vh <= 0) return false;
+    return Math.max(0, rect.width) * Math.max(0, rect.height) >= 0.7 * vw * vh;
+  };
+  const overlayRootOf = (el) => {
+    // Outermost overlay-classified ancestor-or-self: hiding this root clears
+    // the whole residual layer instead of its individual children.
+    let root = null;
+    let node = el;
+    while (node && node.nodeType === 1) {
+      if (isOverlay(node)) root = node;
+      node = node.parentElement;
+    }
+    return root;
+  };
+  const isVisible = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(el);
+    return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0;
+  };
+  const label = (el) => {
+    const tag = (el.tagName || "node").toLowerCase();
+    const id = el.id ? "#" + el.id : "";
+    const raw = typeof el.className === "string" ? el.className : "";
+    const cls = raw.trim() ? "." + raw.trim().split(/\s+/).slice(0, 3).join(".") : "";
+    return tag + id + cls;
+  };
+  const stack = (typeof document.elementsFromPoint === "function")
+    ? Array.from(document.elementsFromPoint(x, y) || [])
+    : [];
+  // The intended target is the topmost element that is not part of a
+  // residual overlay; every overlay root painted above it is a foreign layer.
+  let target = null;
+  let targetIndex = -1;
+  for (let i = 0; i < stack.length; i++) {
+    if (!overlayRootOf(stack[i])) { target = stack[i]; targetIndex = i; break; }
+  }
+  const hidden = [];
+  const seen = new Set();
+  const limit = targetIndex === -1 ? stack.length : targetIndex;
+  for (let i = 0; i < limit; i++) {
+    const root = overlayRootOf(stack[i]);
+    if (!root || seen.has(root)) continue;
+    seen.add(root);
+    if (!isVisible(root)) continue;
+    root.style.setProperty("display", "none", "important");
+    hidden.push(label(root));
+  }
+  return {
+    cleared: hidden.length,
+    hidden: hidden,
+    point: [x, y],
+    target: target ? label(target) : null,
+    stackSize: stack.length,
+    stack: stack.slice(0, 12).map(label),
+  };
+})(__X__, __Y__)
+"""
+
+
+@mcp.tool(name="kahin_mirage_clear_overlays", annotations=_DW)
+async def mirage_clear_overlays(x: float, y: float, frame_id: str | None = None) -> str:
+    """Mirage: deterministically clear residual overlays blocking a point.
+
+    Reads the live paint stack at (x, y) with document.elementsFromPoint,
+    finds the topmost element that is not part of a residual overlay (the
+    intended target), and sets ``display:none !important`` on every overlay
+    layer painted above it — semantic-ui ``.ui.dimmer``/``.ui.modal``
+    residues, generic dimmer/modal/overlay/tips layers, and full-viewport
+    fixed/absolute blockers. Idempotent: already-hidden layers leave the
+    stack, so a repeat call clears 0. Returns {cleared, hidden:[selectors],
+    point, target, stackSize, stack}. Destructive only to the overlay
+    layers above the target."""
+    tool = "kahin_mirage_clear_overlays"
+    x_value, error = _strict_float(x, tool=tool, field="x", minimum=0.0, maximum=_MAX_COORDINATE)
+    if error:
+        return error
+    y_value, error = _strict_float(y, tool=tool, field="y", minimum=0.0, maximum=_MAX_COORDINATE)
+    if error:
+        return error
+    async with _healer_ref.safe(tool, x=x_value, y=y_value, frame_id=frame_id):
+        session_id, capture_error = await _capture_page_session(tool)
+        if capture_error:
+            return capture_error
+        assert session_id is not None
+        expression = _OVERLAY_CLEAR_JS.replace(
+            "__X__", orjson.dumps(x_value).decode(),
+        ).replace("__Y__", orjson.dumps(y_value).decode())
+        result = await _safe_mirage_eval_result(tool, expression, frame_id, session_id=session_id)
+        if isinstance(result, str):
+            return result
+        if result.get("exceptionDetails"):
+            return _json_error(tool, "JavaScript evaluation failed", "javascript_error")
+        value = result.get("result") or {}
+        parsed = value.get("value") if isinstance(value, dict) else None
+        if not isinstance(parsed, dict):
+            return _json_error(tool, "overlay probe returned no value", "invalid_engine_response")
+        return orjson.dumps({
+            "engine": "mirage",
+            "cleared": parsed.get("cleared", 0),
+            "hidden": parsed.get("hidden", []),
+            "point": parsed.get("point", [x_value, y_value]),
+            "target": parsed.get("target"),
+            "stackSize": parsed.get("stackSize", 0),
+            "stack": parsed.get("stack", []),
         }, option=orjson.OPT_INDENT_2).decode()
 
 

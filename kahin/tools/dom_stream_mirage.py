@@ -42,6 +42,14 @@ def _dump(value: Any) -> str:
 # only by a successful snapshot and invalidated by the reset/dropped/stale
 # signals actually observed on the wire, so status reports whether the last
 # snapshot's refs can still be acted on. Keyed by Juggler page session id.
+#
+# Bounded: every tab opened over a long-lived MCP process contributes a
+# distinct session id, and ids are never reused, so an uncapped map would
+# grow for the process's whole lifetime. Keep the most recently created
+# sessions (dict preserves insertion order, so the first key is the oldest);
+# an evicted live session merely reports refsLive conservatively on the next
+# status read, never a wrong "true".
+_MAX_DOM_STREAM_SESSIONS = 64
 _DOM_STREAM_STATE: dict[str, dict[str, Any]] = {}
 
 
@@ -57,6 +65,10 @@ def _dom_stream_record(
     entry = _DOM_STREAM_STATE.setdefault(
         session_id, {"streamId": None, "cursor": None, "nextSeq": None, "refsLive": False}
     )
+    while len(_DOM_STREAM_STATE) > _MAX_DOM_STREAM_SESSIONS:
+        # The just-touched session sits at the end, so the oldest-first key
+        # here is always a different (idle) session.
+        _DOM_STREAM_STATE.pop(next(iter(_DOM_STREAM_STATE)), None)
     if stream_id is not None and entry.get("streamId") != stream_id:
         # A different streamId means a new document: the previous snapshot's
         # refs died with it, whatever the caller believes.

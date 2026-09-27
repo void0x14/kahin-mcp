@@ -81,6 +81,21 @@ pub fn spawn(allocator: Allocator, argv: []const []const u8) !Spawned {
 
     if (pid == 0) {
         // ---- child ----
+        // Die with the sidecar. If the sidecar is SIGKILLed (OOM, a client
+        // timeout, a crash) the browser must not survive it: an orphaned
+        // Camoufox keeps the persistent profile's `lock`/`.parentlock` and
+        // the next launch then dies at the Browser.enable handshake with
+        // "error: BrowserClosed". PR_SET_PDEATHSIG is set on the child here
+        // and survives execve (the browser is not setuid). SIGKILL is used
+        // because a wedged browser may ignore SIGTERM; a stale lock left by
+        // a hard kill is harmless (Camoufox reclaims a dead-owner lock).
+        _ = linux.prctl(
+            @intFromEnum(linux.PR.SET_PDEATHSIG),
+            @as(usize, @intFromEnum(linux.SIG.KILL)),
+            0,
+            0,
+            0,
+        );
         const err_w = err_pipe[1];
         // resp first: in a daemon context fd 3 may already be resp[1], and
         // dup2(cmd[0] -> 3) would clobber it before we reach fd 4.
@@ -426,4 +441,82 @@ test "spawn passes argv and environment" {
     var child = try spawn(testing.allocator, &.{ "/bin/sh", "-c", "test -n \"$PATH\" && test \"$0\" = \"/bin/sh\" && exit 3 || exit 4" });
     defer pipeClose(&child);
     try testing.expectEqual(@as(u8, 3), try wait(&child));
+}
+
+test "spawned child dies when its spawner dies (PR_SET_PDEATHSIG)" {
+    // PDEATHSIG fires when the *spawning thread* dies, so the spawner must
+    // be a separate process we can end. Fork a middle process that spawns
+    // `sleep 30`, reports the grandchild pid, then exits; the grandchild
+    // (like the Camoufox that holds the profile lock) must be gone.
+    var report: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&report, .{})) != .SUCCESS) return error.PipeFailed;
+    defer _ = linux.close(report[0]);
+
+    const mid: i32 = fork: {
+        const rc = linux.fork();
+        switch (linux.errno(rc)) {
+            .SUCCESS => break :fork @intCast(rc),
+            else => return error.ForkFailed,
+        }
+    };
+    if (mid == 0) {
+        // ---- middle process: never return to the test runner ----
+        _ = linux.close(report[0]);
+        const sp = spawn(std.heap.page_allocator, &.{ "/bin/sleep", "30" }) catch linux.exit_group(125);
+        const pid: i32 = @intCast(sp.pid);
+        _ = linux.write(report[1], @ptrCast(&pid), @sizeOf(i32));
+        _ = linux.close(report[1]);
+        // Exiting this process ends the spawning thread -> PDEATHSIG on the
+        // grandchild. Do NOT reap it first, or the test proves nothing.
+        linux.exit_group(0);
+    }
+    _ = linux.close(report[1]);
+
+    var grandchild: i32 = 0;
+    const got = linux.read(report[0], @ptrCast(&grandchild), @sizeOf(i32));
+    try testing.expectEqual(@as(usize, @sizeOf(i32)), got);
+    try testing.expect(grandchild > 0); // middle failed to spawn -> 0
+
+    var status: u32 = 0;
+    _ = linux.waitpid(mid, &status, 0);
+
+    // Poll a bounded window for the grandchild to disappear. PDEATHSIG is
+    // immediate, but under heavy load the reap can lag; 5s is generous.
+    var gone = false;
+    for (0..1000) |_| {
+        if (!procAlive(grandchild)) {
+            gone = true;
+            break;
+        }
+        testSleepMs(5);
+    }
+    try testing.expect(gone);
+}
+
+/// True while /proc/<pid> exists and the process is not a zombie. Reading the
+/// state (not just the path) keeps the check honest if a subreaper holds the
+/// reparented grandchild as an unreaped zombie.
+fn procAlive(pid: i32) bool {
+    var path_buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return false;
+    const fd = linux.open(path, .{}, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [256]u8 = undefined;
+    const n = linux.read(@intCast(fd), &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS or n == 0) return false;
+    const text = buf[0..n];
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
+    var i = close + 1;
+    while (i < text.len and text[i] == ' ') i += 1;
+    if (i >= text.len) return false;
+    return text[i] != 'Z';
+}
+
+fn testSleepMs(ms: i64) void {
+    var ts = linux.timespec{
+        .sec = @intCast(@divTrunc(ms, 1000)),
+        .nsec = @intCast(@rem(ms, 1000) * std.time.ns_per_ms),
+    };
+    _ = linux.nanosleep(&ts, null);
 }

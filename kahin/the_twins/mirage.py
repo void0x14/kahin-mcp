@@ -56,7 +56,16 @@ _RESPONSE_BODY_RETRY_INTERVAL = 0.1
 # response into LimitOverrunError and kills the transport reader.
 _IPC_STREAM_LIMIT = 64 * 1024 * 1024
 _READER_SHUTDOWN_TIMEOUT = 1.0
-_SIDECAR_SHUTDOWN_TIMEOUT = 3.0
+# Bounded wait for the sidecar to exit after stdin EOF. The sidecar reaps
+# the browser with a 10s grace (driver.zig: `inst.stop(10_000)`) before it
+# SIGKILLs a wedged child. An early kill here can no longer orphan Camoufox:
+# the browser child is spawned with PR_SET_PDEATHSIG=SIGKILL (pipe.zig), so
+# it dies with the sidecar and cannot wedge the next browser_start on the
+# profile lock. This value is therefore a latency bound, not a correctness
+# one: it + the 1s reader drain + the 2s reap must stay under the 15s outer
+# budget (`_ENGINE_STOP_TIMEOUT` in tools/pilot.py, `_MIRAGE_STOP_TIMEOUT`
+# in tools/_common.py).
+_SIDECAR_SHUTDOWN_TIMEOUT = 6.0
 _SIDECAR_KILL_TIMEOUT = 2.0
 _CAMOUFOX_FETCH_TIMEOUT = 120.0
 _CAMOUFOX_PROBE_TIMEOUT = 10.0
@@ -984,11 +993,17 @@ class Mirage(BrowserEngine):
         (attachedToTarget/detachedFromTarget), dispatch events."""
 
         async def reader() -> None:
-            assert self._process is not None and self._process.stdout is not None
+            process = self._process
+            assert process is not None and process.stdout is not None
+            # Read through a local stream, not self._process.stdout: stop()
+            # clears self._process before it waits for the sidecar, and the
+            # reader must keep draining stdout until real EOF so a large
+            # final response cannot fill the pipe and wedge the sidecar.
+            stream = process.stdout
             death_reason = "sidecar_stdout_closed"
             try:
                 while True:
-                    raw = await self._process.stdout.readline()
+                    raw = await stream.readline()
                     if not raw:
                         break  # sidecar closed stdout (browser gone)
                     try:
@@ -2304,77 +2319,74 @@ class Mirage(BrowserEngine):
         self._started_monotonic = None
         self._marionette_port = None
         self._passkey_mode = False
-        reader, self._reader = self._reader, None
-        if reader is not None:
-            reader.cancel()
-            if reader is not asyncio.current_task():
-                try:
-                    await asyncio.wait_for(asyncio.shield(reader), timeout=_READER_SHUTDOWN_TIMEOUT)
-                except TimeoutError:
-                    # A callback or a broken pipe must not turn browser_stop
-                    # into a 30-second MCP stall. The reader is already
-                    # cancelled; process teardown below is authoritative.
-                    reader.cancel()
-                except asyncio.CancelledError:
-                    pass
-                except Exception:  # noqa: BLE001 - shutdown must continue
-                    logger.debug("Mirage reader failed during shutdown", exc_info=True)
         for fut in self._pending.values():
             if not fut.done():
                 fut.cancel()
         self._pending.clear()
         proc, self._process = self._process, None
-        if proc is None:
-            self._sessions.clear()
-            self._target_infos.clear()
-            self._frame_contexts.clear()
-            self._current_target = None
-            if self._stderr_file is not None:
-                self._stderr_file.close()
-                self._stderr_file = None
-            self._remove_profile()
-            return
-        if proc.stdin:
-            try:
-                proc.stdin.close()  # stdin EOF -> sidecar stops the browser
-            except Exception:  # noqa: BLE001
-                pass
-        wait_task = asyncio.create_task(proc.wait())
         try:
-            await asyncio.wait_for(asyncio.shield(wait_task), timeout=_SIDECAR_SHUTDOWN_TIMEOUT)
-        except ProcessLookupError:
-            # The sidecar may already have been reaped by its reader/death
-            # path. Cleanup is idempotent; a dead child is already stopped.
-            pass
-        except TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(asyncio.shield(wait_task), timeout=_SIDECAR_KILL_TIMEOUT)
-            except TimeoutError:
-                # A sidecar stuck while its browser is dying must not hold an
-                # MCP shutdown request forever. The kill was already sent;
-                # cancel only the local waiter after the bounded reap window.
-                wait_task.cancel()
+            if proc is not None:
+                if proc.stdin:
+                    try:
+                        proc.stdin.close()  # stdin EOF -> sidecar stops the browser
+                    except Exception:  # noqa: BLE001
+                        pass
+                wait_task = asyncio.create_task(proc.wait())
                 try:
-                    await wait_task
-                except BaseException:  # noqa: BLE001 - waiter is cancelled
+                    await asyncio.wait_for(asyncio.shield(wait_task), timeout=_SIDECAR_SHUTDOWN_TIMEOUT)
+                except ProcessLookupError:
+                    # The sidecar may already have been reaped by its
+                    # reader/death path. Cleanup is idempotent.
                     pass
-            except ProcessLookupError:
-                pass
-        except asyncio.CancelledError:
-            # A cancelled MCP request must still reap the sidecar before the
-            # cancellation escapes; otherwise the next tool sees a cleared
-            # Python state with a live child underneath it.
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await asyncio.shield(wait_task)
-            raise
+                except TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(asyncio.shield(wait_task), timeout=_SIDECAR_KILL_TIMEOUT)
+                    except TimeoutError:
+                        # A sidecar stuck while its browser is dying must not
+                        # hold an MCP shutdown request forever. The kill was
+                        # already sent; cancel only the local waiter after the
+                        # bounded reap window.
+                        wait_task.cancel()
+                        try:
+                            await wait_task
+                        except BaseException:  # noqa: BLE001 - waiter is cancelled
+                            pass
+                    except ProcessLookupError:
+                        pass
+                except asyncio.CancelledError:
+                    # A cancelled MCP request must still reap the sidecar
+                    # before the cancellation escapes; otherwise the next tool
+                    # sees a cleared Python state with a live child underneath.
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await asyncio.shield(wait_task)
+                    raise
         finally:
+            # The reader must keep draining stdout until the sidecar is gone:
+            # while it is alive it may still flush a large final response, and
+            # a cancelled reader would let the 64 KiB pipe fill and wedge the
+            # sidecar mid-shutdown. Cancel it only now.
+            reader, self._reader = self._reader, None
+            if reader is not None:
+                reader.cancel()
+                if reader is not asyncio.current_task():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(reader), timeout=_READER_SHUTDOWN_TIMEOUT)
+                    except TimeoutError:
+                        # A callback or a broken pipe must not turn browser_stop
+                        # into a 30-second MCP stall. The reader is already
+                        # cancelled; process teardown is authoritative.
+                        reader.cancel()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:  # noqa: BLE001 - shutdown must continue
+                        logger.debug("Mirage reader failed during shutdown", exc_info=True)
             if self._stderr_file is not None:
                 self._stderr_file.close()
                 self._stderr_file = None

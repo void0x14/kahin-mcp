@@ -228,3 +228,63 @@ async def test_mirage_full_flow_real_camoufox() -> None:
         assert any(m.startswith(("Page.", "Runtime.")) for m in methods), methods
     finally:
         await engine.stop()
+
+
+# Emits one spontaneous event ~150ms after the boot handshake, then keeps
+# reading stdin so the process stays alive while the test clears the process
+# reference the way stop() does.
+FAKE_SIDECAR_SPONTANEOUS_EVENT = """\
+#!/usr/bin/env python3
+import json, sys, time
+sent = False
+for line in sys.stdin:
+    req = json.loads(line)
+    rid = req["id"]
+    if req["method"] == "Browser.health":
+        print(json.dumps({"id": rid, "result": {"alive": True, "pid": 1}}), flush=True)
+    else:
+        print(json.dumps({"id": rid, "result": {}}), flush=True)
+    if not sent:
+        sent = True
+        time.sleep(0.15)
+        print(json.dumps({"method": "Runtime.console",
+                          "params": {"type": "log", "args": [],
+                                     "location": {"url": "", "lineNumber": 1, "columnNumber": 1}},
+                          "sessionId": "sess-1"}), flush=True)
+"""
+
+
+@pytest.mark.asyncio
+async def test_reader_drains_after_process_reference_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stop() clears self._process before it waits for the sidecar, so the
+    reader must drain stdout through a captured stream. Re-reading
+    self._process.stdout raised ``AttributeError`` and killed the drain
+    (regression: death_reason ``reader_error:AttributeError``)."""
+    script = tmp_path / "spontaneous_sidecar.py"
+    script.write_text(FAKE_SIDECAR_SPONTANEOUS_EVENT)
+    script.chmod(0o755)
+    monkeypatch.setattr(mirage_mod, "_sidecar_bin", lambda: script)
+    monkeypatch.setattr(mirage_mod, "_camoufox_bin", lambda: script)
+
+    engine = Mirage()
+    seen: list[str] = []
+    engine._event_callbacks.append(lambda evt: seen.append(evt.method))
+    await engine.start()
+    proc = engine._process
+    try:
+        # Mirror the real stop() order: clear the process reference, then let
+        # the still-running sidecar flush its final line to the reader.
+        engine._process = None
+        await asyncio.sleep(0.5)
+        assert "Runtime.console" in seen, seen
+        assert engine._death_reason is None, engine._death_reason
+    finally:
+        if proc is not None:
+            if proc.stdin:
+                proc.stdin.close()
+            await proc.wait()
+        if engine._stderr_file is not None:
+            engine._stderr_file.close()
+            engine._stderr_file = None

@@ -707,7 +707,17 @@ fn advanceScreenshot(d: *driver_mod.Driver, t: *Task) void {
     switch (t.shot_stage) {
         0 => {
             const p = d.pages.get(t.target_id.?) orelse return t.fail("screenshot failed");
-            if (p.main_frame_id == null) return; // wait for the frame
+            if (p.main_frame_id == null) {
+                // No main frame yet (a freshly created tab whose frameAttached
+                // has not arrived, or a wedged browser). This stage keeps
+                // flow = .none, so taskDeadline() returns t.deadline_ms; once
+                // that passes nextPollTimeoutMs() returns 0 and the loop spins
+                // on poll(0) at 100% CPU while the task is never failed and
+                // never answered. Bound the wait: fail at the task deadline so
+                // the client gets a response and the CPU is released.
+                if (nowMs() >= t.deadline_ms) return t.fail("screenshot failed: main frame not ready");
+                return; // wait for the frame
+            }
             if (t.clip_payload != null) {
                 t.shot_stage = 2;
             } else {
@@ -2039,6 +2049,39 @@ test "router: screenshot size-probe failure responds -32000 (no swallowed error)
     const line = try runRequest(&d, "{\"id\":2,\"method\":\"Page.captureScreenshot\",\"params\":{}}");
     defer testing.allocator.free(line);
     try testing.expectEqualStrings("{\"id\":2,\"error\":{\"code\":-32000,\"message\":\"could not measure page size\"}}\n", line);
+}
+
+test "router: screenshot with no main frame fails at its deadline (no busy-spin)" {
+    const rig = try testRig();
+    defer {
+        _ = std.os.linux.close(rig.cmd[0]);
+        _ = std.os.linux.close(rig.cmd[1]);
+        _ = std.os.linux.close(rig.resp[0]);
+        _ = std.os.linux.close(rig.resp[1]);
+    }
+    var d = rig.d;
+    defer d.deinit();
+
+    // Attach a page but never deliver its Page.frameAttached, so
+    // main_frame_id stays null and stage 0 has nothing to measure.
+    try seedPage(&d, rig.resp, "t1", "s1", "");
+    try setCurrentTarget(testing.allocator, "t1");
+    defer {
+        if (current_target) |t| testing.allocator.free(t);
+        current_target = null;
+    }
+
+    const t = try allocTask(testing.allocator, 7, .screenshot);
+    t.target_id = try testing.allocator.dupe(u8, "t1");
+    t.session_id = try testing.allocator.dupe(u8, "s1");
+    // Already past its deadline: the stage must fail the task, not wait
+    // forever (which would spin poll(0) at 100% CPU and never answer).
+    t.deadline_ms = nowMs() - 1;
+    defer freeTask(&d, testing.allocator, t);
+
+    advanceScreenshot(&d, t);
+    try testing.expect(t.failed);
+    try testing.expect(std.mem.indexOf(u8, t.err_msg, "main frame") != null);
 }
 
 test "router: events pumped during a driver call are flushed upward (sink)" {

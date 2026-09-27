@@ -42,6 +42,7 @@ from kahin.tools import (
     trainman_mirage,
     trainman_obscura,
     upload_mirage,
+    vault_login_mirage,
     visualization,
 )
 
@@ -75,5 +76,6 @@ __all__ = [
     "trainman_mirage",
     "trainman_obscura",
     "upload_mirage",
+    "vault_login_mirage",
     "visualization",
 ]

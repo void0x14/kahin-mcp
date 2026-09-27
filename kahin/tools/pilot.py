@@ -25,7 +25,13 @@ from kahin import _state as state
 from kahin._mcp import mcp
 from kahin.oracle import _on_cdp_event, _on_console_event, _on_engine_death, _on_network_event
 from kahin.the_twins.capabilities import capabilities_for
-from kahin.the_twins.mirage import Mirage, _profile_directory
+from kahin.the_twins.mirage import (
+    STATE_MODE_AGIRBAS,
+    STATE_MODE_KES,
+    Mirage,
+    _canonical_state_mode,
+    _profile_directory,
+)
 from kahin.the_twins.shadow import Obscura
 from kahin.tools._common import (
     _DW,
@@ -56,6 +62,30 @@ _NAVIGATE_IDLE_QUIET = 0.5
 _NAVIGATE_MAX_TIMEOUT = 120.0
 _MAX_IDENTITY_PAYLOAD = 16 * 1024 * 1024
 _MAX_PROFILE_DIR_LENGTH = 4_096
+
+# Durum modu sözleşmesi (spec §5): ajanın okuduğu metin budur. İki mod da
+# serbestçe seçilir; kullanıcı/ajan hangisini isterse o çalışır. Sistem
+# "şu modu seç" diye dayatmaz.
+_STATE_MODE_CONTRACTS = {
+    STATE_MODE_AGIRBAS: (
+        "ağırbaş — kalıcı: giriş, kayıtlı oturum, tekrar dönülecek iş, uzantı "
+        "durumu, kalıcı çerez. Tek ve sabit ev; tarayıcı kapanınca çerez, "
+        "localStorage, IndexedDB, uzantılar ve uzantı durumu (Bitwarden girişi/"
+        "ayarları) silinmez."
+    ),
+    STATE_MODE_KES: (
+        "keş — geçici, unut beni: tek seferlik keşif, anonim kazıma, kimlik "
+        "istemeyen iş. Her açılışta yeni ve benzersiz profil; browser_stop "
+        "profili ve içindeki her şeyi siler. Hesap otomasyonu (Bitwarden hesap "
+        "havuzu) için keş de Bitwarden taşır; bunun dışında taşımaz."
+    ),
+}
+_STATE_MODE_SELECTION_RULE = (
+    "Giriş, kayıtlı oturum, tekrar dönülecek iş, uzantı durumu, kalıcı çerez → "
+    "ağırbaş. Tek seferlik keşif, anonim kazıma, kimlik istemeyen iş → keş. "
+    "Her iki mod da istenildiği gibi çalıştırılabilir; seçim kullanıcınındır. "
+    "mode açıkça verilmelidir."
+)
 
 
 def _json_error(tool: str, message: str, code: str = "tool_error", **details: Any) -> str:
@@ -322,6 +352,20 @@ def _profile_config_conflict(
             "profile_dir": str(active_path) if isinstance(active_path, Path) else None,
         },
     }
+def _state_mode_conflict(engine: Any, *, mode: str) -> dict[str, Any] | None:
+    """A reuse must never silently keep a different state mode (spec §2.3)."""
+    active_mode = getattr(engine, "_state_mode", None)
+    if not isinstance(active_mode, str) or not active_mode or active_mode == mode:
+        return None
+    return {
+        "error": "Engine already running in a different state mode.",
+        "hint": "Stop the engine with kahin_browser_stop, then start again with the requested mode.",
+        "code": "engine_config_conflict",
+        "requested": {"mode": mode},
+        "active": {"mode": active_mode},
+    }
+
+
 def _addons_start_summary(engine: Any) -> list[str]:
     addons = getattr(engine, "_addons", None)
     if isinstance(addons, list):
@@ -375,6 +419,21 @@ def _profile_start_summary(engine: Any) -> dict[str, Any]:
     }
 
 
+def _engine_state_mode(engine: Any) -> str | None:
+    """Active engine's canonical state mode, with a legacy fallback.
+
+    Mirage records ``_state_mode`` at start. Older/fake engines that predate
+    the field fall back to their ``_persistent_profile`` flag so summaries
+    still carry a mode.
+    """
+    mode = getattr(engine, "_state_mode", None)
+    if isinstance(mode, str) and mode:
+        return mode
+    if isinstance(engine, Mirage):
+        return STATE_MODE_AGIRBAS if bool(getattr(engine, "_persistent_profile", False)) else STATE_MODE_KES
+    return None
+
+
 @mcp.tool(name="kahin_browser_start", annotations=_RW)
 async def browser_start(
     engine: str = "mirage",
@@ -386,8 +445,27 @@ async def browser_start(
     profile_dir: str | None = None,
     addons: list[str] | None = None,
     passkey_mode: bool = False,
+    mode: str | None = None,
+    ephemeral_ack: bool = False,
 ) -> str:
     """Start or reuse one browser engine.
+
+    DURUM MODU ZORUNLUDUR. Varsayılan yoktur: ``mode`` açıkça verilmelidir,
+    yoksa tarayıcı açılmaz ve mod sözleşmesi döner. Her iki mod da istenildiği
+    gibi çalıştırılır; seçim kullanıcınındır:
+      - ``mode="ağırbaş"`` — kalıcı. Giriş, kayıtlı oturum, tekrar dönülecek
+        iş, uzantı durumu (Bitwarden) veya kalıcı çerez için. Tek sabit ev;
+        durdurunca hiçbir şey silinmez.
+      - ``mode="keş"`` — geçici, "unut beni". Tek seferlik keşif, anonim
+        kazıma veya kimlik istemeyen iş için. Her açılışta yeni ve benzersiz
+        profil; ``kahin_browser_stop`` o profili ve içindeki her şeyi siler.
+        ``keş`` ayrıca ``ephemeral_ack=true`` ister (hiçbir şeyin kalıcı
+        olmayacağının açık onayı). Hesap otomasyonu (Bitwarden hesap havuzu)
+        için ``keş`` de Bitwarden taşır; bunun dışında taşımaz.
+    Aynı anda tek motor çalışır; mod değiştirmek ``kahin_browser_stop``
+    gerektirir. ASCII yazımlar ``agirbas``/``kes`` de kabul edilir. Eski
+    ``persistent_profile`` bayrağı modlara eşlenir (``true`` -> ``ağırbaş``,
+    ``false`` -> ``keş``) ama ``mode`` verilirse ``mode`` kazanır.
 
     Camoufox/Mirage is the default because it is the complete visual browser
     surface: screenshots, mobile viewport, input, accessibility and
@@ -401,17 +479,21 @@ async def browser_start(
     ``proxy`` routes the browser through a proxy URL (http/https/socks4/
     socks5) via its environment; it applies to Mirage only, never Shadow,
     and credentials are never echoed back. Reusing a healthy engine that
-    runs a different identity/proxy is a conflict (``engine_config_conflict``),
-    never a silent ignore — stop the engine first to change configuration.
+    runs a different identity/proxy/mode is a conflict
+    (``engine_config_conflict``), never a silent ignore — stop the engine
+    first to change configuration.
     The summary always carries the active bounded ``identity.hash`` (fresh
     BrowserForge digest or the pinned identity's config hash) and the
     enabled ``identity.stealth`` launch policy, configured or not.
-    By default the Mirage profile is persistent, so native cookies and web
-    storage survive a clean browser restart. Set ``persistent_profile=False``
-    for a disposable profile; ``profile_dir`` selects an explicit absolute
-    persistent directory. ``passkey_mode`` installs the signed Bitwarden XPI
-    into the persistent profile before launch; it reports installation only,
-    and does not inspect whether the vault is logged in or unlocked.
+    ``profile_dir`` selects an explicit absolute agirbas directory and is
+    rejected together with ``kes``. In ``agirbas`` the signed Bitwarden XPI is
+    an embedded, pinned part of the browser (spec §3): every agirbas start
+    ensures it is present in the permanent profile, and the install is
+    idempotent — it never re-downloads, re-extracts or re-copies an existing
+    verified add-on. ``passkey_mode`` additionally enables Marionette for the
+    one-time Bitwarden setup UI and makes the install strict; it reports
+    installation only, and does not inspect whether the vault is logged in or
+    unlocked.
     """
     if not isinstance(engine, str):
         return _json_error("kahin_browser_start", "engine must be a string", "invalid_argument", field="engine")
@@ -440,6 +522,29 @@ async def browser_start(
             "invalid_argument",
             field="passkey_mode",
         )
+    if not isinstance(ephemeral_ack, bool):
+        return _json_error(
+            "kahin_browser_start",
+            "ephemeral_ack must be a boolean",
+            "invalid_argument",
+            field="ephemeral_ack",
+        )
+    # Resolve the requested state mode early. ``mode`` has no default (spec
+    # §5); passkey_mode is the only implicit agirbas so existing Bitwarden
+    # callers keep working until they pass mode explicitly.
+    canonical_mode: str | None = None
+    if mode is not None:
+        try:
+            canonical_mode = _canonical_state_mode(mode)
+        except ValueError as exc:
+            return _json_error(
+                "kahin_browser_start",
+                str(exc),
+                "invalid_argument",
+                field="mode",
+            )
+    elif passkey_mode:
+        canonical_mode = STATE_MODE_AGIRBAS
     if profile_dir is not None:
         profile_dir, profile_error = _validate_text(
             profile_dir,
@@ -465,18 +570,11 @@ async def browser_start(
                 "invalid_argument",
                 field="profile_dir",
             )
-    try:
-        requested_profile, requested_persistent = _profile_directory(
-            persistent_profile,
-            profile_dir,
-        )
-    except ValueError as exc:
-        return _json_error(
-            "kahin_browser_start",
-            str(exc),
-            "invalid_argument",
-            field="profile_dir",
-        )
+    # kes has no fixed directory: never allocate a throwaway profile at
+    # validation time. The agirbas path is resolved only after the mode
+    # contract is enforced, so a rejected call never touches the filesystem.
+    requested_persistent = bool(persistent_profile) and canonical_mode != STATE_MODE_KES
+    requested_profile: Path | None = None
     if addons is not None:
         if not isinstance(addons, list):
             return _json_error(
@@ -637,6 +735,17 @@ async def browser_start(
             "invalid_argument",
             field="engine",
         )
+    # An explicit ``mode`` that normalizes to keş cannot be combined with
+    # passkey_mode: the Bitwarden vault lives in the persistent ağırbaş home.
+    # Name both arguments instead of blaming the defaulted persistent_profile.
+    if passkey_mode and mode is not None and canonical_mode == STATE_MODE_KES:
+        return _json_error(
+            "kahin_browser_start",
+            "mode='keş' conflicts with passkey_mode=true: passkey_mode requires a persistent (ağırbaş) profile",
+            "mode_argument_conflict",
+            field="mode",
+            conflicting_arguments=["mode", "passkey_mode"],
+        )
     if passkey_mode and not requested_persistent:
         return _json_error(
             "kahin_browser_start",
@@ -644,6 +753,54 @@ async def browser_start(
             "invalid_argument",
             field="persistent_profile",
         )
+    if canonical_mode is None:
+        # No default: refuse to boot and return the binding mode contract.
+        return orjson.dumps(
+            {
+                "error": "mode zorunlu: 'ağırbaş' (kalıcı) ya da 'keş' (geçici) seç.",
+                "code": "mode_required",
+                "tool": "kahin_browser_start",
+                "modes": dict(_STATE_MODE_CONTRACTS),
+                "selection_rule": _STATE_MODE_SELECTION_RULE,
+                "hint": "İki mod da istenildiği gibi çalıştırılır; seçim senin.",
+            },
+            option=orjson.OPT_INDENT_2,
+        ).decode()
+    if canonical_mode == STATE_MODE_KES:
+        if not ephemeral_ack:
+            return orjson.dumps(
+                {
+                    "error": (
+                        "keş geçicidir: kahin_browser_stop sonrası hiçbir şey kalmaz."
+                    ),
+                    "code": "ephemeral_ack_required",
+                    "tool": "kahin_browser_start",
+                    "modes": dict(_STATE_MODE_CONTRACTS),
+                    "selection_rule": _STATE_MODE_SELECTION_RULE,
+                    "hint": (
+                        "Geçici profili onaylamak için ephemeral_ack=true ile tekrar "
+                        "çağır, ya da mode='ağırbaş' kullan."
+                    ),
+                },
+                option=orjson.OPT_INDENT_2,
+            ).decode()
+        if profile_dir is not None:
+            return _json_error(
+                "kahin_browser_start",
+                "keş modunda profile_dir desteklenmez; keş her zaman taze geçici profil kullanır.",
+                "invalid_argument",
+                field="profile_dir",
+            )
+    if canonical_mode == STATE_MODE_AGIRBAS:
+        try:
+            requested_profile, requested_persistent = _profile_directory(True, profile_dir)
+        except ValueError as exc:
+            return _json_error(
+                "kahin_browser_start",
+                str(exc),
+                "invalid_argument",
+                field="profile_dir",
+            )
 
     async with state._lifecycle_lock:
         async with _healer_ref.safe("kahin_browser_start", engine=engine, headless=headless, port=port):
@@ -671,6 +828,9 @@ async def browser_start(
                         # active configuration is a conflict, never silently
                         # ignored (Faz 3 Task 5).
                         if current_kind == "mirage":
+                            mode_conflict = _state_mode_conflict(current, mode=canonical_mode)
+                            if mode_conflict is not None:
+                                return orjson.dumps(mode_conflict, option=orjson.OPT_INDENT_2).decode()
                             profile_conflict = _profile_config_conflict(
                                 current,
                                 persistent=requested_persistent,
@@ -708,6 +868,7 @@ async def browser_start(
                         reuse_result = {
                             "status": "reused",
                             "engine": current_kind,
+                            "state_mode": _engine_state_mode(current),
                             "capabilities": capabilities_for(current_kind),
                             "identity": _identity_start_summary(current),
                             "profile": _profile_start_summary(current),
@@ -761,21 +922,60 @@ async def browser_start(
                     **browser_lock_error,
                 )
 
-            if passkey_mode:
+            # Embedded, pinned Bitwarden (spec §3). In agirbas the add-on is a
+            # first-class part of the browser (like Camoufox's uBlock), so the
+            # profile is ensured on every agirbas start. The install is
+            # idempotent and reuses the pinned cache: no re-download, no
+            # re-extract, no re-copy once the profile has it. An explicit
+            # ``passkey_mode`` is strict (it also enables Marionette for the
+            # one-time setup UI) and blocks on failure; the implicit agirbas
+            # ensure is best-effort so an offline first run cannot stop boot.
+            bitwarden_state: dict[str, Any] | None = None
+            if engine != "shadow" and canonical_mode == STATE_MODE_AGIRBAS:
                 try:
-                    from kahin.bitwarden import install_bitwarden_into_profile
+                    from kahin.bitwarden import (
+                        bitwarden_profile_status,
+                        install_bitwarden_into_profile,
+                    )
 
+                    assert requested_profile is not None
                     await asyncio.to_thread(install_bitwarden_into_profile, requested_profile)
+                    # Report the profile's own registry, not the install call:
+                    # a deleted XPI or a disabled add-on must be visible.
+                    status = await asyncio.to_thread(
+                        bitwarden_profile_status, requested_profile
+                    )
+                    if not status["present"]:
+                        verified = "missing"
+                    elif status["active"] is True:
+                        verified = "present_active"
+                    elif status["active"] is False:
+                        verified = "present_disabled"
+                    else:
+                        verified = "present_pending_first_run"
+                    bitwarden_state = {
+                        "state": verified,
+                        "vault_state": "unknown",
+                        "active": status["active"],
+                    }
                 except asyncio.CancelledError:
                     state.release_browser_lock()
                     raise
                 except Exception:  # noqa: BLE001 - installer details may contain local paths
-                    state.release_browser_lock()
-                    return _json_error(
-                        "kahin_browser_start",
-                        "Could not install the built-in passkey extension into the browser profile",
-                        "passkey_extension_unavailable",
+                    if passkey_mode:
+                        state.release_browser_lock()
+                        return _json_error(
+                            "kahin_browser_start",
+                            "Could not install the built-in passkey extension into the browser profile",
+                            "passkey_extension_unavailable",
+                        )
+                    logger.warning(
+                        "embedded Bitwarden add-on could not be installed", exc_info=True
                     )
+                    bitwarden_state = {
+                        "state": "unavailable",
+                        "vault_state": "unknown",
+                    }
 
             if engine == "shadow":
                 candidate: Any = Obscura()
@@ -792,6 +992,7 @@ async def browser_start(
                         "identity": identity_config,
                         "identity_name": identity_name,
                         "proxy": proxy_value,
+                        "mode": canonical_mode,
                         "persistent_profile": persistent_profile,
                         "profile_dir": profile_dir,
                         "addons": addons,
@@ -860,6 +1061,7 @@ async def browser_start(
             start_result = {
                 "status": "started",
                 "engine": "mirage" if engine == "camoufox" else engine,
+                "state_mode": _engine_state_mode(candidate),
                 "capabilities": capabilities_for("mirage" if engine == "camoufox" else engine),
                 "identity": _identity_start_summary(candidate),
                 "profile": _profile_start_summary(candidate),
@@ -868,6 +1070,8 @@ async def browser_start(
                 "tabs": tabs,
                 "hint": "Reuse this browser; for separate work create/switch a Mirage tab.",
             }
+            if bitwarden_state is not None:
+                start_result["bitwarden"] = bitwarden_state
             if passkey_mode:
                 start_result["passkey_mode"] = True
                 start_result["passkey_extension"] = {

@@ -94,7 +94,7 @@ async def _start_identity_engine(name: str) -> dict[str, Any]:
     """Stop any engine, boot with a saved identity, and return the live
     page-observed fingerprint summary from kahin_fingerprint_report."""
     await pilot.browser_stop()
-    started = _loads(await pilot.browser_start(engine="mirage", identity=name))
+    started = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage", identity=name))
     assert started.get("status") == "started", started
     try:
         tab = _loads(await trainman_mirage.mirage_tab_new())
@@ -112,7 +112,7 @@ async def _start_identity_engine(name: str) -> dict[str, Any]:
 @async_fixture
 async def mirage_tools() -> AsyncGenerator[None, None]:
     """Start real Camoufox through kahin_browser_start with its one tab, then stop."""
-    resp = _loads(await pilot.browser_start(engine="mirage"))
+    resp = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage"))
     assert resp["status"] == "started", resp
     try:
         tabs = _loads(await trainman_mirage.mirage_tab_list())
@@ -289,7 +289,7 @@ async def test_browser_start_identity_conflict(mirage_tools: None) -> None:
     created = _loads(await agent_mirage.identity_new("conflict-e2e"))
     assert created.get("saved"), created
     try:
-        conflict = _loads(await pilot.browser_start(engine="mirage", identity="conflict-e2e"))
+        conflict = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage", identity="conflict-e2e"))
         assert conflict.get("code") == "engine_config_conflict", conflict
         assert conflict.get("requested") == {"identity": "conflict-e2e"}, conflict
     finally:
@@ -300,13 +300,13 @@ async def test_browser_start_identity_conflict(mirage_tools: None) -> None:
 async def test_browser_start_proxy_conflict_and_reuse(mirage_tools: None) -> None:
     # mirage_tools fixture runs an engine WITHOUT proxy; requesting one
     # must be a structured conflict, never a silent ignore.
-    conflict = _loads(await pilot.browser_start(engine="mirage", proxy="http://127.0.0.1:8080"))
+    conflict = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage", proxy="http://127.0.0.1:8080"))
     assert conflict.get("code") == "engine_config_conflict", conflict
     assert "kahin_browser_stop" in conflict.get("hint", ""), conflict
     assert conflict.get("requested") == {"proxy": "http://127.0.0.1:8080"}, conflict
     assert conflict.get("active") == {"proxy": None}, conflict
     # no proxy requested → plain idempotent reuse
-    reuse = _loads(await pilot.browser_start(engine="mirage"))
+    reuse = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage"))
     assert reuse.get("status") == "reused", reuse
 
 
@@ -319,17 +319,17 @@ async def test_browser_start_proxy_records_active_metadata() -> None:
     assert stopped.get("status") == "stopped" or stopped.get("code") == "engine_unavailable", (
         stopped
     )
-    started = _loads(await pilot.browser_start(engine="mirage", proxy="http://127.0.0.1:1"))
+    started = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage", proxy="http://127.0.0.1:1"))
     assert started.get("status") == "started", started
     try:
         engine = _state._current_engine
         assert engine is not None
         assert getattr(engine, "_proxy_url", None) == "http://127.0.0.1:1"
         # identical request reuses cleanly
-        reuse = _loads(await pilot.browser_start(engine="mirage", proxy="http://127.0.0.1:1"))
+        reuse = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage", proxy="http://127.0.0.1:1"))
         assert reuse.get("status") == "reused", reuse
         # a different proxy is a conflict
-        conflict = _loads(await pilot.browser_start(engine="mirage", proxy="http://127.0.0.1:2"))
+        conflict = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage", proxy="http://127.0.0.1:2"))
         assert conflict.get("code") == "engine_config_conflict", conflict
     finally:
         await pilot.browser_stop()

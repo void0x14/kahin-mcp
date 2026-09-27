@@ -40,6 +40,7 @@ import orjson
 
 from kahin import _state as state
 from kahin._mcp import mcp
+from kahin.the_twins.mirage import STATE_MODE_AGIRBAS, STATE_MODE_KES
 from kahin.tools._common import _DW, _RO, _RW, _healer_ref
 
 logger = logging.getLogger(__name__)
@@ -409,6 +410,9 @@ class _CrawlJob:
         self.launch_identity: str | dict[str, Any] | None = None
         self.launch_headless = True
         self.launch_proxy: str | None = None
+        # Durum modu işe göre seçilir ve motorun gerçek modundan devralınır:
+        # anonim kazıma keş, ağırbaş işler ağırbaş. Sabit değildir.
+        self.launch_mode: str = STATE_MODE_AGIRBAS
         self.task: asyncio.Task[Any] | None = None
 
     def _record_event(self, kind: str, **payload: Any) -> None:
@@ -866,7 +870,13 @@ async def _start_for_rotation(
     kwargs: dict[str, Any] = {
         "engine": "mirage",
         "headless": bool(job.launch_headless),
+        # Durum modu kahin_browser_start'ta zorunludur (spec §5). Crawler modu
+        # işe göre seçer: motor hangi modda başlatıldıysa rotasyon da o modda
+        # sürer. Anonim kazıma keş (proxy'lerle), hesaplı kazıma ağırbaş.
+        "mode": job.launch_mode,
     }
+    if job.launch_mode == STATE_MODE_KES:
+        kwargs["ephemeral_ack"] = True
     if isinstance(job.launch_proxy, str) and job.launch_proxy:
         kwargs["proxy"] = job.launch_proxy
     if identity is not None:
@@ -1509,6 +1519,10 @@ async def crawl_start(
             if isinstance(launch_proxy, str) and len(launch_proxy) <= _MAX_PROXY_LENGTH
             else None
         )
+        # Rotasyon, motorun gerçek durum modunu sürdürür; mod işe göre seçilir.
+        from kahin.tools.pilot import _engine_state_mode  # noqa: PLC0415
+
+        job.launch_mode = _engine_state_mode(engine) or STATE_MODE_AGIRBAS
 
         async with state._crawl_jobs_lock:
             # Re-check while holding the registration lock. The first check

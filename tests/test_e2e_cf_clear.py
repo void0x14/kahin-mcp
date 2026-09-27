@@ -46,7 +46,7 @@ def _loads(text: str) -> Any:
 
 @async_fixture
 async def mirage_tools() -> AsyncGenerator[None]:
-    resp = _loads(await pilot.browser_start(engine="mirage"))
+    resp = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage"))
     assert resp["status"] == "started", resp
     try:
         tabs = _loads(await trainman_mirage.mirage_tab_list())

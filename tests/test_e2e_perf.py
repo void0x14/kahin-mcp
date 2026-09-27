@@ -155,7 +155,7 @@ async def test_engine_stats_live_monotonic() -> None:
     """Real engine: uptime is monotonic and real tool durations appear."""
     await _stop_engine()
     try:
-        start = _loads(await pilot.browser_start(headless=True))
+        start = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, headless=True))
         assert start.get("status") == "started"
         _loads(await engine_mod.engine_health())
         await asyncio.sleep(0.05)
@@ -199,7 +199,7 @@ async def test_prewarm_identity_metadata_reuse(tmp_path: Path, monkeypatch: pyte
         created = _loads(await agent_mirage.identity_new(name=name))
         assert created.get("saved") is True
 
-        first = _loads(await pilot.browser_start(identity=name, headless=True))
+        first = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, identity=name, headless=True))
         assert first.get("status") == "started"
         engine = _state._current_engine
         assert engine is not None
@@ -217,7 +217,7 @@ async def test_prewarm_identity_metadata_reuse(tmp_path: Path, monkeypatch: pyte
         assert identity_hash == mirage_mod._identity_hash(original_config)
         await _stop_engine()
 
-        second = _loads(await pilot.browser_start(identity=name, headless=True))
+        second = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, identity=name, headless=True))
         assert second.get("status") == "started"
         engine2 = _state._current_engine
         assert engine2 is not None

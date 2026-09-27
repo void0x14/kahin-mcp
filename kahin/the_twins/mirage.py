@@ -81,38 +81,191 @@ _PREWARM_CACHE: dict[str, dict[str, Any]] = {}
 
 _PROFILE_DIR_ENV = "KAHIN_PROFILE_DIR"
 _PROFILE_DIR_MAX_LENGTH = 4096
+_KES_TEMP_PREFIX = "kahin-kes-"
+_LEGACY_TEMP_PREFIX = "kahin-fp-"
+_KES_SWEEP_MAX_ENTRIES = 512
+
+# Directories created for this process's kes launches. The stale-dir sweep
+# must never delete a directory a live engine still owns.
+_LIVE_KES_DIRS: set[str] = set()
+
+# Durum modları (spec §2). Kanonik adlar sahibinin verdiği Türkçe adlardır;
+# İngilizce karşılık uydurulmaz ("kahin" -> "oracle" gibi). Dizin adları ise
+# dosya yolu güvenliği için ASCII kalır (agirbas/, kes/).
+STATE_MODE_AGIRBAS = "ağırbaş"
+STATE_MODE_KES = "keş"
+
+_STATE_MODE_ALIASES = {
+    STATE_MODE_AGIRBAS: STATE_MODE_AGIRBAS,
+    "agirbas": STATE_MODE_AGIRBAS,
+    STATE_MODE_KES: STATE_MODE_KES,
+    "kes": STATE_MODE_KES,
+}
+
+
+def _canonical_state_mode(mode: str) -> str:
+    """Verilen mod adını kanonik Türkçe ada çevir (``ağırbaş``/``keş``)."""
+    if not isinstance(mode, str) or not mode.strip():
+        raise ValueError("mode 'ağırbaş' ya da 'keş' olmalı")
+    canonical = _STATE_MODE_ALIASES.get(mode.strip().lower())
+    if canonical is None:
+        raise ValueError("mode 'ağırbaş' ya da 'keş' olmalı")
+    return canonical
+
+
+def _kahin_home() -> Path:
+    """Resolve the Kahin data home (spec §6).
+
+    ``$KAHIN_HOME`` when set, else ``$XDG_DATA_HOME/kahin``, else
+    ``~/.local/share/kahin``.
+    """
+    configured = os.environ.get("KAHIN_HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    root = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+    return root / "kahin"
+
+
+def _absolute_profile_path(configured: str) -> Path:
+    """Validate an explicit profile directory (non-empty, bounded, absolute)."""
+    if not isinstance(configured, str) or not configured.strip():
+        raise ValueError("profile directory must be a non-empty absolute path")
+    path = Path(configured.strip()).expanduser()
+    if len(str(path)) > _PROFILE_DIR_MAX_LENGTH:
+        raise ValueError(f"profile directory exceeds {_PROFILE_DIR_MAX_LENGTH} characters")
+    if not path.is_absolute():
+        raise ValueError("profile directory must be an absolute path")
+    return path
+
+
+def _agirbas_profile_dir(configured: str | None = None) -> Path:
+    """Stable, permanent profile directory for the ``agirbas`` mode.
+
+    Performs the one-time legacy migration from spec §6: an existing
+    ``$KAHIN_HOME/profile`` is renamed to ``$KAHIN_HOME/agirbas/profile`` so
+    the user's existing uBlock/Bitwarden data is preserved. If the rename
+    fails the legacy path is used in place — data is never destroyed.
+    """
+    if configured is not None and str(configured).strip():
+        return _absolute_profile_path(configured)
+    env_override = os.environ.get(_PROFILE_DIR_ENV, "").strip()
+    if env_override:
+        return _absolute_profile_path(env_override)
+    home = _kahin_home()
+    legacy = home / "profile"
+    target = home / "agirbas" / "profile"
+    if not target.exists() and legacy.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(legacy, target)
+        except OSError:
+            logger.warning(
+                "legacy profile migration failed; continuing with the legacy path",
+                exc_info=True,
+            )
+    if target.exists():
+        return target
+    if legacy.exists():
+        return legacy
+    return target
+
+
+def _new_kes_profile() -> Path:
+    """Create a fresh, unique ephemeral profile for one ``kes`` launch.
+
+    The directory lives under ``$KAHIN_HOME/kes`` when that root is
+    creatable, otherwise in the system temp dir.
+    """
+    root = _kahin_home() / "kes"
+    dir_arg: str | None = None
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        dir_arg = str(root)
+    except OSError:
+        dir_arg = None
+    return Path(tempfile.mkdtemp(prefix=_KES_TEMP_PREFIX, dir=dir_arg))
+
+
+def _is_kes_owned_path(path: Path) -> bool:
+    """True only for a ``kahin-kes-*`` dir under the kes root or the temp dir."""
+    if not path.name.startswith(_KES_TEMP_PREFIX):
+        return False
+    parent = path.parent
+    if parent == _kahin_home() / "kes":
+        return True
+    return parent == Path(tempfile.gettempdir())
+
+
+def _is_sweepable_kes_path(path: Path) -> bool:
+    """True for stale ephemeral dirs the sweep is allowed to remove."""
+    if path.name.startswith(_KES_TEMP_PREFIX) or path.name.startswith(_LEGACY_TEMP_PREFIX):
+        return True
+    return path.parent == _kahin_home() / "kes"
+
+
+def _sweep_stale_kes_dirs() -> int:
+    """Remove leftover ephemeral profile dirs no live engine owns (spec §2.2).
+
+    Bounded to the kes root and the known temp prefixes; symlinks and dirs
+    registered as live are never removed. Returns the number of directories
+    deleted.
+    """
+    candidates: list[Path] = []
+    kes_root = _kahin_home() / "kes"
+    try:
+        if kes_root.is_dir():
+            candidates.extend(list(kes_root.iterdir())[:_KES_SWEEP_MAX_ENTRIES])
+    except OSError:
+        pass
+    tmp_root = Path(tempfile.gettempdir())
+    for prefix in (_KES_TEMP_PREFIX, _LEGACY_TEMP_PREFIX):
+        try:
+            candidates.extend(list(tmp_root.glob(prefix + "*"))[:_KES_SWEEP_MAX_ENTRIES])
+        except OSError:
+            pass
+    removed = 0
+    seen: set[str] = set()
+    for entry in candidates:
+        key = str(entry)
+        if key in seen or key in _LIVE_KES_DIRS:
+            continue
+        seen.add(key)
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        if not _is_sweepable_kes_path(entry):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+    return removed
+
+
+def _state_mode_directory(
+    mode: str,
+    configured: str | None,
+) -> tuple[Path | None, str]:
+    """Resolve the profile directory for a state mode (spec §2/§6).
+
+    Returns ``(profile_dir, canonical_mode)``. ``agirbas`` resolves to the one
+    permanent home; ``kes`` creates a fresh, unique temp profile per call so
+    ``stop()`` can delete exactly the directory this launch created.
+    """
+    canonical = _canonical_state_mode(mode)
+    if canonical == STATE_MODE_AGIRBAS:
+        return _agirbas_profile_dir(configured), canonical
+    return _new_kes_profile(), canonical
 
 
 def _profile_directory(
     persistent: bool,
     configured: str | None,
 ) -> tuple[Path | None, bool]:
-    """Resolve the browser profile policy without touching the filesystem.
+    """Back-compat mapping onto the two state modes (spec §2.3).
 
-    The default profile is deliberately stable so Firefox can retain its
-    native cookies, web storage and other session data between launches.
-    Tests and callers that need a disposable browser can opt out explicitly;
-    the old temporary-profile behavior is preserved for that path.
+    ``persistent=True`` -> agirbas resolution, ``persistent=False`` -> kes.
     """
-    if not persistent:
-        return None, False
-    if configured is not None:
-        if not isinstance(configured, str) or not configured.strip():
-            raise ValueError("profile directory must be a non-empty absolute path")
-        raw = configured.strip()
-    else:
-        raw = os.environ.get(_PROFILE_DIR_ENV, "").strip()
-    if raw:
-        path = Path(raw).expanduser()
-    else:
-        data_home = os.environ.get("XDG_DATA_HOME", "").strip()
-        root = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
-        path = root / "kahin" / "profile"
-    if len(str(path)) > _PROFILE_DIR_MAX_LENGTH:
-        raise ValueError(f"profile directory exceeds {_PROFILE_DIR_MAX_LENGTH} characters")
-    if not path.is_absolute():
-        raise ValueError("profile directory must be an absolute path")
-    return path, True
+    path, canonical = _state_mode_directory(STATE_MODE_AGIRBAS if persistent else STATE_MODE_KES, configured)
+    return path, canonical == STATE_MODE_AGIRBAS
 
 
 def _profile_cache_dir() -> Path:
@@ -415,6 +568,8 @@ class Mirage(BrowserEngine):
         self._stderr_path: Path | None = None
         self._profile_dir: Path | None = None
         self._persistent_profile = False
+        self._state_mode: str | None = None
+        self._kes_profile_dir: Path | None = None
         self._headless = True
         self._marionette_port: int | None = None
         self._passkey_mode = False
@@ -545,21 +700,32 @@ class Mirage(BrowserEngine):
         self._launch_policy = None
         self._started_monotonic = None
         self._persistent_profile = False
+        self._state_mode = None
+        self._kes_profile_dir = None
         self._marionette_port = None
         self._passkey_mode = False
         configured_profile = kwargs.get("profile_dir")
+        requested_mode = kwargs.get("mode")
         persistent_profile = kwargs.get("persistent_profile", True)
         if not isinstance(persistent_profile, bool):
             raise ValueError("persistent_profile must be a boolean")
         if not isinstance(passkey_mode, bool):
             raise ValueError("passkey_mode must be a boolean")
-        if passkey_mode and not persistent_profile:
+        if requested_mode is None:
+            # Back-compat (spec §2.3): persistent_profile maps onto the modes.
+            mode = STATE_MODE_AGIRBAS if persistent_profile else STATE_MODE_KES
+        else:
+            mode = _canonical_state_mode(requested_mode)
+        if passkey_mode and mode != STATE_MODE_AGIRBAS:
             raise ValueError("passkey_mode requires persistent_profile=True")
         self._passkey_mode = passkey_mode
-        profile_dir, self._persistent_profile = _profile_directory(
-            persistent_profile,
-            configured_profile,
-        )
+        _sweep_stale_kes_dirs()
+        profile_dir, canonical_mode = _state_mode_directory(mode, configured_profile)
+        self._state_mode = canonical_mode
+        self._persistent_profile = canonical_mode == STATE_MODE_AGIRBAS
+        self._kes_profile_dir = profile_dir if canonical_mode == STATE_MODE_KES else None
+        if self._kes_profile_dir is not None:
+            _LIVE_KES_DIRS.add(str(self._kes_profile_dir))
         if passkey_mode:
             # Firefox Marionette shares the existing Camoufox process. Bind
             # to loopback only and release immediately so Firefox can claim
@@ -726,7 +892,12 @@ class Mirage(BrowserEngine):
         # firefox_user_prefs -> <profile>/user.js (webgl etc. must be set
         # before the browser boots; the sidecar only mkdirs the profile).
         if profile_dir is None:
-            profile_dir = Path(tempfile.mkdtemp(prefix="kahin-fp-"))
+            # Defensive: the resolver always returns a path, but if it ever
+            # does not, allocate a tracked ephemeral dir so stop() still
+            # cleans it up instead of leaking it.
+            profile_dir = _new_kes_profile()
+            self._kes_profile_dir = profile_dir
+            _LIVE_KES_DIRS.add(str(profile_dir))
         else:
             profile_dir.mkdir(parents=True, exist_ok=True)
         self._profile_dir = profile_dir
@@ -2215,6 +2386,17 @@ class Mirage(BrowserEngine):
 
     def _remove_profile(self) -> None:
         profile, self._profile_dir = self._profile_dir, None
+        mode, self._state_mode = self._state_mode, None
+        recorded, self._kes_profile_dir = self._kes_profile_dir, None
         persistent, self._persistent_profile = self._persistent_profile, False
-        if profile is not None and not persistent:
+        # kes is "forget me": delete exactly the directory this launch created,
+        # and only when it is provably an ephemeral kes path. agirbas state is
+        # never touched (spec §2.1/§2.2).
+        if mode == STATE_MODE_KES and recorded is not None and profile == recorded:
+            _LIVE_KES_DIRS.discard(str(recorded))
+            if _is_kes_owned_path(recorded):
+                shutil.rmtree(recorded, ignore_errors=True)
+            return
+        # Back-compat for the legacy non-persistent path.
+        if mode is None and profile is not None and not persistent:
             shutil.rmtree(profile, ignore_errors=True)

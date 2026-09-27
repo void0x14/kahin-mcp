@@ -49,7 +49,7 @@ def _page() -> str:
 
 @pytest.mark.asyncio
 async def test_browser_start_defaults_to_camoufox() -> None:
-    started = _loads(await pilot.browser_start())
+    started = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, ))
     assert started["engine"] == "mirage", started
     assert started["capabilities"]["visual"] is True, started
     try:
@@ -62,7 +62,7 @@ async def test_browser_start_defaults_to_camoufox() -> None:
 
 @pytest.mark.asyncio
 async def test_shadow_cdp_screenshot_promotes_to_camoufox() -> None:
-    started = _loads(await pilot.browser_start(engine="shadow"))
+    started = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="shadow"))
     assert started["engine"] == "shadow", started
     assert started["capabilities"]["screenshot"] is False, started
     try:
@@ -84,7 +84,7 @@ async def test_shadow_cdp_screenshot_promotes_to_camoufox() -> None:
 
 @pytest.mark.asyncio
 async def test_cdp_layout_metrics_are_real_on_camoufox() -> None:
-    started = _loads(await pilot.browser_start())
+    started = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, ))
     assert started["engine"] == "mirage", started
     try:
         await pilot.navigate(
@@ -100,7 +100,7 @@ async def test_cdp_layout_metrics_are_real_on_camoufox() -> None:
 
 @pytest.mark.asyncio
 async def test_shared_screenshot_preserves_shadow_page_without_external_fallback() -> None:
-    started = _loads(await pilot.browser_start(engine="shadow"))
+    started = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="shadow"))
     assert started["engine"] == "shadow", started
     try:
         await pilot.navigate(_page())

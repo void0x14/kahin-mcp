@@ -98,7 +98,7 @@ async def http_server() -> AsyncGenerator[str, None]:
 @async_fixture
 async def mirage_tools() -> AsyncGenerator[None, None]:
     """Start real Camoufox through kahin_browser_start with its one tab, then stop."""
-    resp = _loads(await pilot.browser_start(engine="mirage"))
+    resp = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage"))
     assert resp["status"] == "started", resp
     try:
         tabs = _loads(await trainman_mirage.mirage_tab_list())

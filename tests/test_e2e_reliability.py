@@ -70,7 +70,7 @@ def _eval_value(text: str) -> Any:
 @async_fixture
 async def mirage_tools() -> AsyncGenerator[None, None]:
     """Start real Camoufox through kahin_browser_start with its one tab, then stop."""
-    resp = _loads(await pilot.browser_start(engine="mirage"))
+    resp = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage"))
     assert resp["status"] == "started", resp
     try:
         tabs = _loads(await trainman_mirage.mirage_tab_list())
@@ -499,7 +499,7 @@ async def test_identity_start_pins_user_agent() -> None:
     await pilot.browser_stop()  # deterministic slate
     try:
         # 1) inline config dict
-        started = _loads(await pilot.browser_start(engine="mirage", identity=dict(fixed)))
+        started = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage", identity=dict(fixed)))
         assert started.get("status") == "started", started
         tab = _loads(await trainman_mirage.mirage_tab_new())
         assert tab.get("targetId"), tab
@@ -513,7 +513,7 @@ async def test_identity_start_pins_user_agent() -> None:
         await pilot.browser_stop()
 
         # 2) saved identity name through browser_start
-        started = _loads(await pilot.browser_start(engine="mirage", identity="startpin"))
+        started = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage", identity="startpin"))
         assert started.get("status") == "started", started
         tab = _loads(await trainman_mirage.mirage_tab_new())
         assert tab.get("targetId"), tab

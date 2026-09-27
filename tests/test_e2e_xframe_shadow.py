@@ -140,7 +140,7 @@ async def http_server() -> AsyncGenerator[str, None]:
 
 @async_fixture
 async def mirage_tools() -> AsyncGenerator[None, None]:
-    resp = _loads(await pilot.browser_start(engine="mirage"))
+    resp = _loads(await pilot.browser_start(mode="kes", ephemeral_ack=True, engine="mirage"))
     assert resp["status"] == "started", resp
     try:
         await asyncio.sleep(0.5)

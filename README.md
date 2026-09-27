@@ -16,7 +16,7 @@ AI modeller Chrome'un içine girip sayfa gezip kod çalıştırabilir ama CDP'yi
 
 56 domain, 667 komut, 237 event, 609 type — Chrome 148 protokolü gömülü.
 
-## 159 Tool · 5 Kategori Ailesi · 2 Engine
+## 160 Tool · 5 Kategori Ailesi · 2 Engine
 
 Tool'lar engine-ayrımlı kategori dosyalarında (`kahin/tools/`): paylaşılan çekirdek + Obscura + Camoufox aileleri.
 
@@ -29,14 +29,15 @@ Tool'lar engine-ayrımlı kategori dosyalarında (`kahin/tools/`): paylaşılan 
 |  DEJA_VU — Debug | CDP event geçmişi, network istekleri, console mesajları | 4 |
 |  PROPHECY — Pattern DB | Kullanım desenlerini öğren, sorgula, öner | 5 |
 |  HEALER | Hata istatistikleri | 1 |
-|  MIRAGE — Camoufox Native (106) | Juggler protokolü üstünde gerçek-zamanlı DOM stream, DOM, Reliability, Input, PageEx, Tab, Network, Storage, Emulation, Dialog/Download/Worker/WS, Upload, Screencast + Watch, Accessibility, Engine sağlığı/istatistik, Agent-native snapshot/form/state/identity/status/challenge, Stealth audit/insansı girdi/identity rotasyonu/proxy-geo | 106 |
+|  MIRAGE — Camoufox Native (111) | Juggler protokolü üstünde gerçek-zamanlı DOM stream, DOM, Reliability, Input, PageEx, Tab, Network, Storage, Emulation, Dialog/Download/Worker/WS, Upload, Screencast + Watch, Accessibility, Engine sağlığı/istatistik, Agent-native snapshot/form/state/identity/status/challenge, Stealth audit/insansı girdi/identity rotasyonu/proxy-geo | 111 |
 |  ORBIT — Long Crawler (7) | Tek Mirage browser/tab üzerinde bounded background crawl, canlı crawl event stream (`kahin_crawl_events`), sonuç cursor'ı, rate-limit backoff, challenge pause/resume, rotation ve cancel | 7 |
 |  VISUALIZATION (1) | Deterministik SVG görselleştirme (`kahin_visualize_data`) | 1 |
 |  EXTENSIONS (1) | Güvenli WebExtension hazırlama ve uyumluluk raporu (`kahin_extension_prepare`) | 1 |
 |  CF-CLEAR — Cloudflare (2) | Embedded challenge solver + salt-okunur clearance raporu (`kahin_cf_clear`, `kahin_cf_status`) | 2 |
+|  VAULT — Bitwarden (5) | Kod güdümlü hesap girişi (`kahin_vault_login`; sıra passkey → credentials → kullanıcı) + passkey kurulum araçları | 5 |
 |  OBSCURA — Ayrı kategori | Obscura'ya özel tool'lar (hazırlanıyor) | 0 |
 
-**Toplam: 155 tool.**
+**Toplam: 160 tool.**
 
 ## Bir satırda özet
 
@@ -99,10 +100,43 @@ mobile viewport, screencast, upload veya accessibility isteyen bir tool,
 Shadow'ı Kahin içinde Camoufox'a yükseltir. Ajanın başka bir otomasyon
 kütüphanesine geçmesi gerekmez.
 
-Bitwarden passkey modu `kahin_browser_start(engine="mirage", headless=false,
-passkey_mode=true)` ile aynı kalıcı profilde açılır. İlk hesap girişi ve
-otonom uzantı ayarları için [passkey modu kılavuzuna](docs/passkey-mode.md)
-bakın.
+`mode` zorunludur ve iki durum modundan biri seçilir. Her iki mod da istenildiği
+gibi çalıştırılır; seçim kullanıcınındır:
+
+- `mode="ağırbaş"` — kalıcı. Giriş, kayıtlı oturum, tekrar dönülecek iş, uzantı
+  durumu ve kalıcı çerez için. Tek sabit ev; tarayıcı kapanınca hiçbir şey
+  silinmez.
+- `mode="keş"` — geçici, "unut beni". Tek seferlik keşif ve anonim kazıma için.
+  Her açılışta yeni ve benzersiz profil; `kahin_browser_stop` profili ve içindeki
+  her şeyi siler. `keş` ayrıca `ephemeral_ack=true` gerektirir.
+
+`mode` verilmezse tarayıcı açılmaz. ASCII yazımlar `agirbas`/`kes` de kabul
+edilir. Hesap otomasyonu (Bitwarden hesap havuzu) ağırbaş/keş'ten bağımsız ayrı
+bir eksendir; o dalda keş de Bitwarden taşır. Ayrıntılı sözleşme:
+[durum modları](docs/state-modes.md).
+
+Bitwarden `ağırbaş` profilinde **gömülü ve pinlidir** (Camoufox'un uBlock'u
+gibi): imzalı XPI sürüm ve SHA-256 ile doğrulanır, bir kez indirilip çıkarılır
+ve bir kez profile kurulur. Sonraki başlatmalarda yeniden indirme, çıkarma veya
+kopyalama yapılmaz; varlığı başlangıç yanıtında profil kaydından **doğrulanır**
+(`present_active` / `present_disabled` / `missing`). İlk hesap girişi ve otonom
+uzantı ayarları için [passkey modu kılavuzuna](docs/passkey-mode.md) bakın.
+
+Bitwarden kurulumu bu makinede **tamamlandı**: hesap bir kez açıldı, kasa
+`vaultTimeout = never` + auto-unlock anahtarı (`<uid>_user_auto`) ile kalıcı
+hâle getirildi ve yeniden başlatma sonrası kasanın kendiliğinden açıldığı
+canlı doğrulandı. **Bir daha giriş istenmez.**
+
+Yalnızca yeni/temiz bir makinede gerekir (bu makinede çalıştırma):
+
+```bash
+.venv/bin/python scripts/bitwarden_ilk_kurulum.py   # hesap yoksa: tek giriş
+.venv/bin/python scripts/bitwarden_kasa_ac.py       # never devredeyken tek açılış
+```
+
+İkinci adım mekaniktir: Bitwarden auto-unlock anahtarını yalnızca kasa
+açılırken yazar. İkisi tamamlandığında kasa her açılışta kendiliğinden açılır.
+Ayrıntı ve canlı kanıt: [durum modları §4](docs/state-modes.md).
 
 Camoufox (Juggler native) ile:
 
@@ -124,6 +158,7 @@ Camoufox (Juggler native) ile:
 → kahin_agent_status (agent döngüsü özeti) → kahin_challenge_status (crawl öncesi)
 → kahin_crawl_start(seeds=[...]) → kahin_crawl_status → kahin_crawl_results(cursor=...)
 → kahin_crawl_pause/resume/stop
+→ kahin_vault_login(site_url="https://...")   # passkey → credentials → kullanıcı; Mirage passkey_mode=true gerekir
 ```
 
 `kahin_browser_start` tek bir Camoufox/sidecar süreci açar. İlk sayfa işlemi
@@ -187,7 +222,7 @@ Kahin'de hata loglama ve kendini onarma sistemi gömülüdür:
 
 ```
 oracle.py               → MCP server (bootstrap: mcp instance + engine lifecycle + main)
-  tools/                → 159 tool, engine-ayrımlı kategori dosyaları
+  tools/                → 160 tool, engine-ayrımlı kategori dosyaları
     _common.py          → capability routing, _safe_cdp, _require_engine, _auto_learn
     the_twins/capabilities → motor-yetenek sözleşmesi ve Mirage yükseltme matrisi
     grimoire/seraph/prophecy/healer → CDP bilgi + doğrulama + pattern (paylaşılan)
@@ -216,7 +251,7 @@ camoufox-harness/       → Zig sidecar (Juggler protocol, vendor binary gömül
 - [x] **Tek tık kurulum** — `pnpm add -g @kahinmcp/kahin`, sonra `kahin` (ilk çalıştırmada Python ortamını otomatik kurar)
 - [ ] **Zero-dependency** hedefi (Go/Rust portu)
 - [ ] **LSP modu** — kod içinde hata yakalama, AI'a yanlışını yüzüne vurma
-- [x] **Tool sayısı 159** — Camoufox Juggler-native 106 tool (gerçek-zamanlı DOM stream, DOM, Reliability, Input, Network, Storage, Emulation, Dialog, Tab, Worker/WS, Upload, Screencast + Watch, Accessibility, Engine sağlığı/istatistik, Agent-native snapshot/form/state/identity/status, Stealth audit/humanized input/identity pins/proxy geo) + CF-Clear 2 (tarayıcısız hızlı yol: curl_cffi impersonate safari18_0 → chrome131, düz CF'yi browser'sız geçer + JS/challenge/canvas için embedded solver + status) + paylaşılan 47 çekirdek (Grimoire 7, Seraph 3, Pilot 9, Trainman 4, DejaVu 4, Prophecy 5, Healer 1, Crawler 7, Engine 2, Visualization 1, Extensions 1, OCR dahil)
+- [x] **Tool sayısı 160** — Camoufox Juggler-native 111 tool (gerçek-zamanlı DOM stream, DOM, Reliability, Input, Network, Storage, Emulation, Dialog, Tab, Worker/WS, Upload, Screencast + Watch, Accessibility, Engine sağlığı/istatistik, Agent-native snapshot/form/state/identity/status, Stealth audit/humanized input/identity pins/proxy geo) + CF-Clear 2 (tarayıcısız hızlı yol: curl_cffi impersonate safari18_0 → chrome131, düz CF'yi browser'sız geçer + JS/challenge/canvas için embedded solver + status) + paylaşılan 47 çekirdek (Grimoire 7, Seraph 3, Pilot 9, Trainman 4, DejaVu 4, Prophecy 5, Healer 1, Crawler 7, Engine 2, Visualization 1, Extensions 1, OCR dahil)
 - [x] **Faz 4 performans yüzeyi** — non-blocking Zig sidecar (N=20 probe: paralel duvar 56.89 → 8.71 ms, ratio 1.314 → 3.281), `kahin_engine_stats` (monotonic uptime + per-tool rollup, top_slow ≤ 10) ve identity başına bounded prewarm metadata (launch asla atlanmaz; dürüst reuse kaydı)
 - [ ] **Obscura ayrı tool'ları** — CDP-yeteneklerine özel pilot_obscura/trainman_obscura/dejavu_obscura kategorilerini doldur
 

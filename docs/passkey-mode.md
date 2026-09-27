@@ -40,6 +40,38 @@ alınması, hesap değişikliği veya kuruluş politikası gibi dış koşullar 
 "ömür boyu tek giriş" garantisi verilemez. Bu koşullarda Kahin yeniden
 kimlik doğrulama gerektiğini açıkça raporlar.
 
+## Gömülü ve pinli kurulum (ağırbaş)
+
+Bitwarden `ağırbaş` profilinde **gömülü ve pinlidir** (Camoufox'un uBlock'u
+gibi): imzalı XPI sürüm ve SHA-256 ile doğrulanır, `$KAHIN_HOME/addons/bitwarden/`
+altında tutulur ve profile **idempotent** kurulur. Var olan doğrulanmış kopya
+yeniden indirilmez, çıkarılmaz veya kopyalanmaz; her `ağırbaş` başlatmasında
+dosya yerindeyse hiçbir şey yapılmaz (kanıt: ikinci başlatmada XPI mtime
+değişmez, ağ isteği olmaz). Varlık iddia edilmez, profil kaydından doğrulanır
+(`present_active` / `present_disabled` / `present_pending_first_run` / `missing`
+/ `unavailable`). Sözleşme: [durum modları §3](state-modes.md).
+
+## Kilit ve zaman aşımı — kökten kapatma ve doğru sıra
+
+Ayar **kökten** yazılır: `configure_vault_timeout_root` uzantı popup'ından
+`user_<uid>_vaultTimeoutSettings_vaultTimeout="never"` +
+`vaultTimeoutAction="lock"` yazar ve geri okuyup doğrular.
+
+**Kritik tuzak (canlı kanıtlandı):** `never` tek başına yetmez. Bitwarden
+auto-unlock anahtarını (`<uid>_user_auto`) **yalnızca kasa açılırken** yazar.
+Giriş `onRestart` varken yapıldıysa anahtar yazılmaz ve yeniden başlatmada kasa
+`#/lock` olur. Doğru sıra:
+
+1. Kullanıcı bir kez giriş yapar.
+2. Kod `never` + `lock` ayarını kökten yazar.
+3. `never` devredeyken kasa **bir kez** açılır → `<uid>_user_auto` yazılır.
+4. Bundan sonra kalıcı: her açılışta kasa açık.
+
+Bu adımlar otonom yürütülür: `scripts/bitwarden_ilk_kurulum.py` (bir kez giriş)
+ve `scripts/bitwarden_kasa_ac.py` (`never` devredeyken bir kez aç). Kullanıcıdan
+yalnızca giriş/açma anında tek bir elle işlem istenir, gerisi kod. Ayrıntı ve
+canlı kanıt: [durum modları §4](state-modes.md).
+
 ## Değerlendirilen yollar
 
 - Camoufox'un çıkarılmış `addons` dizini: Genel eklenti yükleme arayüzü var,

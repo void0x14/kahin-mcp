@@ -3,6 +3,15 @@
 Bu MCP server, Chrome DevTools Protocol (CDP) bilgisi, doğrulaması ve browser kontrolü sağlar.
 56 domain, 667 komut, 237 event, 609 type — Chrome 148.
 
+## Durum Modu — `mode` Zorunludur
+
+`kahin_browser_start` `mode` olmadan başlamaz (`mode_required`). Seçim kullanıcınındır; iki mod da istenildiği gibi çalıştırılır:
+
+- `mode="ağırbaş"` — kalıcı. Giriş, kayıtlı oturum, tekrar dönülecek iş, uzantı durumu ve kalıcı çerez için. Tek sabit ev; kapanınca hiçbir şey silinmez.
+- `mode="keş"` — geçici ("unut beni"). Tek seferlik keşif, anonim kazıma, kimlik istemeyen iş için. Her açılışta yeni profil; `kahin_browser_stop` profili ve içindeki her şeyi siler. `keş` ayrıca `ephemeral_ack=true` gerektirir.
+
+ASCII `agirbas`/`kes` de kabul edilir. Sözleşme: [docs/state-modes.md](docs/state-modes.md).
+
 ## Tool İsimlendirme
 
 OpenCode'da tool isimleri `kahin_` prefix'i ile başlar. AGENTS.md'deki isimler aynen kullanılır:
@@ -66,7 +75,7 @@ kahin_pattern_query(context="doggystyle")
 kahin_pattern_suggest(partial="navig")
 ```
 
-## Tool Listesi (159 adet)
+## Tool Listesi (160 adet)
 
 Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 [docs/juggler-ai-native.md](docs/juggler-ai-native.md)
@@ -92,7 +101,7 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 ### PILOT — Browser Kontrol (9)
 | Tool | Ne işe yarar? |
 |------|---------------|
-| `kahin_browser_start` | Varsayılan Camoufox/Mirage browser motorunu başlat (Shadow açıkça seçilebilir) |
+| `kahin_browser_start` | Browser motorunu başlat; `mode` zorunlu (`ağırbaş` kalıcı / `keş` geçici, `keş` için `ephemeral_ack=true`) |
 | `kahin_browser_stop` | Browser'ı durdur, state temizle |
 | `kahin_navigate` | URL'e git |
 | `kahin_click` | CSS selector ile element tıkla |
@@ -127,7 +136,12 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_pattern_forget` | Pattern sil |
 | `kahin_pattern_stats` | Pattern istatistikleri |
 
-### MIRAGE — Juggler Native (106) — Camoufox varsayılandır; Shadow'dan gerektiğinde otomatik yükseltilir
+### HEALER — Hata İstatistikleri (1)
+| Tool | Ne işe yarar? |
+|------|---------------|
+| `kahin_healer_stats` | Hata takibi ve kendini onarma (self-healing) istatistiklerini göster |
+
+### MIRAGE — Juggler Native (111) — Camoufox varsayılandır; Shadow'dan gerektiğinde otomatik yükseltilir
 
 #### DOM Stream (5) — gerçek MutationObserver + Juggler binding
 | Tool | Ne işe yarar? |
@@ -328,6 +342,18 @@ rate-limit kaçış yolu olarak kullanmaz.
 |------|---------------|
 | `kahin_cf_clear` | Cloudflare challenge'ı temizle — önce tarayıcısız hızlı yol (curl_cffi impersonate: safari18_0 → chrome131, yalnızca python, browser açılmyor); düz CF burada geçilir (`method: fast:<profile>`, `browser: false`). Yalnızca JS/challenge/canvas kanıtlanınca browser yoluna düşülür (embedded solver; interstitial title gate + host-scoped `cf_clearance` doğrular, tıklayamıyorsa `pause_for_human` döner) |
 | `kahin_cf_status` | Mevcut sayfanın Cloudflare clearance durumunu raporla (salt-okunur; gezinmez, tıklamaz) |
+
+### VAULT — Bitwarden (5)
+
+Bitwarden kasasından **kod güdümlü** hesap girişi. Sıra sabittir ve ajan seçmez: passkey → credentials → kullanıcı (docs/state-modes.md §2.4). `kahin_vault_login` Mirage motoru `passkey_mode=true` ile açılmış olmalı; araç kendisi tarayıcı başlatmaz.
+
+| Tool | Ne işe yarar? |
+|------|---------------|
+| `kahin_vault_login` | Site girişini Bitwarden kasasından çözer: passkey varsa onu seçer, yoksa credentials ile autofill yapar, ikisi de yoksa kullanıcıya hesabı Bitwarden'a eklemesini söyler; kasa okunamazsa nedenini raporlar. Mirage `passkey_mode=true` gerekir; tarayıcı başlatmaz |
+| `kahin_passkey_setup_open` | Bitwarden'ı tek seferlik insan girişi için ayrı görünür sekmede açar |
+| `kahin_passkey_setup_status` | Kurulum rotasını hesap alanlarını okumadan raporlar |
+| `kahin_passkey_setup_finish` | İnsan girişinden sonra `Never` timeout'u kökten ayarlar ve passkey'leri etkinleştirir |
+| `kahin_passkey_setup_close` | Yalnızca kurulum sekmesini kapatır; Kahin tarayıcısı çalışmaya devam eder |
 
 ### Faz 4 — Performans (Zig sidecar + metrik yüzeyi)
 

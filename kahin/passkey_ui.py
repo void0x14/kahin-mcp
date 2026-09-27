@@ -1,11 +1,14 @@
-"""Small Marionette helpers for Bitwarden's Firefox popup UI.
+"""Small Marionette helpers for Bitwarden's Firefox popup UI and settings.
 
-These helpers only inspect public UI state and click visible controls. They do
-not read or enter account credentials.
+The UI helpers only inspect public UI state and click visible controls. The
+root storage helper writes the vault timeout settings straight into the
+extension's own ``browser.storage.local`` (docs/state-modes.md §4). Nothing
+here reads or returns credentials, master passwords or vault items.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 from urllib.parse import urldefrag
@@ -277,4 +280,174 @@ def configure_unlocked_vault(m: Any, popup_url: str) -> dict[str, Any]:
         "route": "notifications",
         "state": "verified",
         "settings": {"vault_timeout": "never", "ask_to_save_and_use_passkeys": True},
+    }
+
+
+# --- Root storage (docs/state-modes.md §4) ---------------------------------
+#
+# Bitwarden persists settings in browser.storage.local under logical keys and
+# wraps every value as {"__json__": true, "value": JSON.stringify(actual)}.
+# The popup page is a real extension page, so its JS context reaches that store
+# directly; writing there disables lock/timeout with no UI clicks.
+
+ACTIVE_ACCOUNT_KEY = "global_account_activeAccountId"
+VAULT_TIMEOUT = "never"
+VAULT_TIMEOUT_ACTION = "lock"
+_STORAGE_TIMEOUT_MS = 5000
+
+# Marionette's async script callback is always the last argument; the keys or
+# items arrive as the first script argument.
+_JS_STORAGE_API = (
+    "const w = (typeof window !== 'undefined') ? window : globalThis;"
+    "const page = w.wrappedJSObject || w;"
+    "const api = (w.browser || w.chrome || page.browser || page.chrome).storage.local;"
+)
+
+_READ_STORAGE_SCRIPT = (
+    "const callback = arguments[arguments.length - 1];"
+    "const keys = arguments[0];"
+    "try {"
+    + _JS_STORAGE_API
+    + "Promise.resolve(api.get(keys)).then("
+    "function (result) { callback({ok: true, result: result}); },"
+    "function (error) { callback({ok: false, error: String((error && error.message) || error)}); }"
+    ");"
+    "} catch (error) {"
+    "callback({ok: false, error: String((error && error.message) || error)});"
+    "}"
+)
+
+_WRITE_STORAGE_SCRIPT = (
+    "const callback = arguments[arguments.length - 1];"
+    "const items = arguments[0];"
+    "try {"
+    + _JS_STORAGE_API
+    + "Promise.resolve(api.set(items)).then("
+    "function () { callback({ok: true}); },"
+    "function (error) { callback({ok: false, error: String((error && error.message) || error)}); }"
+    ");"
+    "} catch (error) {"
+    "callback({ok: false, error: String((error && error.message) || error)});"
+    "}"
+)
+
+
+def vault_timeout_key(user_id: str) -> str:
+    """Logical storage key holding ``user_id``'s vault timeout."""
+    return f"user_{user_id}_vaultTimeoutSettings_vaultTimeout"
+
+
+def vault_timeout_action_key(user_id: str) -> str:
+    """Logical storage key holding ``user_id``'s vault timeout action."""
+    return f"user_{user_id}_vaultTimeoutSettings_vaultTimeoutAction"
+
+
+def wrap_stored_value(value: Any) -> dict[str, Any]:
+    """Wrap a value the way Bitwarden's storage service does before writing."""
+    return {"__json__": True, "value": json.dumps(value)}
+
+
+def unwrap_stored_value(stored: Any) -> Any:
+    """Unwrap a stored value; return anything that is not a wrapper unchanged."""
+    if isinstance(stored, dict) and stored.get("__json__") and isinstance(stored.get("value"), str):
+        try:
+            return json.loads(stored["value"])
+        except json.JSONDecodeError:
+            return stored
+    return stored
+
+
+def _read_storage(client: Any, keys: list[str]) -> dict[str, Any]:
+    payload = client.execute_async_script(
+        _READ_STORAGE_SCRIPT, (list(keys),), script_timeout=_STORAGE_TIMEOUT_MS
+    )
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise RuntimeError("Bitwarden storage read failed")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        # A reachable store always answers with an object. Anything else means
+        # the extension API was never actually reached, so callers must treat
+        # it as unavailable rather than as "no account" (a false negative).
+        raise RuntimeError("Bitwarden storage returned no object")
+    return result
+
+
+def _write_storage(client: Any, items: dict[str, Any]) -> None:
+    payload = client.execute_async_script(
+        _WRITE_STORAGE_SCRIPT, (items,), script_timeout=_STORAGE_TIMEOUT_MS
+    )
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise RuntimeError("Bitwarden storage write failed")
+
+
+def configure_vault_timeout_root(client: Any) -> dict[str, Any]:
+    """Disable Bitwarden lock/timeout at the storage root and verify it.
+
+    ``client`` must be a live Marionette connection whose current context is
+    the Bitwarden popup extension page. Returns ``login_required`` when no
+    account is active, ``configured`` when the read-back matches, ``failed``
+    naming the mismatching setting, or ``unavailable`` when the extension
+    storage cannot be reached (callers may then fall back to the UI).
+    """
+    try:
+        account = _read_storage(client, [ACTIVE_ACCOUNT_KEY])
+    except Exception:  # noqa: BLE001 - extension page/storage not reachable
+        return {"status": "unavailable", "state": "storage_unavailable"}
+
+    user_id = unwrap_stored_value(account.get(ACTIVE_ACCOUNT_KEY))
+    if not isinstance(user_id, str) or not user_id:
+        return {"status": "login_required"}
+
+    timeout_key = vault_timeout_key(user_id)
+    action_key = vault_timeout_action_key(user_id)
+    try:
+        _write_storage(
+            client,
+            {
+                timeout_key: wrap_stored_value(VAULT_TIMEOUT),
+                action_key: wrap_stored_value(VAULT_TIMEOUT_ACTION),
+            },
+        )
+        stored = _read_storage(client, [timeout_key, action_key])
+    except Exception:  # noqa: BLE001 - extension page/storage not reachable
+        return {"status": "unavailable", "state": "storage_unavailable"}
+
+    if unwrap_stored_value(stored.get(timeout_key)) != VAULT_TIMEOUT:
+        return {"status": "failed", "state": "vault_timeout_mismatch"}
+    if unwrap_stored_value(stored.get(action_key)) != VAULT_TIMEOUT_ACTION:
+        return {"status": "failed", "state": "vault_timeout_action_mismatch"}
+    return {
+        "status": "configured",
+        "settings": {"vault_timeout": VAULT_TIMEOUT, "vault_timeout_action": VAULT_TIMEOUT_ACTION},
+    }
+
+
+def vault_timeout_status(client: Any) -> dict[str, Any]:
+    """Read-only probe of the root vault timeout settings.
+
+    Run this live after a human Bitwarden login (and again after a restart) to
+    confirm the settings stuck. It never writes and never reads vault contents.
+    """
+    try:
+        account = _read_storage(client, [ACTIVE_ACCOUNT_KEY])
+    except Exception:  # noqa: BLE001 - extension page/storage not reachable
+        return {"status": "unavailable", "state": "storage_unavailable"}
+
+    user_id = unwrap_stored_value(account.get(ACTIVE_ACCOUNT_KEY))
+    if not isinstance(user_id, str) or not user_id:
+        return {"status": "login_required"}
+
+    timeout_key = vault_timeout_key(user_id)
+    action_key = vault_timeout_action_key(user_id)
+    try:
+        stored = _read_storage(client, [timeout_key, action_key])
+    except Exception:  # noqa: BLE001 - extension page/storage not reachable
+        return {"status": "unavailable", "state": "storage_unavailable"}
+
+    timeout_value = unwrap_stored_value(stored.get(timeout_key))
+    action_value = unwrap_stored_value(stored.get(action_key))
+    return {
+        "status": "ok",
+        "settings": {"vault_timeout": timeout_value, "vault_timeout_action": action_value},
+        "never": timeout_value == VAULT_TIMEOUT,
     }

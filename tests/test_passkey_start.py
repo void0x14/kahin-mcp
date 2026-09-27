@@ -168,12 +168,12 @@ async def test_reuse_reports_only_passkey_mode_recorded_on_successful_start(monk
     monkeypatch.setattr(state, "_current_engine", active)
     monkeypatch.setattr(pilot, "_engine_is_healthy", _healthy)
 
-    ordinary_reuse = json.loads(await pilot.browser_start())
+    ordinary_reuse = json.loads(await pilot.browser_start(mode="agirbas"))
     assert ordinary_reuse["status"] == "reused"
     assert "passkey_mode" not in ordinary_reuse
 
     active._passkey_mode = True
-    passkey_reuse = json.loads(await pilot.browser_start())
+    passkey_reuse = json.loads(await pilot.browser_start(mode="agirbas"))
     assert passkey_reuse["passkey_mode"] is True
     assert passkey_reuse["passkey_extension"]["vault_state"] == "unknown"
 

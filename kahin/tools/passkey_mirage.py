@@ -12,7 +12,11 @@ import orjson
 from kahin import _state as state
 from kahin._mcp import mcp
 from kahin.passkey_session import PasskeyUISession
-from kahin.passkey_ui import configure_unlocked_vault, prepare_login_ui
+from kahin.passkey_ui import (
+    configure_unlocked_vault,
+    configure_vault_timeout_root,
+    prepare_login_ui,
+)
 from kahin.the_twins.mirage import Mirage
 from kahin.tools._common import _RO, _RW, _healer_ref
 
@@ -124,11 +128,22 @@ async def passkey_setup_finish() -> str:
                 await _close_session()
                 return _error("No Bitwarden setup tab is open.", "passkey_setup_not_open")
             try:
-                result = await asyncio.to_thread(
-                    configure_unlocked_vault,
+                # Root write first: it needs no UI clicking and persists on its
+                # own. The UI path is only a fallback for when the extension
+                # storage has no active account or cannot be reached.
+                root_result = await asyncio.to_thread(
+                    configure_vault_timeout_root,
                     _setup_session.client,
-                    _setup_session.popup_url,
                 )
+                if root_result.get("status") == "configured":
+                    result = {**root_result, "method": "storage_root"}
+                else:
+                    ui_result = await asyncio.to_thread(
+                        configure_unlocked_vault,
+                        _setup_session.client,
+                        _setup_session.popup_url,
+                    )
+                    result = {**ui_result, "method": "ui"}
             except Exception:  # noqa: BLE001 - never echo popup contents or credentials
                 logger.exception("Bitwarden setup could not complete")
                 return _error("Could not complete Bitwarden setup.", "passkey_setup_failed")

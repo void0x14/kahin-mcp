@@ -1,0 +1,86 @@
+diff --git a/dom/events/EventStateManager.cpp b/dom/events/EventStateManager.cpp
+index 4fe9337e86..057a63e5f7 100644
+--- a/dom/events/EventStateManager.cpp
++++ b/dom/events/EventStateManager.cpp
+@@ -2291,6 +2291,14 @@ bool EventStateManager::HandleCrossProcessEvent(WidgetEvent* aEvent,
+   //
+   // NB: the elements of |remoteTargets| must be unique, for correctness.
+   AutoTArray<RefPtr<BrowserParent>, 1> remoteTargets;
++  // A nested out-of-process iframe has no BrowserParent in this embedding
++  // process: its frame loader owns a BrowserBridgeHost, so
++  // BrowserParent::GetFrom() above returns null and the event was dropped
++  // here (bug 1549355). Keep the bridge child instead, so the event can be
++  // handed to PBrowserBridge, which forwards it to the OOPIF's BrowserParent
++  // and on to the child process.
++  RefPtr<BrowserBridgeChild> bridgeTarget;
++  WidgetMouseEvent* bridgeEvent = nullptr;
+   if (aEvent->mClass != eTouchEventClass || aEvent->mMessage == eTouchStart) {
+     // If this event only has one target, and it's remote, add it to
+     // the array.
+@@ -2300,6 +2308,16 @@ bool EventStateManager::HandleCrossProcessEvent(WidgetEvent* aEvent,
+     nsIContent* target = frame ? frame->GetContent() : nullptr;
+     if (BrowserParent* remoteTarget = BrowserParent::GetFrom(target)) {
+       remoteTargets.AppendElement(remoteTarget);
++    } else if (aEvent->mClass == eMouseEventClass ||
++               aEvent->mClass == ePointerEventClass) {
++      WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent();
++      if (!mouseEvent) {
++        mouseEvent = aEvent->AsPointerEvent();
++      }
++      if (mouseEvent) {
++        bridgeEvent = mouseEvent;
++        bridgeTarget = BrowserBridgeChild::GetFrom(target);
++      }
+     }
+   } else {
+     // This is a touch event with possibly multiple touch points.
+@@ -2332,6 +2350,15 @@ bool EventStateManager::HandleCrossProcessEvent(WidgetEvent* aEvent,
+     }
+   }
+ 
++  if (bridgeTarget) {
++    // Hand the event to the PBrowserBridge; BrowserBridgeParent forwards it to
++    // the OOPIF's BrowserParent, which posts it to the child process. The
++    // local dispatch below still runs against the embedding <iframe>, which
++    // does not consume mouse input, so nothing is duplicated.
++    (void)bridgeTarget->SendDispatchSynthesizedMouseEvent(*bridgeEvent);
++    return false;
++  }
++
+   if (remoteTargets.Length() == 0) {
+     return false;
+   }
+diff --git a/dom/ipc/BrowserBridgeParent.cpp b/dom/ipc/BrowserBridgeParent.cpp
+index 5321bcab1c..31d8bfe854 100644
+--- a/dom/ipc/BrowserBridgeParent.cpp
++++ b/dom/ipc/BrowserBridgeParent.cpp
+@@ -216,9 +216,26 @@ IPCResult BrowserBridgeParent::RecvBeginDestroy() {
+ 
+ IPCResult BrowserBridgeParent::RecvDispatchSynthesizedMouseEvent(
+     const WidgetMouseEvent& aEvent) {
+-  if (aEvent.mMessage != eMouseMove ||
+-      aEvent.mReason != WidgetMouseEvent::eSynthesized) {
+-    return IPC_FAIL(this, "Unexpected event type");
++  // The embedding process also uses this message to deliver synthesized input
++  // (Juggler) into a nested out-of-process iframe. Those events arrive with
++  // mReason == eReal, and a click needs eMouseDown/eMouseUp as well as
++  // eMouseMove, so the original guard -- which admitted only the APZ-generated
++  // synthesized mousemove -- dropped exactly the events a remote click is made
++  // of.
++  if (aEvent.mClass != eMouseEventClass &&
++      aEvent.mClass != ePointerEventClass) {
++    return IPC_FAIL(this, "Unexpected event class");
++  }
++  switch (aEvent.mMessage) {
++    case eMouseMove:
++    case eMouseDown:
++    case eMouseUp:
++    case ePointerMove:
++    case ePointerDown:
++    case ePointerUp:
++      break;
++    default:
++      return IPC_FAIL(this, "Unexpected event message");
+   }
+ 
+   nsCOMPtr<nsIWidget> widget = Manager()->GetWidget();

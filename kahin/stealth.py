@@ -328,8 +328,10 @@ def proxy_env(proxy_url: str) -> dict[str, str]:
 # rejects anything whose scheme is not ``http`` (``SchemeIs("http")``), so a
 # socks4/socks5 URL placed in HTTP_PROXY/ALL_PROXY is silently dropped and the
 # browser falls back to a DIRECT connection (real-IP leak). The enum values
-# mirror Playwright's ``toJugglerProxyOptions``: socks5 -> ``socks``,
-# socks4 -> ``socks4``, http/https unchanged.
+# are the browser's own Juggler schema
+# (camoufox-harness/protocol/schema/juggler-schema.json, source
+# daijro/camoufox@v152.0.4-beta.28): socks5 -> ``socks``, socks4 -> ``socks4``,
+# http/https unchanged.
 _JUGGLER_PROXY_TYPE = {
     "http": "http",
     "https": "https",

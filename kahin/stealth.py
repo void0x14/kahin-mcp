@@ -21,7 +21,7 @@ import importlib.util
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 import orjson
@@ -261,11 +261,13 @@ def unpin_identity(domain: str) -> dict[str, str] | None:
     return None
 
 
-# Proxy/geo sync (Faz 3 Task 5): the browser layer applies a proxy through
-# environment variables (Camoufox passes our env through to the Firefox
-# child verbatim), and geo resolution runs THROUGH the proxy so the exit IP
-# is what actually gets probed. Credentials live only inside the env dict
-# that the browser consumes; every display surface uses ``_redact_proxy``.
+# Proxy/geo sync (Faz 3 Task 5): the browser applies the proxy through the
+# Juggler ``Browser.setBrowserProxy`` call (``proxy_juggler_params`` below),
+# and geo resolution runs THROUGH the proxy so the exit IP is what actually
+# gets probed. ``proxy_env`` is retained as the URL validator and as a
+# loopback guard, but it is NOT how Firefox routes traffic (see the note on
+# ``_JUGGLER_PROXY_TYPE``). Credentials live only inside the params dict and
+# the env dict; every display surface uses ``_redact_proxy``.
 _PROXY_SCHEMES = ("http", "https", "socks4", "socks5")
 _PROXY_GEO_ENDPOINT = "https://ipapi.co/json/"
 _PROXY_GEO_MAX_BYTES = 64 * 1024
@@ -315,6 +317,63 @@ def proxy_env(proxy_url: str) -> dict[str, str]:
         "ALL_PROXY": raw,
         "NO_PROXY": "localhost,127.0.0.1,::1",
     }
+
+
+# Juggler ``Browser.setBrowserProxy`` mapping. This is the ONLY seam that
+# actually routes Firefox through the proxy: the browser applies it with a
+# global nsIProtocolProxyChannelFilter (NetworkObserver.js:618-641), so it
+# needs no prefs, no user.js and no env, works for every scheme, and is the
+# only path that can carry credentials. The env seam below is NOT equivalent:
+# Firefox's environment-proxy path (toolkit/system/commonproxy/ProxyUtils.cpp)
+# rejects anything whose scheme is not ``http`` (``SchemeIs("http")``), so a
+# socks4/socks5 URL placed in HTTP_PROXY/ALL_PROXY is silently dropped and the
+# browser falls back to a DIRECT connection (real-IP leak). The enum values
+# mirror Playwright's ``toJugglerProxyOptions``: socks5 -> ``socks``,
+# socks4 -> ``socks4``, http/https unchanged.
+_JUGGLER_PROXY_TYPE = {
+    "http": "http",
+    "https": "https",
+    "socks4": "socks4",
+    "socks5": "socks",
+}
+_PROXY_DEFAULT_PORTS = {"http": 80, "https": 443}
+# Mirror the NO_PROXY intent above: loopback never leaves the machine. The
+# Juggler filter overrides Firefox's own allow_hijacking_localhost guard, so
+# the bypass list must be explicit.
+_PROXY_BYPASS = ("localhost", "127.0.0.1", "::1")
+
+
+def proxy_juggler_params(proxy_url: str) -> dict[str, Any]:
+    """Map a proxy URL to Juggler ``Browser.setBrowserProxy`` params.
+
+    Validates the URL exactly like ``proxy_env`` (identical ``ValueError``
+    messages; credentials never appear in an error) and returns the params
+    the browser-level proxy filter consumes:
+    ``{type, host, port, bypass}`` plus ``username``/``password`` when the
+    URL carries userinfo. SOCKS has no default port, so it is required.
+    """
+    proxy_env(proxy_url)  # same validation contract as proxy_env
+    parsed = urlparse(proxy_url.strip())
+    port = parsed.port
+    if port is None:
+        port = _PROXY_DEFAULT_PORTS.get(parsed.scheme)
+    if port is None or port <= 0:
+        raise ValueError(
+            "socks proxy URL must include a valid port"
+            if parsed.scheme in ("socks4", "socks5")
+            else "proxy URL has an invalid port"
+        )
+    params: dict[str, Any] = {
+        "type": _JUGGLER_PROXY_TYPE[parsed.scheme],
+        "host": parsed.hostname,
+        "port": port,
+        "bypass": list(_PROXY_BYPASS),
+    }
+    if parsed.username:
+        params["username"] = unquote(parsed.username)
+    if parsed.password:
+        params["password"] = unquote(parsed.password)
+    return params
 
 
 def _bounded_geo_text(value: Any, maximum: int) -> str:

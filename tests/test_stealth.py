@@ -16,6 +16,7 @@ from kahin.stealth import (
     pin_identity,
     pins_path,
     proxy_env,
+    proxy_juggler_params,
     resolve_proxy_geo,
     save_pins,
     score_checks,
@@ -180,6 +181,45 @@ def test_proxy_env_rejects_nonsense() -> None:
 def test_proxy_env_errors_never_embed_credentials() -> None:
     with pytest.raises(ValueError) as excinfo:
         proxy_env("http://user:supersecret@:8080")
+    assert "supersecret" not in str(excinfo.value)
+
+
+def test_proxy_juggler_params_maps_schemes_and_default_ports() -> None:
+    socks = proxy_juggler_params("socks5://43.161.246.231:10808")
+    assert socks["type"] == "socks"
+    assert socks["host"] == "43.161.246.231"
+    assert socks["port"] == 10808
+    assert socks["bypass"] == ["localhost", "127.0.0.1", "::1"]
+    assert "username" not in socks and "password" not in socks
+
+    assert proxy_juggler_params("socks4://10.0.0.1:1080")["type"] == "socks4"
+    assert proxy_juggler_params("http://proxy.example.com")["type"] == "http"
+    assert proxy_juggler_params("http://proxy.example.com")["port"] == 80
+    assert proxy_juggler_params("https://proxy.example.com")["type"] == "https"
+    assert proxy_juggler_params("https://proxy.example.com")["port"] == 443
+
+
+def test_proxy_juggler_params_splits_and_decodes_credentials() -> None:
+    params = proxy_juggler_params("socks5://user:pass@127.0.0.1:1080")
+    assert params["username"] == "user"
+    assert params["password"] == "pass"
+    decoded = proxy_juggler_params("http://user%40x:p%3Ass@127.0.0.1:8080")
+    assert decoded["username"] == "user@x"
+    assert decoded["password"] == "p:ss"
+
+
+def test_proxy_juggler_params_rejects_missing_or_zero_ports() -> None:
+    for bad in ("socks5://host", "socks4://host", "socks5://host:0", "http://host:0"):
+        with pytest.raises(ValueError):
+            proxy_juggler_params(bad)
+
+
+def test_proxy_juggler_params_reuses_proxy_env_validation() -> None:
+    for bad in ("not a proxy", "", "ftp://127.0.0.1:21", "http://host:70000"):
+        with pytest.raises(ValueError):
+            proxy_juggler_params(bad)
+    with pytest.raises(ValueError) as excinfo:
+        proxy_juggler_params("http://user:supersecret@:8080")
     assert "supersecret" not in str(excinfo.value)
 
 

@@ -776,22 +776,21 @@ class Mirage(BrowserEngine):
             prewarm_hash = _identity_hash(self._identity_config)
             prewarm = _prewarm_load(prewarm_hash)
         # Validate the proxy before constructing launch options so the same
-        # validated value can drive Camoufox's native proxy/geoip seam and
-        # the existing environment defense-in-depth seam below. Credentials
-        # remain internal to the launch call and env; no display/log path
-        # receives the raw URL.
+        # validated value can drive Camoufox's native proxy/geoip seam
+        # (geoip resolves the exit IP THROUGH the proxy) and the Juggler
+        # Browser.setBrowserProxy call after boot. Credentials remain internal
+        # to the launch call and the params; no display/log path receives the
+        # raw URL. An invalid URL fails the start (fail closed) instead of
+        # silently running proxyless.
         proxy_url = kwargs.get("proxy")
         validated_proxy_url: str | None = None
-        proxy_environment: dict[str, str] | None = None
+        proxy_params: dict[str, Any] | None = None
         if isinstance(proxy_url, str) and proxy_url.strip():
-            from kahin.stealth import proxy_env  # noqa: PLC0415 - pure helper
+            from kahin.stealth import proxy_juggler_params  # noqa: PLC0415 - pure helper
 
             candidate_proxy_url = proxy_url.strip()
-            try:
-                proxy_environment = proxy_env(candidate_proxy_url)
-                validated_proxy_url = candidate_proxy_url
-            except ValueError:
-                logger.warning("proxy env merge skipped: invalid proxy URL")
+            proxy_params = proxy_juggler_params(candidate_proxy_url)
+            validated_proxy_url = candidate_proxy_url
         # Real launch policy (crawler/rotation Task 1): the same fixed
         # Camoufox options are bound on EVERY start — default and identity —
         # so fingerprint generation, user.js prefs and args never drift from
@@ -873,16 +872,21 @@ class Mirage(BrowserEngine):
         # Allow hardware GPU acceleration unless explicitly overridden by environment
         if os.environ.get("KAHIN_FORCE_SOFTWARE_GL") == "1":
             env["LIBGL_ALWAYS_SOFTWARE"] = "1"
-        # Proxy (Faz 3 Task 5): merge through the same env seam the sidecar
-        # passes to the Camoufox child (create_subprocess_exec env below).
-        # Firefox honors ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY for its
-        # network layer; the helper validates and maps a single proxy URL.
-        # Credentials stay inside the env only — never logged. The raw URL
-        # is retained as engine metadata so a later browser_start reuse can
-        # detect a requested configuration mismatch instead of silently
-        # ignoring it. A failed merge must never crash boot.
-        if proxy_environment is not None and validated_proxy_url is not None:
-            env.update(proxy_environment)
+        # Proxy (Faz 3 Task 5): the browser-level proxy is applied through
+        # the Juggler ``Browser.setBrowserProxy`` call after boot (see below),
+        # NOT through the child environment. Firefox's environment-proxy path
+        # only accepts ``http://`` proxy URLs, so a socks URL exported here is
+        # silently dropped and the browser leaks the real IP via a DIRECT
+        # connection. Strip any ambient proxy env when a proxy is configured
+        # so no second, divergent mechanism can apply. The raw URL is retained
+        # as engine metadata so a later browser_start reuse can detect a
+        # requested configuration mismatch instead of silently ignoring it.
+        if proxy_params is not None and validated_proxy_url is not None:
+            for _key in (
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+            ):
+                env.pop(_key, None)
             self._proxy_url = validated_proxy_url
         else:
             self._proxy_url = None
@@ -952,6 +956,23 @@ class Mirage(BrowserEngine):
                 raise RuntimeError(
                     "Mirage boot validation failed: Browser.health reports a dead browser"
                 )
+            # Browser-level proxy (Faz 3 Task 5): Juggler registers a global
+            # nsIProtocolProxyChannelFilter, so this routes EVERY channel
+            # (all contexts, pages, subframes, workers) through the proxy
+            # without touching prefs or env — and it is the only path that
+            # carries proxy credentials. `Browser.enable` has already
+            # completed (the sidecar performs it before answering health), and
+            # no page exists yet, so this lands before the first navigation.
+            # Fail closed: a browser that cannot be proxied must not run,
+            # otherwise it silently egresses from the host IP.
+            if proxy_params is not None:
+                try:
+                    await self.call("Browser.setBrowserProxy", proxy_params)
+                except Exception as exc:  # noqa: BLE001 - fail closed on any error
+                    raise RuntimeError(
+                        "Mirage proxy application failed; refusing to run without "
+                        f"the requested proxy ({type(exc).__name__})"
+                    ) from exc
             # The engine is live: anchor uptime (monotonic) and update the
             # per-identity pre-warm metadata. A failure here must never fail
             # boot — record helpers swallow OSError, and the lookup above

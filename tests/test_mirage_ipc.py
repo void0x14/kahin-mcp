@@ -176,6 +176,130 @@ while True:
         engine._remove_profile()
 
 
+# Records every request (method + params) to KAHIN_TEST_SIDECAR_LOG and the
+# proxy-related env it was launched with, then answers health/anything.
+RECORDING_SIDECAR = """\
+#!/usr/bin/env python3
+import json, os, sys
+log = os.environ.get("KAHIN_TEST_SIDECAR_LOG", "")
+with open(log, "a") as f:
+    f.write(json.dumps({"event": "env", "proxy_env": {
+        k: v for k, v in os.environ.items() if "PROXY" in k.upper()}}) + "\\n")
+for line in sys.stdin:
+    req = json.loads(line)
+    rid = req["id"]
+    method = req["method"]
+    params = req.get("params") or {}
+    with open(log, "a") as f:
+        f.write(json.dumps({"event": "call", "method": method, "params": params}) + "\\n")
+    if method == "Browser.health":
+        print(json.dumps({"id": rid, "result": {"alive": True, "pid": 1}}), flush=True)
+    else:
+        print(json.dumps({"id": rid, "result": {}}), flush=True)
+"""
+
+# Answers health, then errors on Browser.setBrowserProxy (older-binary case).
+FAILING_PROXY_SIDECAR = """\
+#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    rid = req["id"]
+    if req["method"] == "Browser.health":
+        print(json.dumps({"id": rid, "result": {"alive": True, "pid": 1}}), flush=True)
+    elif req["method"] == "Browser.setBrowserProxy":
+        print(json.dumps({"id": rid, "error": {"message": "Method not found"}}), flush=True)
+    else:
+        print(json.dumps({"id": rid, "result": {}}), flush=True)
+"""
+
+
+def _write_sidecar(tmp_path: Path, name: str, body: str) -> Path:
+    script = tmp_path / name
+    script.write_text(body)
+    script.chmod(0o755)
+    return script
+
+
+def _read_calls(log: Path) -> list[dict[str, object]]:
+    import json
+
+    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+async def test_start_with_proxy_applies_juggler_proxy_and_strips_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proxy is applied through Browser.setBrowserProxy (the only seam
+    Firefox honors for socks), and no ambient proxy env is passed to the
+    browser child (the env path silently direct-connects for non-http
+    schemes)."""
+    script = _write_sidecar(tmp_path, "recording_sidecar.py", RECORDING_SIDECAR)
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("KAHIN_TEST_SIDECAR_LOG", str(log))
+    monkeypatch.setenv("HTTP_PROXY", "http://ambient.invalid:9999")
+    monkeypatch.setenv("ALL_PROXY", "http://ambient.invalid:9999")
+    monkeypatch.setattr(mirage_mod, "_sidecar_bin", lambda: script)
+    monkeypatch.setattr(mirage_mod, "_camoufox_bin", lambda: script)
+
+    engine = Mirage()
+    await engine.start(proxy="socks5://user:pass@127.0.0.1:1080")
+    try:
+        assert engine._proxy_url == "socks5://user:pass@127.0.0.1:1080"
+        records = _read_calls(log)
+        proxy_calls = [r for r in records if r.get("method") == "Browser.setBrowserProxy"]
+        assert len(proxy_calls) == 1, records
+        assert proxy_calls[0]["params"] == {
+            "type": "socks",
+            "host": "127.0.0.1",
+            "port": 1080,
+            "bypass": ["localhost", "127.0.0.1", "::1"],
+            "username": "user",
+            "password": "pass",
+        }
+        env_record = next(r for r in records if r["event"] == "env")
+        assert env_record["proxy_env"] == {}, env_record
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_without_proxy_sends_no_setbrowserproxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = _write_sidecar(tmp_path, "recording_sidecar.py", RECORDING_SIDECAR)
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("KAHIN_TEST_SIDECAR_LOG", str(log))
+    monkeypatch.setattr(mirage_mod, "_sidecar_bin", lambda: script)
+    monkeypatch.setattr(mirage_mod, "_camoufox_bin", lambda: script)
+
+    engine = Mirage()
+    await engine.start()
+    try:
+        assert engine._proxy_url is None
+        methods = [r["method"] for r in _read_calls(log) if "method" in r]
+        assert "Browser.setBrowserProxy" not in methods, methods
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_fails_closed_when_proxy_cannot_be_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A requested proxy that the browser rejects must fail the start, never
+    silently run proxyless (which would leak the host IP)."""
+    script = _write_sidecar(tmp_path, "failing_proxy_sidecar.py", FAILING_PROXY_SIDECAR)
+    monkeypatch.setattr(mirage_mod, "_sidecar_bin", lambda: script)
+    monkeypatch.setattr(mirage_mod, "_camoufox_bin", lambda: script)
+
+    engine = Mirage()
+    with pytest.raises(RuntimeError, match="proxy application failed"):
+        await engine.start(proxy="http://127.0.0.1:8080")
+    await engine.stop()
+
+
 def _real_available() -> bool:
     try:
         mirage_mod._sidecar_bin()

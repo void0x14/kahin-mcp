@@ -477,8 +477,9 @@ async def browser_start(
     saved identity name (``kahin_identity_save``/``kahin_identity_new``) or
     an inline config dict. Identity applies to Mirage only, never Shadow.
     ``proxy`` routes the browser through a proxy URL (http/https/socks4/
-    socks5) via its environment; it applies to Mirage only, never Shadow,
-    and credentials are never echoed back. Reusing a healthy engine that
+    socks5) via the Juggler ``Browser.setBrowserProxy`` filter; it applies to
+    Mirage only, never Shadow, and credentials are never echoed back. Reusing
+    a healthy engine that
     runs a different identity/proxy/mode is a conflict
     (``engine_config_conflict``), never a silent ignore — stop the engine
     first to change configuration.
@@ -649,10 +650,10 @@ async def browser_start(
             )
         stripped = proxy.strip()
         if stripped:
-            from kahin.stealth import proxy_env  # noqa: PLC0415 - pure helper
+            from kahin.stealth import proxy_juggler_params  # noqa: PLC0415 - pure helper
 
             try:
-                proxy_env(stripped)
+                proxy_juggler_params(stripped)
             except ValueError as exc:
                 return _json_error(
                     "kahin_browser_start",

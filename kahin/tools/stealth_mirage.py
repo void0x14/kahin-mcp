@@ -6,7 +6,8 @@ cadence typing. Task 4: per-domain identity rotation policy
 (`kahin_identity_pin`/`unpin`/`pins`/`for_domain`) backed by the bounded
 pin store. Task 5: `kahin_fingerprint_report` (live page fingerprint a
 site would observe) and `kahin_proxy_resolve` (proxy exit-IP geo + sync
-recommendations); `browser_start(proxy=...)` applies the proxy env.
+recommendations); `browser_start(proxy=...)` applies the proxy through the
+Juggler ``Browser.setBrowserProxy`` filter (credentials supported).
 """
 
 from __future__ import annotations

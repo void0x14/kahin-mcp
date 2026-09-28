@@ -603,14 +603,20 @@ async def _page_cf_cookie_names(session_id: str) -> list[str]:
     return [str(n) for n in value] if isinstance(value, list) else []
 
 
-async def _fast_fingerprint_clear(url: str, host: str, started: float) -> dict[str, Any] | None:
+async def _fast_fingerprint_clear(
+    url: str, host: str, started: float, proxy: str | None = None
+) -> dict[str, Any] | None:
     """Düz CF için tarayıcısız hızlı yol: curl_cffi impersonate.
 
     Browser ASLA açılmaz — yalnızca python komutu yürütülür. Profiller
     sırayla denenir (safari18_0 → chrome131). Başarı = HTTP 200/301/302
     + interstitial yok (title/body'de 'just a moment' / captcha metni
     yok). Başarısızlıkta None döner, çağıran browser yoluna düşer —
-    yani JS/challenge/canvas gerektiği kanıtlanınca Kahin açılır."""
+    yani JS/challenge/canvas gerektiği kanıtlanınca Kahin açılır.
+
+    ``proxy`` motorun yapılandırılmış çıkışıdır ve ZORUNLU olarak
+    kullanılır: onsuz curl_cffi hedefe doğrudan, host'un gerçek IP'sinden
+    bağlanır — hedef sitelerde kullanılması yasak olan tek çıkış."""
     def elapsed_ms() -> int:
         return int((time.monotonic() - started) * 1000)
     try:
@@ -626,7 +632,7 @@ async def _fast_fingerprint_clear(url: str, host: str, started: float) -> dict[s
         try:
             session = _cf_requests.Session(impersonate=profile)
             session.headers.update({"Origin": origin, "Referer": origin + "/"})
-            resp = session.get(url, timeout=_FAST_TIMEOUT)
+            resp = session.get(url, timeout=_FAST_TIMEOUT, proxy=proxy)
             status = resp.status_code
             body = (resp.text or "")[:60000].lower()
             cookies = sorted({c.name for c in session.cookies.jar
@@ -693,8 +699,13 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
 
     # HIZLI YOL: düz CF — browser yok, healer yok, sadece python.
     # _healer_ref.safe ÖNCESİNDE: engine'siz çalışır, geçerse dön.
+    # Motorun yapılandırılmış proxy'si ZORUNLU geçirilir: browserless yol
+    # onsuz hedefe gerçek IP'den bağlanır ve bu, hedef sitelerde yasak
+    # olan tek çıkıştır.
     _fast_started = time.monotonic()
-    fast = await _fast_fingerprint_clear(url, host, _fast_started)
+    fast = await _fast_fingerprint_clear(
+        url, host, _fast_started, getattr(_mirage_engine(), "_proxy_url", None)
+    )
     if fast is not None:
         return _dump(fast)
 

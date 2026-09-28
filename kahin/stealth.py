@@ -111,10 +111,40 @@ def launch_policy(headless: bool = True) -> dict[str, Any]:
             humanize = False
     import sys as _sys
 
+    # Diagnostic lever for COOP+COEP-gated targets (Cloudflare Turnstile).
+    # A target that answers with ``COOP: same-origin`` + ``COEP: require-corp``
+    # makes Firefox compute OPENER_POLICY_SAME_ORIGIN_EMBEDDER_POLICY_REQUIRE_CORP
+    # (ProcessIsolation.cpp ShouldCrossOriginIsolate), so the challenge iframe is
+    # forced into its own ``webCOOP+COEP=`` content process regardless of the
+    # fission prefs below. Synthesized mouse input cannot cross that second hop:
+    # in the embedding content process EventStateManager::HandleCrossProcessEvent
+    # collects targets with BrowserParent::GetFrom(), which is null for a nested
+    # remote frame (nsFrameLoader::GetBrowserParent() returns null for a
+    # BrowserBridgeHost), so remoteTargets stays empty and the event is dropped
+    # before it ever reaches the checkbox. Native input is unaffected because APZ
+    # routes it from the parent process in a single hop.
+    #
+    # ``disable_coop`` is Camoufox's documented lever for exactly this symptom
+    # ("allowing elements in cross-origin iframes, such as the Turnstile
+    # checkbox, to be clicked"): it sets
+    # browser.tabs.remote.useCrossOriginOpenerPolicy=False, the only pref that
+    # makes ComputeCrossOriginOpenerPolicyMismatch bail, so the top-level page is
+    # never cross-origin isolated and the iframe stays in-process.
+    #
+    # It is a TRADE-OFF, not a free win: window.crossOriginIsolated becomes false,
+    # SharedArrayBuffer disappears and window.opener semantics change. Camoufox
+    # upstream flags it as WAF-detectable. Keep it opt-in (KAHIN_DISABLE_COOP=1)
+    # for the diagnostic proof on real COOP+COEP targets until the vector-free
+    # root fix lands: forwarding the synthesized event to the nested OOPIF in
+    # EventStateManager::HandleCrossProcessEvent via
+    # BrowserBridgeChild::SendDispatchSynthesizedMouseEvent (the PBrowserBridge
+    # IPC already exists), which needs the single build.
+    disable_coop = _os.environ.get("KAHIN_DISABLE_COOP", "").strip().lower() in {"1", "true", "yes"}
     target_os = "linux" if _sys.platform.startswith("linux") else ("macos" if _sys.platform == "darwin" else "windows")
     return {
         "headless": bool(headless),
         "humanize": humanize,
+        "disable_coop": disable_coop,
         "enable_cache": True,
         "block_webgl": False,
         "main_world_eval": False,

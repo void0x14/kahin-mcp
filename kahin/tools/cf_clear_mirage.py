@@ -43,7 +43,7 @@ from typing import Any
 import orjson
 
 from kahin._mcp import mcp
-from kahin.humanize import jittered_delay
+from kahin.humanize import bezier_trajectory, jittered_delay, step_delays
 from kahin.tools._common import (
     _RO,
     _RW,
@@ -64,19 +64,19 @@ _TOOL = "kahin_cf_clear"
 # Bounds: every wait is finite, every retry counted. Defaults cover a slow
 # managed challenge (JS proof-of-work + a Turnstile click + settle).
 # Mirrors the Türk bypasser constants (cf_bypasser/utils/constants.py):
-# DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5, RETRY_POLL_SECONDS=3.
+# DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5 (Kahin: 9.0), RETRY_POLL_SECONDS=3.
 # Fast path (düz CF): curl_cffi impersonate ile tarayıcısız fingerprint
 # geçişi dener (safari18_0 → chrome131). Başarırsa browser ASLA açılmaz;
 # yalnızca JS/challenge/canvas gerektiğinde browser yoluna düşülür.
 # managed challenge (JS proof-of-work + a Turnstile click + settle).
 # Mirrors the Türk bypasser constants (cf_bypasser/utils/constants.py):
-# DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5, RETRY_POLL_SECONDS=3.
+# DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5 (Kahin: 9.0), RETRY_POLL_SECONDS=3.
 _MAX_URL_LENGTH = 4096
 _DEFAULT_TIMEOUT = 60.0
 _MAX_TIMEOUT = 180.0
 _RETRY_POLL_SECONDS = 3.0
 _RETRY_POLL_JITTER_SECONDS = 1.0
-_INITIAL_SETTLE_SECONDS = 5.0
+_INITIAL_SETTLE_SECONDS = 9.0  # TR ref 5s; widget iframe appears before it is interactive
 _MAX_ATTEMPTS = 5
 # Hızlı yol: tarayıcısız fingerprint profilleri, sırayla deneinecek.
 _FAST_IMPERSONATE = ("safari18_0", "chrome131")
@@ -84,6 +84,16 @@ _FAST_TIMEOUT = 30.0
 # Frame-URL filter: the Turnstile challenge frame serves from this host
 # (cf_bypasser/core/bypasser.py:171 — ``"challenges.cloudflare" in f.url``).
 _CF_FRAME_MARKER = "challenges.cloudflare"
+
+# Turnstile "normal" widget geometry (300x65 CSS iframe). Inside the widget
+# the checkbox is a ~23x28 control whose centre sits at a fixed offset from
+# the widget's top-left. Measured live on crackingx.com (dark theme): iframe
+# CSS (202,280) 300x65 -> checkbox border span CSS x 211..234, y 301..324,
+# centre (+20.4, +32.4); the vertical offset is the widget half-height
+# (65/2 = 32.5), i.e. the checkbox is vertically centred. This is Turnstile
+# widget geometry -- not a page coordinate -- so it is independent of where
+# the widget is placed and of its colour theme.
+_TURNSTILE_CHECKBOX_DX = 20.4
 
 # Block-page markers. "cloudflare ray id" alone is NOT a signal — legit
 # footers carry it. Mirrors the Türk repo's _BLOCK_MARKERS contract.
@@ -132,6 +142,19 @@ _IS_BYPASSED_JS = (
     "    return {bypassed:true};"
     "})()"
 )
+
+
+def _engine_failed(resp: Any) -> bool:
+    """True when an engine response carries an error (dict-aware).
+
+    ``_is_error_response`` parses a JSON *string*; the Mirage path already
+    hands back parsed dicts, so feeding it a dict misjudges a perfectly valid
+    payload (a real screenshot was being discarded as an error this way).
+    Check the parsed form directly when the response is not a string.
+    """
+    if isinstance(resp, str):
+        return _is_error_response(resp)
+    return isinstance(resp, dict) and bool(resp.get("error"))
 
 
 def _dump(value: Any) -> str:
@@ -228,10 +251,29 @@ async def _frame_origin(session_id: str, frame_id: str, frame_tree: dict[str, An
         if not isinstance(old_name, str):
             return None
         try:
+            # The Turnstile iframe lives inside a CLOSED shadow root on the
+            # challenge page, so a flat document.querySelectorAll('iframe')
+            # never sees it and the precise DOM click was silently skipped
+            # (only the heuristic screenshot/Tab fallbacks ran). Walk open and
+            # closed shadow roots with the same accessor ladder the checkbox
+            # finder uses, then match the frame by the name marker.
             local = await _eval_value(
-                "(() => { for (const el of document.querySelectorAll('iframe')) {"
-                f" try {{ if (el.contentWindow && el.contentWindow.name === {marker_json}) {{"
-                " const r = el.getBoundingClientRect(); return {x:r.x, y:r.y}; } } catch (_) {}"
+                "(() => { const frames = [];"
+                " const walk = (root) => {"
+                "  for (const el of (root.querySelectorAll ? root.querySelectorAll('*') : [])) {"
+                "   if (el.tagName === 'IFRAME') frames.push(el);"
+                "   const sr = el.shadowRootUnl || el.openOrClosedShadowRoot"
+                "     || el.fakeShadowRoot || el.shadowRoot;"
+                "   if (sr) walk(sr);"
+                "  } };"
+                " walk(document);"
+                " for (const el of frames) {"
+                f"  try {{ if (el.contentWindow && el.contentWindow.name === {marker_json}) {{"
+                "   const r = el.getBoundingClientRect(); return {x:r.x, y:r.y}; } } catch (_) {}"
+                " }"
+                " for (const el of frames) {"
+                "  if (String(el.src || '').indexOf('challenges.cloudflare') >= 0) {"
+                "   const r = el.getBoundingClientRect(); return {x:r.x, y:r.y}; }"
                 " } return null; })()",
                 session_id, frame_id=parent_id,
             )
@@ -280,70 +322,68 @@ async def _checkbox_in_frame(session_id: str, frame_id: str) -> dict[str, float]
     return {"x": x, "y": y}
 
 
-async def _screenshot_widget_point(session_id: str) -> dict[str, float] | None:
-    """Visual fallback: locate the widget on screen, no hardcoded coords.
+_WIDGET_IFRAME_JS = """() => {
+    const frames = [];
+    const walk = (root) => {
+        for (const el of (root.querySelectorAll ? root.querySelectorAll('*') : [])) {
+            if (el.tagName === 'IFRAME') frames.push(el);
+            const sr = el.shadowRootUnl || el.openOrClosedShadowRoot
+                || el.fakeShadowRoot || el.shadowRoot;
+            if (sr) walk(sr);
+        }
+    };
+    walk(document);
+    for (const el of frames) {
+        if (String(el.src || '').indexOf('challenges.cloudflare') >= 0) {
+            const r = el.getBoundingClientRect();
+            return {x: r.x, y: r.y, w: r.width, h: r.height};
+        }
+    }
+    return null;
+}"""
 
-    Live truth (2026-09-16): the Turnstile iframe can render while
-    staying invisible to every DOM API (querySelector, shadow walk,
-    snapshot). Strategy: screenshot -> find the widget band by its
-    stable visual signature (dark rounded rect on light challenge
-    page, ~300x65 at the content column) -> map screenshot pixels
-    to page coords via the viewport scale. Probe-gated so a dead
-    page never gets clicks.
+
+async def _widget_iframe_rect(session_id: str) -> dict[str, float] | None:
+    """The challenges.cloudflare iframe rect, in page CSS coordinates.
+
+    The widget iframe sits inside a CLOSED shadow root, so a flat
+    ``document.querySelectorAll('iframe')`` never sees it. Walk open and
+    closed shadow roots with the same accessor ladder the in-frame checkbox
+    finder uses, then read the rect from the live DOM.
     """
-    probe = await _challenge_probe(session_id)
-    if not (isinstance(probe, dict) and probe.get("detected")):
-        return None
-    engine = _mirage_engine()
-    try:
-        shot = await engine.call("Page.captureScreenshot",
-                                 {"format": "png"}, session_id=session_id)
-    except Exception:  # noqa: BLE001
-        return None
-    data = (shot.get("data") if isinstance(shot, dict) else None) if not _is_error_response(shot) else None
-    if not isinstance(data, str) or not data:
-        return None
-    import base64 as _b64
-    import io as _io
-    try:
-        from PIL import Image as _Image
-    except ImportError:
+    value = await _eval_value(f"({_WIDGET_IFRAME_JS})()", session_id)
+    if not isinstance(value, dict):
         return None
     try:
-        img = _Image.open(_io.BytesIO(_b64.b64decode(data))).convert("RGB")
-    except Exception:  # noqa: BLE001
-        return None
-    sw, sh = img.size
-    vp = await _eval_value(
-        "({w: window.innerWidth, h: window.innerHeight})", session_id)
-    if not isinstance(vp, dict):
-        return None
-    try:
-        vw, vh = float(vp.get("w") or 0), float(vp.get("h") or 0)
+        x = float(value.get("x") or 0)
+        y = float(value.get("y") or 0)
+        w = float(value.get("w") or 0)
+        h = float(value.get("h") or 0)
     except (TypeError, ValueError):
         return None
-    if vw <= 0 or vh <= 0:
+    if w <= 0 or h <= 0:
         return None
-    sx, sy = sw / vw, sh / vh
-    px = img.load()
-    best: dict[str, float] | None = None
-    best_score = 0
-    step = max(4, sw // 480)
-    y0, y1 = int(sh * 0.25), int(sh * 0.6)
-    for yy in range(y0, y1, step):
-        run = 0
-        for xx in range(0, sw, step):
-            r, g, b = px[xx, yy][:3]
-            dark = (r < 90 and g < 90 and b < 90)
-            run = run + step if dark else 0
-            if run >= 200:
-                score = run
-                if score > best_score:
-                    best_score = score
-                    best = {"x": (xx - run / 2) / sx + 40.0 / sx,
-                            "y": yy / sy}
-    return best
-    return best
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+async def _widget_checkbox_point(session_id: str) -> dict[str, float] | None:
+    """Checkbox centre in page CSS coords, from the live widget rect.
+
+    Frame-level evaluate inside the challenges.cloudflare iframe fails on
+    this Camoufox build (COOP+COEP force the widget out of process -- Juggler
+    replies ``evaluate failed``), so the checkbox cannot be read from inside
+    the frame and the solver used to fall through to the keyboard path. The
+    widget iframe's own rect IS readable from the top-level document (the
+    closed-shadow-piercing walk in ``_widget_iframe_rect``), and the checkbox
+    sits at a fixed Turnstile-widget-relative offset inside that rect, so the
+    click point is derived from geometry alone -- no frame evaluate, no
+    screenshot, no pixel scale.
+    """
+    rect = await _widget_iframe_rect(session_id)
+    if rect is None:
+        return None
+    return {"x": rect["x"] + _TURNSTILE_CHECKBOX_DX,
+            "y": rect["y"] + rect["h"] / 2.0}
 
 
 async def _key_press(session_id: str, key: str, code: str, key_code: int = 0) -> bool:
@@ -381,7 +421,7 @@ async def _key_press(session_id: str, key: str, code: str, key_code: int = 0) ->
         resp = await engine.call("Page.keyPress", params, session_id=session_id)
     except Exception:  # noqa: BLE001
         return False
-    return not _is_error_response(resp)
+    return not _engine_failed(resp)
 
 
 async def _tab_space_turnstile(session_id: str) -> tuple[bool, str]:
@@ -439,23 +479,23 @@ async def _flow_click(session_id: str, x: float, y: float) -> bool:
     never clear; a continuous Bézier sweep from a far corner into
     the widget followed by an immediate press does. No dead sleeps
     between travel and press — a parked cursor reads as synthetic.
+
+    The sweep is dispatched as a real Juggler ``Page.dispatchMouseEvent``
+    mousemove per Bézier point (same generator ``mirage_mouse_trajectory``
+    uses). There is no ``Page.dispatchMouseTrajectory`` command in Juggler,
+    so the previous call was a no-op error and the solver silently degraded
+    to a single teleport press that never minted the token.
     """
-    engine = _mirage_engine()
-    try:
-        await engine.call("Page.dispatchMouseEvent",
-                          {"type": "mouseMoved", "x": 1400.0, "y": 200.0},
-                          session_id=session_id)
-    except Exception:  # noqa: BLE001 - sweep is best-effort, press is the gate
-        pass
-    try:
-        traj = await engine.call("Page.dispatchMouseTrajectory",
-                                 {"x": x, "y": y, "steps": 45,
-                                  "jitter": 4, "seed": 903},
-                                 session_id=session_id)
-    except Exception:  # noqa: BLE001 - engine without trajectory falls back
-        traj = None
-    if _is_error_response(traj):
-        return await _click_at(session_id, x, y)
+    start_x, start_y = 1400.0, 200.0
+    await _dispatch_mouse("mousemove", start_x, start_y, session_id=session_id)
+    points = bezier_trajectory(start_x, start_y, x, y, jitter=2.0, seed=903)
+    delays = step_delays(len(points), base_ms=4.0, jitter_ms=2.0, seed=903)
+    for index, (px, py) in enumerate(points):
+        moved = await _dispatch_mouse("mousemove", px, py, session_id=session_id)
+        if _engine_failed(moved):
+            break
+        if index < len(points) - 1:
+            await asyncio.sleep(delays[index] / 1000.0)
     return await _click_at(session_id, x, y)
 
 
@@ -464,10 +504,10 @@ async def _click_at(session_id: str, x: float, y: float) -> bool:
     """Native press/release at page coords. True when both dispatched."""
     """Native press/release at page coords. True when both dispatched."""
     down = await _dispatch_mouse("mousedown", x, y, buttons=1, session_id=session_id)
-    if _is_error_response(down):
+    if _engine_failed(down):
         return False
     up = await _dispatch_mouse("mouseup", x, y, session_id=session_id)
-    return not _is_error_response(up)
+    return not _engine_failed(up)
 
 
 async def _verify_checkbox(session_id: str, frame_id: str) -> bool:
@@ -480,21 +520,27 @@ async def _verify_checkbox(session_id: str, frame_id: str) -> bool:
 
 
 async def _click_turnstile(session_id: str) -> tuple[bool, bool]:
-    """Turnstile path: DOM click, visual click, Tab+Space. First hit wins.
+    """Turnstile path: geometry click, then keyboard toggle. First hit wins.
 
-    Order is deliberate: precise DOM click first; screenshot-located click
-    second; keyboard toggle last (no coordinates at all). Single pass each
-    — no loops, no retries, no coordinate guessing.
+    The in-frame DOM read is impossible on this build (the CF frame rejects
+    ``evaluate``), so the checkbox point is derived from the live widget rect
+    and that geometry click is attempted first. Tab+Space is the last resort
+    for when the widget is on screen but the mouse dispatch itself fails.
+    Single pass — no loops, no coordinate guessing.
     """
     found = await _find_checkbox(session_id)
     if found is not None:
         frame_id, point = found
         if await _flow_click(session_id, point["x"], point["y"]):
             return True, await _verify_checkbox(session_id, frame_id)
-    visual = await _screenshot_widget_point(session_id)
-    if visual is not None:
-        if await _flow_click(session_id, visual["x"], visual["y"]):
-            return True, await _is_bypassed(session_id)
+    point = await _widget_checkbox_point(session_id)
+    if point is None:
+        # The widget is not on screen yet. Report "not attempted" so the
+        # caller's retry loop keeps polling instead of burning the keyboard
+        # fallback on a page that has no widget to toggle.
+        return False, False
+    if await _flow_click(session_id, point["x"], point["y"]):
+        return True, await _is_bypassed(session_id)
     tabbed, _focused = await _tab_space_turnstile(session_id)
     if tabbed:
         return True, await _is_bypassed(session_id)
@@ -772,12 +818,13 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
 
         # TR contract (cf_bypasser/core/bypasser.py:230-243): whether or
         # not a widget is on screen, poll up to _MAX_ATTEMPTS passes of
-        # ``is_bypassed -> maybe one click -> sleep``. Non-interactive
-        # managed challenges self-resolve during the wait; interactive
-        # ones need at most a single click. Never give up early just
-        # because no checkbox is visible yet.
+        # ``is_bypassed -> click -> sleep``. Non-interactive managed
+        # challenges self-resolve during the wait; interactive ones need a
+        # click. The click is re-attempted on every pass: the widget iframe
+        # appears before it is interactive, so a single click fired on the
+        # first pass can land on a widget that is not listening yet and be
+        # lost -- the loop must keep clicking until the challenge clears.
         clicks = 0
-        clicked_once = False
         deadline = started + budget
         # TR retry loop (cf_bypasser:232-239): up to _MAX_ATTEMPTS passes of
         # verify -> click -> jittered retry-poll sleep. ``clicks`` counts
@@ -809,12 +856,12 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
             if time.monotonic() >= deadline:
                 break
             # TR (bypasser.py:237-238): non-interactive challenges
-            # auto-resolve; interactive ones need exactly one click.
-            if not clicked_once:
-                dispatched, _verified = await _click_turnstile(session_id)
-                if dispatched:
-                    clicks += 1
-                    clicked_once = True
+            # auto-resolve; interactive ones need a click. Re-attempt the
+            # click every pass -- an early click on a not-yet-interactive
+            # widget must not consume the only attempt.
+            dispatched, _verified = await _click_turnstile(session_id)
+            if dispatched:
+                clicks += 1
             await asyncio.sleep(
                 jittered_delay(_RETRY_POLL_SECONDS * 1000.0,
                                _RETRY_POLL_JITTER_SECONDS * 1000.0) / 1000.0,

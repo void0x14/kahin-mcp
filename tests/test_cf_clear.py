@@ -22,7 +22,7 @@ from kahin.tools import cf_clear_mirage as cf
 _TEST_URL = "https://cf-challenge.test/"
 
 
-async def _no_fast(_url: str, _host: str, _started: float) -> None:
+async def _no_fast(_url: str, _host: str, _started: float, _proxy: str | None = None) -> None:
     return None
 
 
@@ -88,10 +88,12 @@ def test_checkbox_finder_js_uses_frame_filter_and_shadow_walk() -> None:
     assert "challenges.cloudflare" in cf._CF_FRAME_MARKER
 
 
-def test_retry_and_settle_constants_match_tr_reference() -> None:
-    # TR: DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5, retry poll 3s.
+def test_retry_and_settle_constants_guard() -> None:
+    # TR: DEFAULT_MAX_RETRIES=5, retry poll 3s. Settle is deliberately longer
+    # than the TR 5s: the widget iframe renders before it is interactive, so
+    # the first click needs a longer wait.
     assert cf._MAX_ATTEMPTS == 5
-    assert cf._INITIAL_SETTLE_SECONDS == pytest.approx(5.0)
+    assert cf._INITIAL_SETTLE_SECONDS == pytest.approx(9.0)
     assert cf._RETRY_POLL_SECONDS == pytest.approx(3.0)
 
 

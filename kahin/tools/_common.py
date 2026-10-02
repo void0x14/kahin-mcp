@@ -26,7 +26,7 @@ from kahin import _state as state
 from kahin._healer import get_healer
 from kahin.residual_self.fate import FateDB
 from kahin.the_twins.capabilities import requires_mirage
-from kahin.the_twins.mirage import Mirage
+from kahin.the_twins.mirage import Mirage, MirageCommandTimeout
 from kahin.the_twins.shadow import Obscura
 from kahin.the_source.architect import SchemaEngine
 
@@ -164,6 +164,20 @@ def _native_result_too_large(method: str, message: str) -> str | None:
     }, option=orjson.OPT_INDENT_2).decode()
 
 
+def _stall_payload(method: str, exc: MirageCommandTimeout) -> str:
+    """Structured answer for a stalled command: the cause, never a bare timeout."""
+    diagnosis = dict(exc.diagnosis)
+    return orjson.dumps({
+        "error": str(exc),
+        "code": "command_stalled",
+        "cause": exc.cause,
+        "method": method,
+        "diagnosis": diagnosis,
+        "hint": diagnosis.get("hint"),
+        "retryable": exc.cause == "page_busy",
+    }, option=orjson.OPT_INDENT_2).decode()
+
+
 def _needs_mirage_page(domain: str, command: str) -> bool:
     """Whether a CDP-looking operation needs a current Mirage tab."""
     if domain not in _MIRAGE_PAGE_DOMAINS:
@@ -223,6 +237,8 @@ async def _safe_cdp(domain: str, command: str, params: dict[str, Any] | None = N
                 "hint": "Narrow the query, page, event limit, or screenshot viewport.",
             }, option=orjson.OPT_INDENT_2).decode()
         return encoded.decode()
+    except MirageCommandTimeout as e:
+        return _stall_payload(f"{domain}.{command}", e)
     except RuntimeError as e:
         msg = str(e)
         lowered = msg.lower()
@@ -375,6 +391,8 @@ async def _mirage_call(
                 session_id = page.get("sessionId")
         result = await engine.call(method, params or {}, session_id=session_id)
         return orjson.dumps(result, option=orjson.OPT_INDENT_2).decode()
+    except MirageCommandTimeout as e:
+        return _stall_payload(method, e)
     except RuntimeError as e:
         bounded = _native_result_too_large(method, str(e))
         if bounded is not None:
@@ -661,6 +679,8 @@ async def _mirage_eval_result(
         }
     try:
         return await engine.call(method, params, session_id=session_id)
+    except MirageCommandTimeout as e:
+        return _stall_payload(method, e)
     except RuntimeError as e:
         bounded = _native_result_too_large(method, str(e))
         if bounded is not None:

@@ -48,6 +48,11 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 30.0
 _PAGE_NAVIGATE_RESPONSE_TIMEOUT = 5.0
+# Bounded probes used only to classify a stalled command (never to retry it).
+_STALL_PROBE_TIMEOUT = 2.0
+_STALL_CAUSES = ("pending_js_dialog", "webauthn_pending", "page_busy", "dead_pipe")
+_DIALOG_OPEN_EVENTS = frozenset({"Page.dialogOpened", "Page.javascriptDialogOpening"})
+_DIALOG_CLOSE_EVENTS = frozenset({"Page.dialogClosed", "Page.javascriptDialogClosed"})
 _IPC_WRITE_TIMEOUT = 5.0
 _RESPONSE_BODY_RETRY_TIMEOUT = 5.0
 _RESPONSE_BODY_RETRY_INTERVAL = 0.1
@@ -567,6 +572,24 @@ def _camoufox_bin() -> Path:
     )
 
 
+class MirageCommandTimeout(RuntimeError):
+    """A Juggler command got no reply; ``diagnosis`` says why.
+
+    ``diagnosis["cause"]`` is one of ``pending_js_dialog``,
+    ``webauthn_pending``, ``page_busy`` or ``dead_pipe``. Only ``dead_pipe``
+    means the transport is gone; the other three are page-side locks that a
+    longer timeout or an engine restart cannot clear.
+    """
+
+    def __init__(self, message: str, diagnosis: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnosis = diagnosis
+
+    @property
+    def cause(self) -> str:
+        return str(self.diagnosis.get("cause") or "page_busy")
+
+
 class Mirage(BrowserEngine):
     """Stealth Camoufox engine speaking Juggler methods over the Zig sidecar."""
 
@@ -647,6 +670,14 @@ class Mirage(BrowserEngine):
         self._network_events: deque[dict[str, Any]] = deque(maxlen=2_000)
         self._network_signal = asyncio.Event()
         self._network_routed_ids: set[str] = set()
+        # sessionId -> {dialogId -> dialog info}: tab-modal JS dialogs that
+        # are open right now, fed by Page.dialogOpened/dialogClosed in the
+        # reader; stall diagnosis reads it to name the dialog that holds a
+        # command.
+        self._open_dialogs: dict[str, dict[str, dict[str, Any]]] = {}
+        # (monotonic time, diagnosis) of the latest classified stall; the MCP
+        # harness re-attaches it to tool answers that flattened the error.
+        self._last_stall: tuple[float, dict[str, Any]] | None = None
 
     def _reset_capture_state(self, *, wake_waiters: bool) -> None:
         """Drop capture/chooser state that belongs to the old browser.
@@ -665,6 +696,8 @@ class Mirage(BrowserEngine):
         self._screencast_starting_session_id = None
         self._network_events.clear()
         self._network_routed_ids.clear()
+        self._open_dialogs.clear()
+        self._last_stall = None
         if wake_waiters:
             self._chooser_event.set()
             self._screencast_event.set()
@@ -1052,6 +1085,7 @@ class Mirage(BrowserEngine):
                             self._track_screencast,
                             self._track_dom_binding,
                             self._track_network_event,
+                            self._track_dialog,
                         ):
                             try:
                                 tracker(data)
@@ -1116,6 +1150,164 @@ class Mirage(BrowserEngine):
         elif method == "Runtime.executionContextsCleared":
             if sid:
                 self._frame_contexts.pop(sid, None)
+
+    def _track_dialog(self, data: dict[str, Any]) -> None:
+        """Keep sessionId -> open JS dialogs current from Juggler events."""
+        method = data.get("method")
+        params = data.get("params", {}) or {}
+        sid = data.get("sessionId")
+        if method in _DIALOG_OPEN_EVENTS:
+            dialog_id = params.get("dialogId")
+            if not isinstance(sid, str) or not sid or not isinstance(dialog_id, str):
+                return
+            message = params.get("message")
+            self._open_dialogs.setdefault(sid, {})[dialog_id] = {
+                "dialogId": dialog_id,
+                "type": params.get("type"),
+                "message": message[:200] if isinstance(message, str) else None,
+                "openedAt": time.time(),
+            }
+        elif method in _DIALOG_CLOSE_EVENTS:
+            dialog_id = params.get("dialogId")
+            dialogs = self._open_dialogs.get(sid or "")
+            if dialogs is not None and isinstance(dialog_id, str):
+                dialogs.pop(dialog_id, None)
+                if not dialogs:
+                    self._open_dialogs.pop(sid or "", None)
+        elif method == "Browser.detachedFromTarget":
+            session_id = params.get("sessionId") or sid
+            if isinstance(session_id, str):
+                self._open_dialogs.pop(session_id, None)
+
+    def open_dialogs(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        """Open JS dialogs on one session (or every session), oldest first."""
+        sessions = [session_id] if session_id is not None else list(self._open_dialogs)
+        target_by_session = {sid: tid for tid, sid in self._sessions.items()}
+        found: list[dict[str, Any]] = []
+        for sid in sessions:
+            for info in (self._open_dialogs.get(sid) or {}).values():
+                found.append({**info, "sessionId": sid, "targetId": target_by_session.get(sid)})
+        found.sort(key=lambda item: item.get("openedAt") or 0.0)
+        return found
+
+    async def diagnose_stall(
+        self,
+        method: str,
+        session_id: str | None,
+        params: dict[str, Any] | None = None,
+        *,
+        waited_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Classify why ``method`` got no reply (P0-1).
+
+        Order is evidence strength: a dead transport explains everything; an
+        open JS dialog on the session is an observed lock; a Bitwarden FIDO2
+        popout or native WebAuthn prompt is an observed pending WebAuthn
+        ceremony; otherwise the page itself is busy. Every probe is bounded
+        and none of them retries the stalled command.
+        """
+        diagnosis: dict[str, Any] = {
+            "method": method,
+            "sessionId": session_id,
+            "waitedSeconds": round(waited_s, 2) if isinstance(waited_s, (int, float)) else None,
+        }
+        process = self._process
+        transport_down = (
+            self._dead
+            or process is None
+            or process.returncode is not None
+            or self._reader is None
+            or self._reader.done()
+        )
+        if not transport_down:
+            try:
+                await asyncio.wait_for(self._raw_call("Browser.getInfo", None), timeout=_STALL_PROBE_TIMEOUT)
+            except Exception as exc:  # noqa: BLE001 - classification only
+                transport_down = True
+                diagnosis["browserProbe"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        if transport_down:
+            diagnosis.update({
+                "cause": "dead_pipe",
+                "evidence": {
+                    "deathReason": self._death_reason,
+                    "returncode": process.returncode if process is not None else None,
+                },
+                "hint": "The browser transport is gone: kahin_browser_stop, then kahin_browser_start.",
+            })
+            return diagnosis
+
+        dialogs = self.open_dialogs(session_id) if session_id else self.open_dialogs()
+        if dialogs:
+            first = dialogs[0]
+            diagnosis.update({
+                "cause": "pending_js_dialog",
+                "evidence": {"dialogs": dialogs},
+                "hint": (
+                    f"A JS {first.get('type') or 'dialog'} dialog is open on this tab; call "
+                    f"kahin_mirage_dialog_accept or kahin_mirage_dialog_dismiss with dialog_id="
+                    f"{first.get('dialogId')!r}. Retrying or restarting will not clear it."
+                ),
+            })
+            return diagnosis
+
+        try:
+            from kahin import window_inventory  # noqa: PLC0415 - optional Marionette layer
+
+            webauthn = await window_inventory.webauthn_evidence(self, timeout=_STALL_PROBE_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - classification only
+            webauthn = {"pending": None, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        if webauthn.get("pending") is True:
+            diagnosis.update({
+                "cause": "webauthn_pending",
+                "evidence": webauthn,
+                "hint": (
+                    "A WebAuthn ceremony is waiting for a passkey choice. Finish it with "
+                    "kahin_vault_login (Bitwarden FIDO2 popout) instead of re-sending page commands."
+                ),
+            })
+            return diagnosis
+
+        probe: str
+        if session_id:
+            try:
+                await asyncio.wait_for(
+                    self._raw_call(
+                        "Runtime.evaluate",
+                        {"expression": "0", "returnByValue": True},
+                        session_id=session_id,
+                    ),
+                    timeout=_STALL_PROBE_TIMEOUT,
+                )
+                probe = "responsive"
+            except Exception:  # noqa: BLE001 - classification only
+                probe = "unresponsive"
+        else:
+            probe = "not_applicable"
+        awaited = bool((params or {}).get("awaitPromise"))
+        if probe == "responsive" and awaited:
+            detail = "awaited_promise_pending"
+            hint = (
+                "The page answers but the awaited promise never settled. Do not await "
+                "long-lived page promises; observe the page instead."
+            )
+        elif probe == "responsive":
+            detail = "slow_command"
+            hint = "The page answers simple probes; this command itself is slow. Narrow it or observe first."
+        elif probe == "unresponsive":
+            detail = "main_thread_blocked"
+            hint = (
+                "The page does not answer even a trivial probe (long script or an unlisted modal). "
+                "Inspect kahin_agent_status windows before acting again."
+            )
+        else:
+            detail = "browser_command_slow"
+            hint = "A browser-level command did not answer; inspect kahin_engine_health."
+        diagnosis.update({
+            "cause": "page_busy",
+            "evidence": {"detail": detail, "pageProbe": probe, "webauthn": webauthn},
+            "hint": hint,
+        })
+        return diagnosis
 
     def resolve_context(self, frame_id: str, session_id: str | None = None) -> str | None:
         """Main-world executionContextId for a frame on a live target.
@@ -1517,6 +1709,52 @@ class Mirage(BrowserEngine):
             self.clear_screencast()
             self._screencast_starting = True
             self._screencast_starting_session_id = sid
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        response_timeout = (
+            _PAGE_NAVIGATE_RESPONSE_TIMEOUT
+            if method == "Page.navigate"
+            else _REQUEST_TIMEOUT
+        )
+        request_id: int | None = None
+        try:
+            request_id, fut = await self._send(method, params, sid)
+            result = await asyncio.wait_for(fut, timeout=response_timeout)
+            if method == "Page.startScreencast":
+                screencast_id = result.get("screencastId")
+                if isinstance(screencast_id, str) and screencast_id:
+                    self.set_screencast_id(screencast_id)
+                    self._screencast_session_id = sid
+                self._screencast_starting = False
+                self._screencast_starting_session_id = None
+            return result
+        except TimeoutError:
+            if method == "Page.startScreencast":
+                self._screencast_starting = False
+                self._screencast_starting_session_id = None
+            if request_id is not None:
+                self._pending.pop(request_id, None)
+            waited = loop.time() - started
+            # P0-1: never answer a stall with a bare timeout. The cause decides
+            # the recovery (dialog -> handle it, WebAuthn -> finish it, dead
+            # pipe -> restart); a longer timeout fixes none of them.
+            diagnosis = await self.diagnose_stall(method, sid, params, waited_s=waited)
+            cause = diagnosis.get("cause") or "page_busy"
+            self._last_stall = (time.monotonic(), diagnosis)
+            message = f"Mirage: response timeout ({response_timeout:.1f}s) for {method} [cause={cause}]"
+            raise MirageCommandTimeout(message, diagnosis) from None
+        except BaseException:
+            if method == "Page.startScreencast":
+                self._screencast_starting = False
+                self._screencast_starting_session_id = None
+            if request_id is not None:
+                self._pending.pop(request_id, None)
+            raise
+
+    async def _send(
+        self, method: str, params: dict[str, Any] | None, sid: str | None,
+    ) -> tuple[int, asyncio.Future[dict[str, Any]]]:
+        """Write one JSONL request; return its id and reply future."""
         self._msg_id += 1
         request_id = self._msg_id
         msg: dict[str, Any] = {"id": request_id, "method": method, "params": params or {}}
@@ -1524,11 +1762,6 @@ class Mirage(BrowserEngine):
             msg["sessionId"] = sid
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = fut
-        response_timeout = (
-            _PAGE_NAVIGATE_RESPONSE_TIMEOUT
-            if method == "Page.navigate"
-            else _REQUEST_TIMEOUT
-        )
         try:
             # Keep JSONL records intact when several MCP calls arrive at once;
             # pending replies remain fully concurrent behind this tiny write
@@ -1544,33 +1777,26 @@ class Mirage(BrowserEngine):
                     raise RuntimeError(
                         f"Mirage: stdin write timeout ({_IPC_WRITE_TIMEOUT:.1f}s); sidecar is not draining"
                     ) from exc
-            result = await asyncio.wait_for(fut, timeout=response_timeout)
-            if method == "Page.startScreencast":
-                screencast_id = result.get("screencastId")
-                if isinstance(screencast_id, str) and screencast_id:
-                    self.set_screencast_id(screencast_id)
-                    self._screencast_session_id = sid
-                self._screencast_starting = False
-                self._screencast_starting_session_id = None
-            return result
-        except TimeoutError:
-            if method == "Page.startScreencast":
-                self._screencast_starting = False
-                self._screencast_starting_session_id = None
-            self._pending.pop(request_id, None)
-            raise RuntimeError(f"Mirage: response timeout ({response_timeout:.1f}s) for {method}")
-        except asyncio.CancelledError:
-            if method == "Page.startScreencast":
-                self._screencast_starting = False
-                self._screencast_starting_session_id = None
+        except BaseException:
             self._pending.pop(request_id, None)
             raise
-        except Exception:
-            if method == "Page.startScreencast":
-                self._screencast_starting = False
-                self._screencast_starting_session_id = None
+        return request_id, fut
+
+    async def _raw_call(
+        self, method: str, params: dict[str, Any] | None, session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Probe path: explicit session, no dialog gate, no diagnosis.
+
+        Callers bound it with ``asyncio.wait_for``; the pending slot is freed
+        on every exit so an unanswered probe never leaks.
+        """
+        if self._dead or self._process is None or self._process.stdin is None:
+            raise RuntimeError("Mirage is dead")
+        request_id, fut = await self._send(method, params, session_id)
+        try:
+            return await fut
+        finally:
             self._pending.pop(request_id, None)
-            raise
 
     async def get_response_body(
         self, request_id: str, session_id: str | None = None,

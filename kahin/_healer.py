@@ -31,6 +31,10 @@ _TOP_SLOW_LIMIT = 10
 class ErrorCode:
     ENGINE_START_FAILED = "ENGINE_START_FAILED"
     ENGINE_TIMEOUT = "ENGINE_TIMEOUT"
+    # A command got no reply but the cause is classified (P0-1). Only the
+    # ``dead_pipe`` cause is a transport failure; a JS dialog, a pending
+    # WebAuthn ceremony or a busy page survive any restart unchanged.
+    COMMAND_STALLED = "COMMAND_STALLED"
     ENGINE_ALREADY_RUNNING = "ENGINE_ALREADY_RUNNING"
     CDP_COMMAND_FAILED = "CDP_COMMAND_FAILED"
     CONNECTION_LOST = "CONNECTION_LOST"
@@ -241,7 +245,7 @@ class Healer:
             pass
 
     async def _execute_recovery(self, action: str, tool: str, context: dict[str, Any]) -> str | None:
-        if action == RecoveryAction.NONE:
+        if action in (RecoveryAction.NONE, RecoveryAction.NOTIFY_USER):
             return None
         _tracker.record_recovery()
         self._write_log(ErrorEntry(
@@ -292,6 +296,22 @@ class Healer:
 
         return None
 
+    def _engine_is_alive(self) -> bool:
+        engine = self._engine_ref
+        if engine is None and self._state_ref is not None:
+            engine = (
+                self._state_ref.get("_current_engine")
+                if isinstance(self._state_ref, dict)
+                else getattr(self._state_ref, "_current_engine", None)
+            )
+        is_alive = getattr(engine, "is_alive", None)
+        if not callable(is_alive):
+            return False
+        try:
+            return bool(is_alive())
+        except Exception:  # noqa: BLE001 - liveness probe only
+            return False
+
     def _determine_recovery(self, error_code: str) -> str:
         return RECOVERY_MAP.get(error_code, RecoveryAction.NONE)
 
@@ -312,6 +332,8 @@ class Healer:
             entry.message = f"Timeout in {tool}"
             entry.duration_ms = duration
             entry.recovery = self._determine_recovery(entry.error_code)
+            if entry.recovery == RecoveryAction.RESTART_ENGINE and self._engine_is_alive():
+                entry.recovery = RecoveryAction.NOTIFY_USER
             entry.traceback_str = traceback.format_exc()
             self._write_log(entry)
             _tracker.record_error(entry)
@@ -334,6 +356,26 @@ class Healer:
             entry.level = "ERROR"
             entry.error_code = ErrorCode.UNKNOWN
             msg = str(e)
+            diagnosis = getattr(e, "diagnosis", None)
+            if isinstance(diagnosis, dict):
+                cause = str(diagnosis.get("cause") or "page_busy")
+                entry.error_code = ErrorCode.COMMAND_STALLED
+                entry.message = msg
+                entry.context = {**context, "cause": cause}
+                entry.duration_ms = duration
+                # Restarting is the fix for a dead pipe only. For a dialog,
+                # WebAuthn or busy page it destroys the session and the next
+                # run walks into the same wall (kahin.log 2026-10-02).
+                entry.recovery = (
+                    RecoveryAction.RESTART_ENGINE if cause == "dead_pipe" else RecoveryAction.NOTIFY_USER
+                )
+                entry.traceback_str = traceback.format_exc()
+                self._write_log(entry)
+                _tracker.record_error(entry)
+                if entry.recovery == RecoveryAction.RESTART_ENGINE:
+                    recovery_msg = await self._execute_recovery(entry.recovery, tool, context)
+                    raise RuntimeError(f"{entry.error_code}: {msg} [auto-recovery: {recovery_msg}]") from e
+                raise
             if "not found" in msg.lower() or "no session" in msg.lower():
                 entry.error_code = ErrorCode.SESSION_NOT_FOUND
             elif "timeout" in msg.lower():
@@ -347,11 +389,15 @@ class Healer:
             entry.message = msg
             entry.duration_ms = duration
             entry.recovery = self._determine_recovery(entry.error_code)
+            if entry.recovery == RecoveryAction.RESTART_ENGINE and self._engine_is_alive():
+                # An unclassified "timeout" string on a live engine is not a
+                # reason to kill the browser and every session in it.
+                entry.recovery = RecoveryAction.NOTIFY_USER
             entry.traceback_str = traceback.format_exc()
             self._write_log(entry)
             _tracker.record_error(entry)
             recovery_msg = await self._execute_recovery(entry.recovery, tool, context)
-            if entry.recovery != RecoveryAction.NONE:
+            if entry.recovery not in (RecoveryAction.NONE, RecoveryAction.NOTIFY_USER):
                 raise RuntimeError(f"{entry.error_code}: {entry.message} [auto-recovery: {recovery_msg}]")
             raise
         except Exception as e:

@@ -120,6 +120,10 @@ def main() -> None:
 
 # Register the engine-separated category tool modules (side-effect @mcp.tool).
 import kahin.tools  # noqa: E402,F401
+from kahin import harness as _harness  # noqa: E402
+
+# Every client tool call passes the operator-discipline harness (P1-2).
+_harness.install(mcp)
 
 
 if __name__ == "__main__":

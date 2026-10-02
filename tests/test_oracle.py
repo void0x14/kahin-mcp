@@ -74,10 +74,12 @@ def test_server_initialize_and_list_tools() -> None:
     # Passkey mode adds 4 Bitwarden setup tools = 159.
     # Automation mode adds 1 code-driven vault login tool = 160.
     # Deterministic residual-overlay cleaner adds 1 tool = 161.
+    # Operator-discipline harness reset (kahin_operator_reset) adds 1 = 162.
     assert "kahin_passkey_setup_open" in tool_names
+    assert "kahin_operator_reset" in tool_names
     assert "kahin_vault_login" in tool_names
     assert "kahin_mirage_clear_overlays" in tool_names
-    assert len(tools) == 161
+    assert len(tools) == 162
     assert "kahin_mirage_watch_start" in tool_names
     assert "kahin_mirage_watch_stop" in tool_names
     assert "kahin_mirage_dom_start" in tool_names

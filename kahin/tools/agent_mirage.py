@@ -25,6 +25,7 @@ import orjson
 
 from kahin import window_inventory
 from kahin._mcp import mcp
+from kahin.harness import get_harness
 from kahin.agent_snapshot import format_snapshot
 from kahin.dom_stream import DOM_STREAM_GLOBAL
 from kahin.tools._common import (
@@ -933,6 +934,7 @@ async def agent_status() -> str:
                 "stealth": None,
                 "windows": [],
                 "windowSummary": None,
+                "harness": get_harness().snapshot(),
                 "hint": "use kahin_browser_start",
             }, option=orjson.OPT_INDENT_2).decode()
 
@@ -957,6 +959,7 @@ async def agent_status() -> str:
             "stealth": None,
             "windows": [],
             "windowSummary": None,
+            "harness": get_harness().snapshot(),
         }
 
         identity_config = getattr(engine, "_identity_config", None)

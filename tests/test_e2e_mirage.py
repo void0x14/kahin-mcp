@@ -302,6 +302,40 @@ async def test_dialog_accept(mirage_tools: None) -> None:
 
 
 @pytest.mark.asyncio
+async def test_open_dialog_fails_fast_with_cause_and_is_inventoried(mirage_tools: None) -> None:
+    """P0-1/P2-2/P0-2 on real Camoufox: a JS dialog parks the page.
+
+    Measured on 152.0.4-beta.30: Runtime.evaluate gets no reply while an
+    alert is open (it used to wait the full 30 s request timeout, and the
+    healer then restarted the engine). Now the command fails within the
+    dialog grace window with ``cause=pending_js_dialog`` and the dialogId,
+    and kahin_agent_status lists the dialog on its tab without stalling.
+    """
+    from kahin.tools import agent_mirage
+
+    await _navigate(_doc("<html><body><div>page</div></body></html>"))
+    started = asyncio.get_running_loop().time()
+    blocked = _loads(await pilot_mirage.mirage_eval("alert('kahin-lock'); 1"))
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 10.0, elapsed
+    assert blocked["cause"] == "pending_js_dialog", blocked
+    dialog_id = blocked["diagnosis"]["evidence"]["dialogs"][0]["dialogId"]
+    assert dialog_id in blocked["hint"], blocked
+
+    started = asyncio.get_running_loop().time()
+    status = _loads(await agent_mirage.agent_status())
+    assert asyncio.get_running_loop().time() - started < 5.0
+    assert status["alive"] is True and status["pendingDialogs"] == 1, status
+    current = [w for w in status["windows"] if w.get("current")]
+    assert current and current[0]["dialogs"][0]["dialogId"] == dialog_id, status["windows"]
+    assert status["windowSummary"]["jsDialogs"] == 1, status["windowSummary"]
+
+    assert _loads(await dialog_mirage.mirage_dialog_dismiss(dialog_id)) == {}
+    await asyncio.sleep(0.3)
+    assert _loads(await pilot_mirage.mirage_eval("1 + 1")) == 2
+
+
+@pytest.mark.asyncio
 async def test_kill_detection_clean_tool_error(mirage_tools: None) -> None:
     """Firefox death -> clean tool errors, then explicit stop still reaps."""
     eng = state._current_engine

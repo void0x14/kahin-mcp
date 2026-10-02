@@ -48,6 +48,14 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 30.0
 _PAGE_NAVIGATE_RESPONSE_TIMEOUT = 5.0
+# A tab-modal JS dialog (alert/confirm/prompt/beforeunload) parks the page's
+# content process in a nested event loop: Juggler stops answering content
+# commands on that session (Runtime.evaluate measured: no reply until the
+# dialog closes) while Browser.*, Page.screenshot and Page.handleDialog keep
+# answering. A command on a dialog-blocked session gets this short grace to
+# answer on its own, then fails fast as ``pending_js_dialog`` instead of
+# holding the agent for the full request timeout.
+_DIALOG_BLOCK_GRACE = 1.5
 # Bounded probes used only to classify a stalled command (never to retry it).
 _STALL_PROBE_TIMEOUT = 2.0
 _STALL_CAUSES = ("pending_js_dialog", "webauthn_pending", "page_busy", "dead_pipe")
@@ -590,6 +598,10 @@ class MirageCommandTimeout(RuntimeError):
         return str(self.diagnosis.get("cause") or "page_busy")
 
 
+class _DialogBlocked(Exception):
+    """Internal: a reply is held behind an open JS dialog on its session."""
+
+
 class Mirage(BrowserEngine):
     """Stealth Camoufox engine speaking Juggler methods over the Zig sidecar."""
 
@@ -672,9 +684,10 @@ class Mirage(BrowserEngine):
         self._network_routed_ids: set[str] = set()
         # sessionId -> {dialogId -> dialog info}: tab-modal JS dialogs that
         # are open right now, fed by Page.dialogOpened/dialogClosed in the
-        # reader; stall diagnosis reads it to name the dialog that holds a
-        # command.
+        # reader. ``call`` races every reply against ``_dialog_changed`` so a
+        # dialog opening mid-flight releases the waiter immediately.
         self._open_dialogs: dict[str, dict[str, dict[str, Any]]] = {}
+        self._dialog_changed = asyncio.Event()
         # (monotonic time, diagnosis) of the latest classified stall; the MCP
         # harness re-attaches it to tool answers that flattened the error.
         self._last_stall: tuple[float, dict[str, Any]] | None = None
@@ -697,6 +710,7 @@ class Mirage(BrowserEngine):
         self._network_events.clear()
         self._network_routed_ids.clear()
         self._open_dialogs.clear()
+        self._notify_dialog_change()
         self._last_stall = None
         if wake_waiters:
             self._chooser_event.set()
@@ -1151,6 +1165,11 @@ class Mirage(BrowserEngine):
             if sid:
                 self._frame_contexts.pop(sid, None)
 
+    def _notify_dialog_change(self) -> None:
+        """Wake every reply waiter once; later waiters get a fresh event."""
+        changed, self._dialog_changed = self._dialog_changed, asyncio.Event()
+        changed.set()
+
     def _track_dialog(self, data: dict[str, Any]) -> None:
         """Keep sessionId -> open JS dialogs current from Juggler events."""
         method = data.get("method")
@@ -1167,6 +1186,7 @@ class Mirage(BrowserEngine):
                 "message": message[:200] if isinstance(message, str) else None,
                 "openedAt": time.time(),
             }
+            self._notify_dialog_change()
         elif method in _DIALOG_CLOSE_EVENTS:
             dialog_id = params.get("dialogId")
             dialogs = self._open_dialogs.get(sid or "")
@@ -1174,10 +1194,11 @@ class Mirage(BrowserEngine):
                 dialogs.pop(dialog_id, None)
                 if not dialogs:
                     self._open_dialogs.pop(sid or "", None)
+                self._notify_dialog_change()
         elif method == "Browser.detachedFromTarget":
             session_id = params.get("sessionId") or sid
-            if isinstance(session_id, str):
-                self._open_dialogs.pop(session_id, None)
+            if isinstance(session_id, str) and self._open_dialogs.pop(session_id, None):
+                self._notify_dialog_change()
 
     def open_dialogs(self, session_id: str | None = None) -> list[dict[str, Any]]:
         """Open JS dialogs on one session (or every session), oldest first."""
@@ -1189,6 +1210,46 @@ class Mirage(BrowserEngine):
                 found.append({**info, "sessionId": sid, "targetId": target_by_session.get(sid)})
         found.sort(key=lambda item: item.get("openedAt") or 0.0)
         return found
+
+    async def _await_reply(
+        self,
+        fut: asyncio.Future[dict[str, Any]],
+        method: str,
+        sid: str | None,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Await one reply without letting a JS dialog hold the channel.
+
+        Returns the reply, raises ``TimeoutError`` after ``timeout`` or
+        ``_DialogBlocked`` once a dialog on ``sid`` has kept the command
+        unanswered past ``_DIALOG_BLOCK_GRACE`` (P2-2: non-blocking dialog
+        handling). Browser.* calls carry no session and are never gated.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            if sid and self._open_dialogs.get(sid):
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(fut), timeout=min(_DIALOG_BLOCK_GRACE, remaining),
+                    )
+                except TimeoutError:
+                    if self._open_dialogs.get(sid):
+                        raise _DialogBlocked from None
+                    continue  # the dialog closed during the grace window
+            changed = self._dialog_changed
+            waiter = asyncio.ensure_future(changed.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {fut, waiter}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                waiter.cancel()
+            if fut in done:
+                return fut.result()
 
     async def diagnose_stall(
         self,
@@ -1719,7 +1780,7 @@ class Mirage(BrowserEngine):
         request_id: int | None = None
         try:
             request_id, fut = await self._send(method, params, sid)
-            result = await asyncio.wait_for(fut, timeout=response_timeout)
+            result = await self._await_reply(fut, method, sid, response_timeout)
             if method == "Page.startScreencast":
                 screencast_id = result.get("screencastId")
                 if isinstance(screencast_id, str) and screencast_id:
@@ -1728,7 +1789,7 @@ class Mirage(BrowserEngine):
                 self._screencast_starting = False
                 self._screencast_starting_session_id = None
             return result
-        except TimeoutError:
+        except (TimeoutError, _DialogBlocked) as exc:
             if method == "Page.startScreencast":
                 self._screencast_starting = False
                 self._screencast_starting_session_id = None
@@ -1741,7 +1802,13 @@ class Mirage(BrowserEngine):
             diagnosis = await self.diagnose_stall(method, sid, params, waited_s=waited)
             cause = diagnosis.get("cause") or "page_busy"
             self._last_stall = (time.monotonic(), diagnosis)
-            message = f"Mirage: response timeout ({response_timeout:.1f}s) for {method} [cause={cause}]"
+            if isinstance(exc, _DialogBlocked):
+                message = (
+                    f"Mirage: {method} blocked by an open JS dialog after {waited:.1f}s "
+                    f"[cause={cause}]"
+                )
+            else:
+                message = f"Mirage: response timeout ({response_timeout:.1f}s) for {method} [cause={cause}]"
             raise MirageCommandTimeout(message, diagnosis) from None
         except BaseException:
             if method == "Page.startScreencast":

@@ -1,4 +1,4 @@
-"""Stall classification (P0-1).
+"""Stall classification and non-blocking dialog handling (P0-1 / P2-2).
 
 A fake sidecar reproduces the locks measured on real Camoufox
 (152.0.4-beta.30): while a JS dialog is open, content commands on that
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -74,18 +75,28 @@ def fake_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_dialog_stall_names_the_dialog(fake_sidecar: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mirage_mod, "_REQUEST_TIMEOUT", 0.6)
+async def test_dialog_opened_mid_flight_fails_fast_with_dialog_id(fake_sidecar: Path) -> None:
     engine = Mirage()
     await engine.start()
     try:
+        started = time.monotonic()
         with pytest.raises(MirageCommandTimeout) as caught:
             await engine.call("Runtime.evaluate", {"expression": "OPEN_DIALOG"}, session_id="s1")
+        elapsed = time.monotonic() - started
+        # Grace window, not the 30 s request timeout.
+        assert elapsed < mirage_mod._DIALOG_BLOCK_GRACE + 2.0
         assert caught.value.cause == "pending_js_dialog"
         dialogs = caught.value.diagnosis["evidence"]["dialogs"]
         assert dialogs[0]["dialogId"] == "dlg-1" and dialogs[0]["type"] == "alert"
         assert "dlg-1" in caught.value.diagnosis["hint"]
         assert "cause=pending_js_dialog" in str(caught.value)
+
+        # The session stays gated (fast) while the dialog is open ...
+        with pytest.raises(MirageCommandTimeout) as again:
+            await engine.call("Runtime.evaluate", {"expression": "1"}, session_id="s1")
+        assert again.value.cause == "pending_js_dialog"
+        # ... Browser.* and other sessions are not.
+        assert (await engine.call("Browser.getInfo"))["version"] == "fake"
         assert engine.open_dialogs("s2") == []
 
         await engine.call("Page.handleDialog", {"dialogId": "dlg-1", "accept": True}, session_id="s1")

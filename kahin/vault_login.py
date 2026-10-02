@@ -31,6 +31,8 @@ import time
 from typing import Any
 from urllib.parse import urlsplit
 
+from kahin import window_inventory
+
 
 _CSS = "css selector"
 _WAIT_SECONDS = 8.0
@@ -104,7 +106,7 @@ _FILL_SCRIPT = (
 )
 
 _FIDO2_ROW_SELECTOR = "app-fido2-cipher-row button"
-_FIDO2_ROUTE_MARKER = "/fido2"
+_FIDO2_ROUTE_MARKER = window_inventory.FIDO2_ROUTE_MARKER
 
 # --- per-origin passkey detection (read-only) -----------------------------
 # The tab-bound autofill list has no read-only detail control: a row's content
@@ -224,32 +226,21 @@ def _invoke(client: Any, script: str, args: tuple[Any, ...] = ()) -> dict[str, A
 
 
 def _window_urls(client: Any) -> list[tuple[str, str]] | None:
-    """Return ``(handle, url)`` for every window, or None when handles are unreadable."""
-    try:
-        original = client.current_window_handle
-        handles = list(client.window_handles)
-    except Exception:
-        return None
+    """Return ``(handle, url)`` for every window, or None when handles are unreadable.
 
-    urls: list[tuple[str, str]] = []
-    try:
-        for handle in handles:
-            try:
-                client.switch_to_window(handle)
-                urls.append((handle, _current_url(client) or ""))
-            except Exception:
-                urls.append((handle, ""))
-    finally:
-        try:
-            client.switch_to_window(original)
-        except Exception:
-            pass
-    return urls
+    Reads through ``kahin.window_inventory.marionette_windows`` — the same
+    scanner ``kahin_agent_status`` and stall diagnosis use — so the agent's
+    window view and this FIDO2 lookup can never disagree.
+    """
+    windows = window_inventory.marionette_windows(client)
+    if windows is None:
+        return None
+    return [(item["handle"], item["url"]) for item in windows]
 
 
 def _fido2_handle(urls: list[tuple[str, str]]) -> str | None:
     """Pick the Bitwarden FIDO2 popout window out of ``(handle, url)`` pairs."""
-    return next((handle for handle, url in urls if _FIDO2_ROUTE_MARKER in url), None)
+    return window_inventory.fido2_handle(urls)
 
 
 def _wait_for_element(client: Any, selector: str, timeout: float = _WAIT_SECONDS) -> Any | None:

@@ -23,6 +23,7 @@ from typing import Any
 
 import orjson
 
+from kahin import window_inventory
 from kahin._mcp import mcp
 from kahin.agent_snapshot import format_snapshot
 from kahin.dom_stream import DOM_STREAM_GLOBAL
@@ -930,6 +931,8 @@ async def agent_status() -> str:
                 "identity": None,
                 "identityHash": None,
                 "stealth": None,
+                "windows": [],
+                "windowSummary": None,
                 "hint": "use kahin_browser_start",
             }, option=orjson.OPT_INDENT_2).decode()
 
@@ -952,6 +955,8 @@ async def agent_status() -> str:
             "identity": None,
             "identityHash": None,
             "stealth": None,
+            "windows": [],
+            "windowSummary": None,
         }
 
         identity_config = getattr(engine, "_identity_config", None)
@@ -1004,7 +1009,10 @@ async def agent_status() -> str:
             # because that silently creates an about:blank tab merely because
             # an agent asked for telemetry.
             session_id = engine._sessions.get(current_target or "")
-            if isinstance(session_id, str):
+            # A JS dialog parks the page: an evaluate would only stall. The
+            # dialog itself is the page state worth reporting.
+            dialog_blocked = isinstance(session_id, str) and bool(engine.open_dialogs(session_id))
+            if isinstance(session_id, str) and not dialog_blocked:
                 try:
                     raw = _loads(await _mirage_evaluate(
                         "JSON.stringify({url: location.href, title: document.title,"
@@ -1038,23 +1046,20 @@ async def agent_status() -> str:
                     payload["domCursor"] = cursor if isinstance(cursor, int) else None
                     next_seq = stream.get("nextSeq")
                     payload["domNextSeq"] = next_seq if isinstance(next_seq, int) else None
-            # Dialog state is already in Kahin's bounded forwarded event log.
-            # Do not call the public dialog tool from a status probe: that
-            # hidden nested MCP operation added latency and could race a page
-            # session while the agent was deciding whether to recover.
-            open_dialogs: set[str] = set()
-            for event in state._current_event_log:
-                if event.get("session_id") != session_id:
-                    continue
-                params = event.get("params") or {}
-                dialog_id = params.get("dialogId")
-                if not isinstance(dialog_id, str):
-                    continue
-                if event.get("event") == "Page.dialogOpened":
-                    open_dialogs.add(dialog_id)
-                elif event.get("event") == "Page.dialogClosed":
-                    open_dialogs.discard(dialog_id)
-            payload["pendingDialogs"] = len(open_dialogs)
+            # Dialog state comes from the engine's live dialog tracker (the
+            # same one that fails dialog-blocked commands fast). Do not call
+            # the public dialog tool from a status probe: that hidden nested
+            # MCP operation added latency and could race a page session.
+            payload["pendingDialogs"] = len(engine.open_dialogs(session_id)) if isinstance(session_id, str) else 0
+            # P0-2: every window in one list — Juggler tabs, Marionette
+            # windows (Bitwarden popup/FIDO2 popout included) and native
+            # dialogs — from the scanner kahin_vault_login itself uses.
+            try:
+                inventory = await window_inventory.collect(engine, timeout=3.0)
+                payload["windows"] = inventory["windows"]
+                payload["windowSummary"] = {**inventory["summary"], "marionette": inventory["marionette"]}
+            except Exception:  # noqa: BLE001 - status must never raise
+                payload["windowSummary"] = {"error": "inventory_unavailable"}
         else:
             payload["alive"] = bool(engine.is_alive()) if hasattr(engine, "is_alive") else True
             if payload["alive"] and isinstance(engine, Obscura):

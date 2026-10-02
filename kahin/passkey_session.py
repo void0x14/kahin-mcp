@@ -10,6 +10,7 @@ from typing import Any
 
 from marionette_driver.marionette import Marionette
 
+from kahin import window_inventory
 from kahin.bitwarden import BITWARDEN_GECKO_ID
 
 CONNECT_TIMEOUT_SECONDS = 8.0
@@ -130,6 +131,27 @@ def _close_setup_tab(client: Any, original_handle: str, setup_handle: str) -> No
         pass
 
 
+def _tab_host_handle(client: Any) -> str:
+    """Switch to a window that can host a new tab and return its handle.
+
+    A fresh Marionette session starts on the focused window. While a site's
+    passkey request is pending that is Bitwarden's FIDO2 popout — a popup
+    window without a tab strip, where ``WebDriver:NewWindow(type="tab")``
+    never answers (live-measured: "Connection timed out after 3.0s"). The new
+    tab is therefore always opened from a regular browser window.
+    """
+    current = client.current_window_handle
+    windows = window_inventory.marionette_windows(client) or []
+    by_handle = {item["handle"]: item for item in windows}
+    if by_handle.get(current, {}).get("kind") not in ("extension", "bitwarden_fido2"):
+        return current
+    for item in windows:
+        if item.get("kind") not in ("extension", "bitwarden_fido2"):
+            client.switch_to_window(item["handle"])
+            return item["handle"]
+    return current
+
+
 def _open_session(session_type: type[PasskeyUISession], engine: Any) -> PasskeyUISession:
     """Attach to an existing Mirage Marionette endpoint and open Bitwarden's popup.
 
@@ -151,7 +173,7 @@ def _open_session(session_type: type[PasskeyUISession], engine: Any) -> PasskeyU
     handles_before_open: set[str] = set()
     original_target = getattr(engine, "_current_target", None)
     try:
-        original_handle = client.current_window_handle
+        original_handle = _tab_host_handle(client)
         handles_before_open = set(client.window_handles)
         opened = client.open(type="tab", focus=True)
         setup_handle = opened["handle"]

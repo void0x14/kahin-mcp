@@ -179,3 +179,38 @@ def test_rejects_invalid_engine_marionette_port(setup, port):
 
     with pytest.raises(ValueError, match="Marionette port"):
         passkey_session.PasskeyUISession.open(engine)
+
+
+class PopoutFocusedMarionette(FakeMarionette):
+    """A pending passkey request leaves Bitwarden's FIDO2 popout focused."""
+
+    urls = {
+        "fido2-popout": "moz-extension://x/popup/index.html?uilocation=popout#/fido2?sessionId=s",
+        "site-tab": "https://example.com/login",
+    }
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.handles = ["fido2-popout", "site-tab"]
+        self.current = "fido2-popout"
+
+    def get_url(self):
+        return self.urls.get(self.current, "about:blank")
+
+    def open(self, *, type, focus):
+        # WebDriver:NewWindow(type="tab") never answers from a popup window.
+        if self.current == "fido2-popout":
+            raise TimeoutError("Connection timed out after 3.0s")
+        return super().open(type=type, focus=focus)
+
+
+def test_setup_tab_is_opened_from_a_regular_window_when_fido2_popout_is_focused(monkeypatch, setup):
+    engine, _profile = setup
+    monkeypatch.setattr(passkey_session, "Marionette", PopoutFocusedMarionette)
+
+    session = passkey_session.PasskeyUISession.open(engine)
+
+    client = PopoutFocusedMarionette.instances[-1]
+    assert client.open_calls == [("tab", True)]
+    assert session.original_handle == "site-tab"
+    assert "fido2-popout" in client.handles  # the pending popout is left untouched

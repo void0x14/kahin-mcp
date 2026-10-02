@@ -72,6 +72,26 @@ ve `scripts/bitwarden_kasa_ac.py` (`never` devredeyken bir kez aç). Kullanıcı
 yalnızca giriş/açma anında tek bir elle işlem istenir, gerisi kod. Ayrıntı ve
 canlı kanıt: [durum modları §4](state-modes.md).
 
+## Bekleyen passkey isteği ve kurulum sekmesi
+
+Site bir passkey istediğinde Bitwarden ayrı bir **popup** pencere açar
+(`#/fido2`). Yeni Marionette oturumu odaklı pencereden başlar; bu popup'ta
+sekme şeridi yoktur ve `WebDriver:NewWindow(type="tab")` hiç cevap vermez
+(canlı ölçüm: "Connection timed out after 3.0s"). Eskiden bu yüzden
+`kahin_vault_login` tam passkey anında "Bitwarden vault UI açılamadı"
+dönüyordu. Kurulum sekmesi artık her zaman normal bir tarayıcı penceresinden
+açılır (`passkey_session._tab_host_handle`); bekleyen popout'a dokunulmaz.
+
+Passkey seçilmeden önce site sekmesinde Bitwarden'ın FIDO2 sayfa betiği canlı
+test edilir (`navigator.credentials.get` Bitwarden'ın kendi fonksiyonuyla
+değiştirilmiş mi). Değilse `fido2 not injected on <origin>` döner: o sayfada
+passkey isteği Bitwarden'a değil Firefox'un kendi istemine gider.
+
+Marionette istemcisi thread-safe değildir ve tarayıcı başına tek WebDriver
+oturumu vardır. Kahin'deki her Marionette kullanımı tek kilitten geçer
+(`window_inventory.MARIONETTE_LOCK`); durum sorguları kilidi kısa süre dener ve
+meşgulse beklemek yerine `busy` + sahibini raporlar.
+
 ## Değerlendirilen yollar
 
 - Camoufox'un çıkarılmış `addons` dizini: Genel eklenti yükleme arayüzü var,

@@ -75,7 +75,7 @@ kahin_pattern_query(context="doggystyle")
 kahin_pattern_suggest(partial="navig")
 ```
 
-## Tool Listesi (160 adet)
+## Tool Listesi (162 adet)
 
 Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 [docs/juggler-ai-native.md](docs/juggler-ai-native.md)
@@ -136,12 +136,49 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_pattern_forget` | Pattern sil |
 | `kahin_pattern_stats` | Pattern istatistikleri |
 
-### HEALER — Hata İstatistikleri (1)
+### HEALER — Hata İstatistikleri + Operatör Disiplini (2)
 | Tool | Ne işe yarar? |
 |------|---------------|
 | `kahin_healer_stats` | Hata takibi ve kendini onarma (self-healing) istatistiklerini göster |
+| `kahin_operator_reset` | Operatör disiplini kilidini (aşağıda) neden yazarak kaldırır (`reason` 10-500 karakter); temizlenen durumu döndürür |
 
-### MIRAGE — Juggler Native (111) — Camoufox varsayılandır; Shadow'dan gerektiğinde otomatik yükseltilir
+### Takılan Komut Teşhisi ve Operatör Disiplini — sabit kurallar
+
+**Timeout sabit değil, sebebi döner.** Cevap gelmeyen her Juggler komutu
+`MirageCommandTimeout` ile `cause` taşır; araç yanıtında `code:
+"command_stalled"`, `cause`, `diagnosis.evidence`, `hint`:
+
+| `cause` | Kanıt | Doğru hareket |
+|---------|-------|---------------|
+| `pending_js_dialog` | Sekmede açık alert/confirm/prompt (Page.dialogOpened, dialogId) | `kahin_mirage_dialog_accept/dismiss(dialog_id)` |
+| `webauthn_pending` | Bitwarden `/fido2` popout'u veya Firefox WebAuthn istemi açık | `kahin_vault_login` (popout'u o yönetir) |
+| `page_busy` | `awaited_promise_pending` / `main_thread_blocked` / `slow_command` | Gözle (`kahin_agent_status`); asılı promise bekleme |
+| `dead_pipe` | Sidecar/tarayıcı taşıması yok | `kahin_browser_stop` → `kahin_browser_start` |
+
+Yalnızca `dead_pipe` motoru yeniden başlatır; diğerlerinde restart sebebi
+temizlemez (healer artık canlı motoru öldürmez). JS dialog açıkken sekmeye
+giden komut 30 sn beklemez: ~1.5 sn içinde `pending_js_dialog` + dialogId ile
+döner (non-blocking dialog handling); `Browser.*` ve diğer sekmeler etkilenmez.
+
+**Ajan kör değil.** `kahin_agent_status` artık `windows` (Juggler sekmeleri +
+Marionette pencereleri + açık JS/native dialoglar, tek liste) ve
+`windowSummary` (`fido2Popout`, `webauthnPending`, `jsDialogs`) döndürür.
+`kahin_vault_login`'in `/fido2` taraması bununla **aynı** tarayıcıyı
+(`kahin/window_inventory.py`) kullanır. Marionette yalnızca `passkey_mode`'da
+açıktır; değilse `webauthnPending: null` (bilinmiyor, "yok" değil). Marionette
+handle'ları WebDriver oturumuna özeldir; ajan bunları eylem kimliği olarak
+kullanmaz.
+
+**Operatör disiplini (MCP sınırında, her araç için):**
+- (a) aynı araç + aynı argüman 2 kez başarısız → 3. özdeş çağrı `harness_repeat_refused`
+- (b) ardışık 3 takılma/timeout → durum dökümü (`dump`: motor sağlığı + pencere envanteri + son hatalar) ve `harness_halted`; salt-okunur araçlar açık kalır, kurtarma aracı başarı ile ya da `kahin_operator_reset` ile kalkar
+- (c) sayfa-kilidiyle (`pending_js_dialog`/`webauthn_pending`/`page_busy`) takılmış yol motor yeniden başlatıldıktan sonra `harness_same_path_after_restart` ile engellenir (`dead_pipe` hariç)
+- (d) gözlemsiz art arda 4 tıklama → sonraki tıklama `harness_observation_required`; herhangi bir gözlem (snapshot/screenshot/agent_status…) açar
+
+Eşikler: `KAHIN_HARNESS_REPEAT_FAILS`, `KAHIN_HARNESS_TIMEOUT_HALT`,
+`KAHIN_HARNESS_BLIND_CLICKS`; `KAHIN_HARNESS=0` katmanı kapatır.
+
+### MIRAGE — Juggler Native (112) — Camoufox varsayılandır; Shadow'dan gerektiğinde otomatik yükseltilir
 
 #### DOM Stream (5) — gerçek MutationObserver + Juggler binding
 | Tool | Ne işe yarar? |
@@ -288,10 +325,10 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_mirage_state_save` / `kahin_mirage_state_load` | Oturumu (url + cookie + local/sessionStorage) mutlak yola kaydeder/geri yükler |
 | `kahin_identity_new` / `kahin_identity_save` / `kahin_identity_list` / `kahin_identity_delete` | Camoufox fingerprint kimliklerini oluştur/kaydet/listele/sil |
 | `kahin_identity_report` | Aktif engine'in kimlik özetini ve sayfa-içi canlı `navigator.userAgent`'ı raporlar |
-| `kahin_agent_status` | Agent döngüsü özeti: engine liveness, sayfa durumu, sekme sayısı, refsLive/domCursor, dialog/network/console sayaçları |
+| `kahin_agent_status` | Agent döngüsü özeti: engine liveness, sayfa durumu, sekme sayısı, refsLive/domCursor, dialog/network/console sayaçları, tek liste `windows` envanteri (sekmeler + Marionette pencereleri + dialoglar, `webauthnPending`) ve operatör disiplini (`harness`) durumu |
 | `kahin_challenge_status` | CAPTCHA/access-denied/rate-limit algılar; `retryAfterSeconds` ve güvenli pause/backoff kararını döndürür; bypass etmez |
 
-#### Stealth (9) — anti-detect denetimi, insansı girdi, kimlik rotasyonu ve proxy/geo
+#### Stealth (10) — anti-detect denetimi, insansı girdi, kimlik rotasyonu, proxy/geo ve kalıntı overlay temizliği
 | Tool | Ne işe yarar? |
 |------|---------------|
 | `kahin_stealth_audit` | Salt-okunur leak probe paketi (14 check); skor `{passed, total, ratio}` ile döner, hiçbir check atlanmaz |
@@ -301,8 +338,9 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_identity_pin` / `kahin_identity_unpin` / `kahin_identity_pins` / `kahin_identity_for_domain` | Domain başına identity rotasyon politikası (bounded, doğrulanmış `~/.config/kahin/pins.json`) |
 | `kahin_fingerprint_report` | Canlı sayfa evaluate'sinden sitenin göreceği fingerprint (UA/platform/screen/WebGL; emülasyon onayından uydurulmaz) |
 | `kahin_proxy_resolve` | Proxy exit-IP geo + timezone/locale/geolocation önerisi; URL'deki kimlik bilgileri asla yankılanmaz |
+| `kahin_mirage_clear_overlays` | Bir noktayı örten kalıntı overlay'leri `elementsFromPoint` ile bulup deterministik gizler |
 
-Stealth (9) sayımı yalnızca Stealth-native araçları içerir; `kahin_mirage_key_text`
+Stealth (10) sayımı yalnızca Stealth-native araçları içerir; `kahin_mirage_key_text`
 çapraz listelenmiştir ve sayıma Input (7) altında girer (MCP yüzeyinde tek kayıt).
 
 Stealth CI kapısı: `KAHIN_REQUIRE_STEALTH=1` altında audit ratio ≥ 0.8 ve
@@ -349,9 +387,9 @@ Bitwarden kasasından **kod güdümlü** hesap girişi. Sıra sabittir ve ajan s
 
 | Tool | Ne işe yarar? |
 |------|---------------|
-| `kahin_vault_login` | Site girişini Bitwarden kasasından çözer: passkey varsa onu seçer, yoksa credentials ile autofill yapar, ikisi de yoksa kullanıcıya hesabı Bitwarden'a eklemesini söyler; kasa okunamazsa nedenini raporlar. Mirage `passkey_mode=true` gerekir; tarayıcı başlatmaz |
-| `kahin_passkey_setup_open` | Bitwarden'ı tek seferlik insan girişi için ayrı görünür sekmede açar |
-| `kahin_passkey_setup_status` | Kurulum rotasını hesap alanlarını okumadan raporlar |
+| `kahin_vault_login` | Site girişini Bitwarden kasasından çözer: passkey varsa onu seçer, yoksa credentials ile autofill yapar, ikisi de yoksa kullanıcıya hesabı Bitwarden'a eklemesini söyler; kasa okunamazsa nedenini raporlar. **Login-once**: site terminal eyleme ulaştıysa (passkey seçildi / autofill tetiklendi) sonraki çağrı `no-op: unlocked since <ts>` döner (`force=true` yalnızca site çıkış yaptıysa). Tek okunur alan `outcome` (`no_fido2_popout: …`) + `next`. Passkey seçmeden önce sitede Bitwarden FIDO2 köprüsü canlı test edilir; yoksa `fido2 not injected on <origin>`. Mirage `passkey_mode=true` gerekir; tarayıcı başlatmaz |
+| `kahin_passkey_setup_open` | Bitwarden'ı tek seferlik insan girişi için ayrı görünür sekmede açar; kasa bu motorda zaten açık okunduysa `no-op: unlocked since <ts>, setup-only tool` (`force=true` ile açılır) |
+| `kahin_passkey_setup_status` | Kurulum rotasını hesap alanlarını okumadan raporlar; kurulum sekmesi yoksa açık Bitwarden pencerelerinin rotalarını (`/fido2` vb.) döndürür |
 | `kahin_passkey_setup_finish` | İnsan girişinden sonra `Never` timeout'u kökten ayarlar ve passkey'leri etkinleştirir |
 | `kahin_passkey_setup_close` | Yalnızca kurulum sekmesini kapatır; Kahin tarayıcısı çalışmaya devam eder |
 

@@ -334,6 +334,32 @@ veya
 kahin_evaluate("document.querySelector('#name').value")
 ```
 
+### 3.8 Takılan komut sözleşmesi (cause, inventory, disiplin)
+
+Bir komut cevap almazsa yanıt bir "timeout" değil, bir **sebeptir**:
+`code: "command_stalled"`, `cause` ∈ {`pending_js_dialog`,
+`webauthn_pending`, `page_busy`, `dead_pipe`}, `diagnosis.evidence` ve
+`hint`. Ölçülen gerçek (Camoufox 152.0.4-beta.30): açık bir JS dialog
+sekmenin içerik komutlarını (`Runtime.evaluate`, `Page.captureScreenshot`)
+dialog kapanana kadar cevapsız bırakır; `Browser.*`, `Page.handleDialog` ve
+diğer sekmeler çalışır. Kahin bu yüzden dialog'lu sekmeye giden komutu ~1.5 sn
+sonra `pending_js_dialog` + dialogId ile bırakır; 30 sn beklemez. Bekleyen
+WebAuthn yalnızca o promise'i `awaitPromise` ile bekleyen çağrıyı kilitler.
+
+Kurallar:
+
+1. `pending_js_dialog` → dialog'u `kahin_mirage_dialog_accept/dismiss` ile kapat.
+2. `webauthn_pending` → `kahin_vault_login` (Bitwarden `/fido2` popout'u).
+3. `page_busy` → önce gözle (`kahin_agent_status`); asılı promise'i bekleme.
+4. `dead_pipe` → yalnızca burada `kahin_browser_stop` → `kahin_browser_start`.
+
+`kahin_agent_status.windows` Juggler sekmelerini, Marionette pencerelerini
+(Bitwarden popup/FIDO2 popout dahil) ve açık dialogları tek listede verir;
+`kahin_vault_login` aynı tarayıcıyı kullanır. MCP sınırındaki operatör
+disiplini özdeş başarısız tekrarı, ardışık takılmaları, restart sonrası aynı
+kilitli yolu ve gözlemsiz tıklama serisini `harness_*` koduyla reddeder;
+sözleşme ve eşikler: `AGENTS.md` "Takılan Komut Teşhisi ve Operatör Disiplini".
+
 ## 4. Frame ve sekme kullanımı
 
 1. `kahin_mirage_tab_list` ile target'ları gör.

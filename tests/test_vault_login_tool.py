@@ -70,6 +70,9 @@ def isolated(monkeypatch):
     opened = []
 
     monkeypatch.setattr(vault_login_mirage, "_login_lock", asyncio.Lock())
+    monkeypatch.setattr(
+        vault_login_mirage, "_ledger", {"engine": None, "unlockedSince": None, "sites": {}},
+    )
     monkeypatch.setattr(vault_login_mirage, "_login_session", None)
     monkeypatch.setattr(vault_login_mirage, "_login_engine", None)
     monkeypatch.setattr(vault_login_mirage, "_healer_ref", FakeHealer())
@@ -150,7 +153,11 @@ async def test_passkey_method_selects_passkey_and_reports_status(monkeypatch, is
 
     response = json.loads(await vault_login_mirage.vault_login("https://example.com/login"))
 
-    assert response == {"method": "passkey", "action": "select_passkey", "status": "selected"}
+    assert {k: response[k] for k in ("method", "action", "status")} == {
+        "method": "passkey", "action": "select_passkey", "status": "selected",
+    }
+    assert response["outcome"].startswith("passkey_selected: ")
+    assert response["fido2Check"]["injected"] is None  # fake engine has no tab map
     assert calls == [("select", session.client)]
     assert opened == [engine]
 
@@ -178,7 +185,11 @@ async def test_credentials_method_fills_and_reports_status(monkeypatch, isolated
 
     response = json.loads(await vault_login_mirage.vault_login("https://example.com/login"))
 
-    assert response == {"method": "credentials", "action": "fill_credentials", "status": "triggered"}
+    assert {k: response[k] for k in ("method", "action", "status")} == {
+        "method": "credentials", "action": "fill_credentials", "status": "triggered",
+    }
+    assert response["outcome"].startswith("autofill_triggered: ")
+    assert response["vaultUnlockedSince"]
     assert calls == [("fill", session.client, "https://example.com/login")]
 
 
@@ -340,3 +351,92 @@ async def test_open_failure_is_structured(monkeypatch, isolated):
 
     assert response["code"] == "vault_login_unavailable"
     assert vault_login_mirage._login_session is None
+
+
+# --- login-once contract (P1-1) and FIDO2 self-check (P2-1) -----------------
+
+
+@pytest.mark.asyncio
+async def test_second_call_after_terminal_login_is_a_no_op(monkeypatch, isolated):
+    engine, session, opened = isolated
+    fills = []
+    monkeypatch.setattr(
+        vault_login_mirage, "resolve_login", lambda client, url: {"method": "credentials", "count": 1},
+    )
+    monkeypatch.setattr(
+        vault_login_mirage, "fill_credentials", lambda client, url: fills.append(url) or {"status": "triggered"},
+    )
+
+    first = json.loads(await vault_login_mirage.vault_login("https://example.com/login"))
+    second = json.loads(await vault_login_mirage.vault_login("https://example.com/other"))
+
+    assert first["status"] == "triggered"
+    assert second["status"] == "no-op"
+    assert second["action"] == "none"
+    assert second["outcome"].startswith(f"no-op: unlocked since {first['vaultUnlockedSince']}")
+    assert "login-once" in second["outcome"]
+    assert second["previous"]["status"] == "triggered"
+    assert fills == ["https://example.com/login"]  # the resolver/autofill did not run again
+
+    forced = json.loads(await vault_login_mirage.vault_login("https://example.com/login", force=True))
+    assert forced["status"] == "triggered"
+    assert len(fills) == 2
+
+
+@pytest.mark.asyncio
+async def test_non_terminal_passkey_status_has_one_readable_outcome(monkeypatch, isolated):
+    monkeypatch.setattr(
+        vault_login_mirage, "resolve_login", lambda client, url: {"method": "passkey", "count": 1},
+    )
+    monkeypatch.setattr(vault_login_mirage, "select_passkey", lambda client: {"status": "auto"})
+
+    first = json.loads(await vault_login_mirage.vault_login("https://example.com/login"))
+    again = json.loads(await vault_login_mirage.vault_login("https://example.com/login"))
+
+    assert first["status"] == "auto"
+    assert first["outcome"].startswith("no_fido2_popout: ")
+    assert "has not requested a passkey" in first["outcome"]
+    assert "passkey sign-in" in first["next"]
+    # "auto" is not terminal: it is not recorded as a completed login.
+    assert again["status"] == "auto"
+
+
+class ProbeEngine(FakeEngine):
+    def __init__(self, injected: bool):
+        super().__init__()
+        self._current_target = "site-target"
+        self._target_infos = {"site-target": {"url": "https://example.com/login"}}
+        self.injected = injected
+        self.calls = []
+
+    async def call(self, method, params=None, session_id=None):
+        self.calls.append((method, session_id))
+        probe = {"api": True, "own": self.injected, "native": not self.injected, "secure": True}
+        return {"result": {"type": "string", "value": json.dumps(probe)}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("injected", [False, True])
+async def test_fido2_self_check_gates_passkey_selection(monkeypatch, isolated, injected):
+    _engine, _session, _opened = isolated
+    engine = ProbeEngine(injected)
+    monkeypatch.setattr(vault_login_mirage, "_passkey_engine", lambda: engine)
+    selects = []
+    monkeypatch.setattr(
+        vault_login_mirage, "resolve_login", lambda client, url: {"method": "passkey", "count": 1},
+    )
+    monkeypatch.setattr(
+        vault_login_mirage, "select_passkey", lambda client: selects.append(1) or {"status": "selected"},
+    )
+
+    response = json.loads(await vault_login_mirage.vault_login("https://example.com/login"))
+
+    assert engine.calls == [("Runtime.evaluate", "site-session")]
+    if injected:
+        assert response["status"] == "selected"
+        assert response["fido2Check"]["injected"] is True
+        assert selects == [1]
+    else:
+        assert response["code"] == "fido2_not_injected"
+        assert response["error"] == "fido2 not injected on https://example.com"
+        assert selects == []

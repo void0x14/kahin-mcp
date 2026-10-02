@@ -1,4 +1,4 @@
-"""One window inventory shared by agent_status, stall diagnosis and vault_login (P0-2)."""
+"""One window inventory shared by agent_status, stall diagnosis and vault_login (P0-2/P3)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import threading
 import pytest
 
 from kahin import vault_login, window_inventory
+from kahin.tools import passkey_mirage
 
 
 class FakeAlert:
@@ -155,3 +156,28 @@ async def test_without_marionette_webauthn_is_unknown_not_false() -> None:
     evidence = await window_inventory.webauthn_evidence(engine)
     assert evidence["pending"] is None
     assert evidence["marionette"]["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_setup_status_not_open_reports_bitwarden_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from contextlib import asynccontextmanager
+
+    class Healer:
+        @asynccontextmanager
+        async def safe(self, *_a, **_k):
+            yield
+
+    engine = FakeEngine()
+    client = FakeMarionette({"h1": "https://example.com/login", "h2": FIDO2, "h3": POPUP})
+    monkeypatch.setattr(window_inventory, "_transient_client", lambda port: client)
+    monkeypatch.setattr(passkey_mirage, "_setup_lock", asyncio.Lock())
+    monkeypatch.setattr(passkey_mirage, "_setup_session", None)
+    monkeypatch.setattr(passkey_mirage, "_setup_engine", None)
+    monkeypatch.setattr(passkey_mirage, "_active_engine", lambda: engine)
+    monkeypatch.setattr(passkey_mirage, "_healer_ref", Healer())
+
+    response = json.loads(await passkey_mirage.passkey_setup_status())
+
+    assert response["code"] == "passkey_setup_not_open"
+    assert response["routes"] == ["/fido2", "/tabs/vault"]
+    assert {w["kind"] for w in response["bitwardenWindows"]} == {"bitwarden_fido2", "extension"}

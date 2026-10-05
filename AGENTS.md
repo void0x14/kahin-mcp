@@ -75,7 +75,7 @@ kahin_pattern_query(context="doggystyle")
 kahin_pattern_suggest(partial="navig")
 ```
 
-## Tool Listesi (162 adet)
+## Tool Listesi (165 adet)
 
 Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 [docs/juggler-ai-native.md](docs/juggler-ai-native.md)
@@ -368,6 +368,22 @@ rate-limit kaçış yolu olarak kullanmaz.
 |------|---------------|
 | `kahin_visualize_data` | Bounded satırlardan deterministik line/bar/scatter/pie SVG grafiği ve özet üretir |
 
+### WAF-COOKIE — Baidu ADAS çerez üretimi (3)
+
+| Tool | Ne işe yarar? |
+|------|---------------|
+| `kahin_waf_cookie_mint` | WAF korumalı site (gitee.com) için `nox_jst_v1` çerezini tarayıcı açmadan üretir; `origin`/`probe_path`/`force` alır, sonucu `$KAHIN_HOME/nox/<origin>.cookie` dosyasına yazar |
+| `kahin_waf_cookie_status` | Aktif store'un durumu: çerez, yaş, `__noxExpire`, yenileme aralığı, script listesi, dosya yolu |
+| `kahin_waf_cookie_header` | Hazır `nox_jst_v1=…` değeri (çerez yoksa boş döner, scraper koşulsuz gönderebilir) |
+
+Tarayıcı **açmaz**: nox paketi QuickJS üzerinde `kahin/addons/nox/shim.js`
+(minimal DOM yüzeyi) ile çalışır. Ölçülen: peak RSS 10.3-11.4 MB, çerez başına
+~9 ms, tek süreçte 10/10 benzersiz (30 dk'da bir spawn yok). TTL WAF'ın
+`__noxExpire` değerinden okunur, yenileme `× 0.66` (canlı ölçüm: son geçerli
+1653 s, ilk 405 1806 s). Script URL'leri challenge HTML'inden keşfedilir
+(hardcode edilemez) ve yalnız origin altından gelen JS yüklenir. Ayrıntı:
+[docs/waf-cookie.md](docs/waf-cookie.md)
+
 ### EXTENSIONS (1)
 
 | Tool | Ne işe yarar? |
@@ -451,7 +467,11 @@ Bitwarden kasasından **kod güdümlü** hesap girişi. Sıra sabittir ve ajan s
 → kahin_pattern_query(context="doggystyle")      -> öğrenilenler
 ```
 
-## Tool Listesi (Inspector Dogrulamali)
+## Tool Listesi (Inspector Dogrulamali + canli dogrulama)
+
+WAF-COOKIE (3) ucu MCP uzerinden canli dogrulandi: `kahin_waf_cookie_mint` →
+gitee.com `nox_jst_v1` uretildi → ayni URL `200` (124-126 KB).
+
 
 32 tool MCP Inspector ile dogrulanmistir:
 ```

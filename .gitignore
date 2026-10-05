@@ -25,5 +25,11 @@ camoufox-harness/core/root
 .playwright-mcp/
 build/
 
+# nox add-on: QuickJS is a build input, not a source file, and the host binary is
+# compiled per platform at install time (see bin/setup.mjs).
+kahin/addons/nox/_build/
+kahin/addons/nox/bin/
+kahin/addons/nox/_build/quickjs/build/
+
 # Local live-debug screenshots — never part of the package
 screenshots/

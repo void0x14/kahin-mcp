@@ -30,6 +30,12 @@ kahin = "kahin.oracle:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kahin"]
+# The nox add-on ships its sources; QuickJS and the compiled host are build
+# outputs produced by bin/setup.mjs at install time and must stay out of the wheel.
+exclude = [
+  "kahin/addons/nox/_build",
+  "kahin/addons/nox/bin",
+]
 
 [tool.hatch.build.targets.wheel.force-include]
 "kahin/the_source/protocol.json.gz" = "kahin/the_source/protocol.json.gz"

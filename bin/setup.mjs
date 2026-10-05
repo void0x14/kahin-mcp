@@ -326,6 +326,11 @@ const KAHIN_VENV = join(KAHIN_HOME, "venv");
 const KAHIN_PY = process.platform === "win32" ? join(KAHIN_VENV, "Scripts", "python.exe") : join(KAHIN_VENV, "bin", "python");
 const KAHIN_WHEEL = join(dirname(fileURLToPath(import.meta.url)), "..", "lib", "kahin-0.3.10-py3-none-any.whl");
 const KAHIN_INSTALL_MARKER = join(KAHIN_HOME, ".install-state.json");
+
+// package root: `kahin/` lives next to bin/ in the checkout and inside the wheel.
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+// QuickJS upstream for the nox host build input (never tracked in the repo).
+const QUICKJS_REPO = "https://github.com/quickjs-ng/quickjs.git";
 const SETUP_COMMAND_TIMEOUT_MS = 120_000;
 
 function wheelStamp() {
@@ -355,6 +360,65 @@ function writeInstallMarker(stamp) {
   } catch (err) {
     process.stderr.write(`[kahin] install marker yazılamadı: ${err.message}\n`);
   }
+}
+
+// nox add-on host binary'sini derler: Baidu ADAS `nox_jst_v1` çerezini üreten
+// QuickJS host'u. Kaynak `kahin/addons/nox/noxhost.c` + `shim.js` repoda; QuickJS
+// upstream'i build girdisi olarak indirilir (repayı şişirmez), sonuç
+// `kahin/addons/nox/bin/` altına yazılır. Idempotent: binary varsa derlenmez.
+//
+// İsteğe bağlı: derleme araçları (cmake/cc) yoksa atlanır — nox kullanan araçlar
+// `kahin_waf_cookie_*` bunu açıkça bildirir, WAF'sız siteler etkilenmez.
+export async function buildNoxHost() {
+  if (process.env.KAHIN_SKIP_NOX) {
+    log("nox host derlemesi atlandı (KAHIN_SKIP_NOX)");
+    return { skipped: true };
+  }
+  const addon = join(PACKAGE_ROOT, "kahin", "addons", "nox");
+  const name = isWin ? "noxhost.exe" : "noxhost";
+  const target = join(addon, "bin", name);
+  if (existsSync(target)) {
+    return { present: true };
+  }
+  const source = join(addon, "noxhost.c");
+  const shim = join(addon, "shim.js");
+  if (!existsSync(source) || !existsSync(shim)) {
+    log("nox kaynakları eksik; derleme atlandı");
+    return { skipped: true };
+  }
+  const quickjs = join(addon, "_build", "quickjs");
+  if (!existsSync(join(quickjs, "CMakeLists.txt"))) {
+    const code = await run("git", ["clone", "--depth", "1", QUICKJS_REPO, quickjs]);
+    if (code !== 0 || !existsSync(join(quickjs, "CMakeLists.txt"))) {
+      log(`nox: QuickJS kaynağı alınamadı (git çıkış ${code}) — nox cookie üretimi kapalı`);
+      return { skipped: true };
+    }
+  }
+  const cmake = await run("cmake", ["-B", join(quickjs, "build"), "-DCMAKE_BUILD_TYPE=Release", quickjs]);
+  if (cmake !== 0) {
+    log("nox: cmake başarısız — nox cookie üretimi kapalı");
+    return { skipped: true };
+  }
+  const built = await run("cmake", ["--build", join(quickjs, "build"), "-j"]);
+  if (built !== 0) {
+    log("nox: QuickJS derlenemedi — nox cookie üretimi kapalı");
+    return { skipped: true };
+  }
+  mkdirSync(join(addon, "bin"), { recursive: true });
+  const cc = process.env.CC || "cc";
+  const ccArgs = [
+    "-O2", "-o", target, source,
+    "-I", join(quickjs, "build"), "-I", quickjs,
+    join(quickjs, "build", "libqjs.a"),
+    "-lm", "-lpthread", "-ldl",
+  ];
+  const code = await run(cc, ccArgs, 180_000);
+  if (code !== 0 || !existsSync(target)) {
+    log(`nox: ${cc} derlemesi başarısız (çıkış ${code}) — nox cookie üretimi kapalı`);
+    return { skipped: true };
+  }
+  log(`nox host derlendi: ${target}`);
+  return { built: target };
 }
 
 // Gömülü wheel'i venv'e kurar ve varsayılan Camoufox binary'sini hazırlar.
@@ -448,6 +512,7 @@ function run(cmd, args, timeoutMs = SETUP_COMMAND_TIMEOUT_MS) {
 
 if (process.argv[1] && process.argv[1].endsWith("setup.mjs")) {
   setup();
+  await buildNoxHost();
   const result = await installPython();
   if (result?.error) process.exitCode = 1;
 }

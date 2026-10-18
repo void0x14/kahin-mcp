@@ -1,0 +1,19 @@
+{
+  "camoufox_base": "daijro/camoufox 152.0.4-beta.31",
+  "firefox": "152.0.4",
+  "expected_build_id": "20260928220336",
+  "baseline": "Camoufox recipe source tree = firefox-152.0.4 source + copy-additions.sh + patches/ (recipe order)",
+  "regenerate": "Diff the live source tree against a freshly generated baseline; only the files in PATCHES differ. Do not regenerate from an installed package.",
+  "patches": [
+    "0001-juggler-frame-child-routing.patch",
+    "0002-oopif-trusted-click.patch",
+    "0003-per-context-timezone-override.patch",
+    "0004-build-rust-vendor-gentoo.patch"
+  ],
+  "verified": {
+    "juggler_frame_child_sha256_16": "4ae7922675ee50b4",
+    "dist_bin_camoufox_bin_sha256_16": "b23263a74fb11acd",
+    "packaged_omni_ja_sha256": "0951e37ca9e8fd24fda97c7c0379ad5ab84ed02d1a50b2800b2cdc01865ef2a5",
+    "engine_install": "$KAHIN_HOME/engines/<version>-<build>-<stamp> with a current symlink"
+  }
+}

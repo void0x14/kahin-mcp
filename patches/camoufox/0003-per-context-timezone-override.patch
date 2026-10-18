@@ -1,0 +1,64 @@
+diff --git a/js/public/Date.h b/js/public/Date.h
+--- a/js/public/Date.h
++++ b/js/public/Date.h
+@@ -55,6 +55,9 @@
+ extern JS_PUBLIC_API void ResetTimeZone();
+ 
+ extern JS_PUBLIC_API bool SetTimeZoneOverride(const char* timezoneId);
++// Camoufox: per-context timezone override
++extern JS_PUBLIC_API bool SetRealmTimeZoneOverride(JSContext* cx, const char* timezoneId);
++
+ 
+ class ClippedTime;
+ inline ClippedTime TimeClip(double time);
+diff --git a/js/src/vm/DateTime.cpp b/js/src/vm/DateTime.cpp
+--- a/js/src/vm/DateTime.cpp
++++ b/js/src/vm/DateTime.cpp
+@@ -579,10 +579,24 @@
+   js::DateTimeInfo::resetTimeZone(mode);
+ }
+ 
++void js::SetTimeZoneOverrideInternal(std::string timeZone) {
++  auto guard = js::DateTimeInfo::instance->lock();
++  guard->internalSetTimeZoneOverride(timeZone);
++}
++
+ JS_PUBLIC_API void JS::ResetTimeZone() {
+   js::ResetTimeZoneInternal(js::ResetTimeZoneMode::ResetEvenIfOffsetUnchanged);
+ }
+ 
++JS_PUBLIC_API bool JS::SetTimeZoneOverride(const char* timeZoneId) {
++  if (!mozilla::intl::TimeZone::IsValidTimeZoneId(timeZoneId)) {
++    fprintf(stderr, "Invalid timezone id: %s\n", timeZoneId);
++    return false;
++  }
++  js::SetTimeZoneOverrideInternal(std::string(timeZoneId));
++  return true;
++}
++
+ JS_PUBLIC_API bool JS::SetRealmTimeZoneOverride(JSContext* cx, const char* timeZoneId) {
+   if (!timeZoneId || !mozilla::intl::TimeZone::IsValidTimeZoneId(timeZoneId)) {
+     return false;
+diff --git a/js/src/vm/Realm.cpp b/js/src/vm/Realm.cpp
+--- a/js/src/vm/Realm.cpp
++++ b/js/src/vm/Realm.cpp
+@@ -597,10 +597,15 @@
+ }
+ 
+ js::DateTimeInfo* Realm::getDateTimeInfo() {
+-  // Playwright patch: Per-realm timezone overrides are disabled in favor of
+-  // global timezone overrides via JS::SetTimeZoneOverride().
+-  // The DateTimeInfo class was refactored to use std::string instead of
+-  // RefPtr<TimeZoneString>, and no longer supports per-realm timezones.
++  // Camoufox: restore per-context timezone support
++#if JS_HAS_INTL_API
++  RefPtr<JS::TimeZoneString> tzOverride = behaviors_.timeZoneOverride();
++  if (tzOverride) {
++    // Always create fresh to handle timezone changes correctly
++    dateTimeInfo_ = js::MakeUnique<js::DateTimeInfo>(tzOverride->chars());
++    return dateTimeInfo_.get();
++  }
++#endif
+   return nullptr;
+ }
+ 

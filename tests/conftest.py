@@ -11,6 +11,28 @@ from kahin.residual_self.fate import FateDB
 from kahin.the_source.architect import SchemaEngine
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_launch_version(monkeypatch, request):
+    """Unit tests use fake browser binaries without a version.json.
+
+    Production reads the Firefox version from the resolved engine's
+    version.json. Tests must not depend on a cache-resident Camoufox
+    install just to satisfy launch_options().
+    """
+    if request.node.module.__name__.endswith("test_engine_resolver"):
+        return
+    from kahin.the_twins import mirage
+
+    monkeypatch.setattr(mirage, "_camoufox_ff_version", lambda _binary: "152.0.4")
+
+    def _fake_launch_options(*, firefox_user_prefs=None, **_kwargs):
+        return {"env": {}, "firefox_user_prefs": dict(firefox_user_prefs or {})}
+
+    # Unit tests use fake browser binaries: no properties.json, fontconfig
+    # or cache-resident Camoufox. The real launch path stays E2E-only.
+    monkeypatch.setattr(mirage, "launch_options", _fake_launch_options)
+
+
 _REAL_E2E_NODEIDS: set[str] = set()
 _REAL_E2E_EXECUTED = 0
 _REAL_E2E_SKIPPED: list[str] = []

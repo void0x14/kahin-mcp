@@ -1,0 +1,26 @@
+diff --git a/build/moz.configure/rust.configure b/build/moz.configure/rust.configure
+--- a/build/moz.configure/rust.configure
++++ b/build/moz.configure/rust.configure
+@@ -410,11 +410,21 @@
+         if len(narrowed) == 1:
+             return narrowed[0].rust_target
+ 
+-        # Finally, see if the vendor can be used to disambiguate.
++        # See if the vendor can be used to disambiguate.
+         narrowed = [c for c in candidates if c.target.vendor == host_or_target.vendor]
+         if len(narrowed) == 1:
+             return narrowed[0].rust_target
+ 
++        # Finally, check for vendor gentoo in the target triple.
++        vendor_aliases = {"unknown": ("gentoo")}
++        narrowed = [
++            c
++            for c in candidates
++            if host_or_target.vendor in vendor_aliases.get(c.target.vendor, ())
++        ]
++        if len(narrowed) == 1:
++            return narrowed[0].rust_target
++
+         # Rust spells its canonical Linux targets with the vendor-neutral
+         # "unknown" (x86_64-unknown-linux-gnu); the distro-flavoured spellings
+         # are the exceptions -- "gentoo" just above, and "oe" (OpenEmbedded),

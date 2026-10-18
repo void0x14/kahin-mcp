@@ -469,6 +469,47 @@ def _camoufox_cache_candidates() -> list[Path]:
     return sorted(dict.fromkeys(candidates), key=lambda path: (path.parent.name, str(path)))
 
 
+def _installed_engine_candidates() -> list[Path]:
+    """Kahin-managed Camoufox engines under ``$KAHIN_HOME/engines``.
+
+    These are source-built (patched) distributions, not the volatile
+    Camoufox cache. ``current`` is the operator-selected engine; every
+    other version directory is a fallback so an upgrade cannot hide the
+    last known-good build behind a missing symlink.
+    """
+    root = _kahin_home() / "engines"
+    candidates: list[Path] = []
+    current = root / "current" / "camoufox-bin"
+    if _usable_camoufox_bin(current):
+        candidates.append(current)
+    try:
+        for path in sorted(root.glob("*/camoufox-bin")):
+            if path not in candidates and _usable_camoufox_bin(path):
+                candidates.append(path)
+    except OSError:
+        pass
+    return candidates
+
+
+def _camoufox_ff_version(binary: Path) -> str | None:
+    """Firefox version of a resolved engine from its sibling version.json.
+
+    ``launch_options`` otherwise reads the version from Camoufox's cache
+    (``installed_verstr``), which makes a cache-free install impossible.
+    Returning the version here keeps the fingerprint presets and font
+    selection correct without any cache-resident browser.
+    """
+    for candidate in (binary.parent / "version.json", binary.parent.parent / "version.json"):
+        try:
+            data = json.loads(candidate.read_text())
+        except (OSError, ValueError):
+            continue
+        version = data.get("version") if isinstance(data, dict) else None
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+    return None
+
+
 def _camoufox_cli_path() -> Path | None:
     """Ask the installed official CLI for its resolved executable path."""
     for command in _camoufox_cli_commands("path"):
@@ -552,6 +593,10 @@ def _camoufox_bin() -> Path:
             path=str(path),
             detail="KAHIN_CAMOUFOX_BIN must point to an executable Camoufox binary.",
         )
+
+    installed = _installed_engine_candidates()
+    if installed:
+        return installed[0]
 
     package_bin = _camoufox_cli_path()
     if package_bin is not None:
@@ -848,6 +893,11 @@ class Mirage(BrowserEngine):
         from kahin.stealth import launch_policy  # noqa: PLC0415 - pure helper
 
         policy = launch_policy(headless=headless)
+        # Resolve the engine once. A Kahin-managed engine (source-built with
+        # our patches) wins over Camoufox's cache, and its version metadata
+        # feeds launch_options so no cache-resident active version is needed.
+        camoufox_bin = await asyncio.to_thread(_camoufox_bin)
+        ff_version = _camoufox_ff_version(camoufox_bin)
         # launch_options takes `config` and `firefox_user_prefs` as named
         # parameters, so they must never ride inside **launch_kwargs — the
         # identity path below passes its own `config=` and would collide.
@@ -858,6 +908,10 @@ class Mirage(BrowserEngine):
             if key not in ("config", "firefox_user_prefs")
         }
         launch_kwargs["firefox_user_prefs"] = policy_prefs
+        launch_kwargs["executable_path"] = str(camoufox_bin)
+        if ff_version:
+            launch_kwargs["ff_version"] = ff_version
+            launch_kwargs["i_know_what_im_doing"] = True
         if self._addons:
             launch_kwargs["addons"] = self._addons
         if validated_proxy_url is not None:
@@ -970,10 +1024,6 @@ class Mirage(BrowserEngine):
                 lines = [f"user_pref({json.dumps(k)}, {json.dumps(v)});" for k, v in prefs.items()]
                 (profile_dir / "user.js").write_text("\n".join(lines) + "\n")
 
-            # Binary discovery may invoke the official networked fetch. Keep
-            # that bounded operation off the MCP event loop so cancellation
-            # and health requests remain responsive while readiness resolves.
-            camoufox_bin = await asyncio.to_thread(_camoufox_bin)
             args = [str(_sidecar_bin()), str(camoufox_bin)]
             if not headless:
                 args.append("--visible")  # visible window (stealth vs anti-bot)

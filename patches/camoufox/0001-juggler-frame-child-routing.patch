@@ -1,0 +1,24 @@
+diff --git a/juggler/content/JugglerFrameChild.sys.mjs b/juggler/content/JugglerFrameChild.sys.mjs
+--- a/juggler/content/JugglerFrameChild.sys.mjs
++++ b/juggler/content/JugglerFrameChild.sys.mjs
+@@ -49,10 +49,6 @@
+     if (this.document.documentURI.startsWith('moz-extension://'))
+       return;
+ 
+-    // Child frame events will be forwarded to related top-level agents.
+-    if (this.browsingContext.parent)
+-      return;
+-
+     let agents = topBrowingContextToAgents.get(this.browsingContext);
+     if (!agents) {
+       agents = initialize(this.browsingContext, this.docShell);
+@@ -65,9 +61,6 @@
+   didDestroy() {
+     helper.removeListeners(this._eventListeners);
+ 
+-    if (this.browsingContext.parent)
+-      return;
+-
+     const agents = topBrowingContextToAgents.get(this.browsingContext);
+     // The agents are already re-bound to a new actor.
+     if (agents?.actor !== this)

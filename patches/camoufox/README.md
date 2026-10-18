@@ -5,38 +5,36 @@ These are Kahin's own changes on top of the Camoufox recipe base
 They are the delta against the recipe baseline, not against vanilla Firefox:
 the baseline already contains `additions/` and the recipe `patches/` series.
 
-## Why a patch series
+## What this is
 
-An installed engine is a build artifact. It belongs in the Camoufox cache only
-as long as it is disposable. Kahin needs the opposite: a browser it can rebuild
-after every upstream bump, with the same behaviour. The durable form is this
-patch series plus a rebuild script; the cache is replaceable by definition.
-
-Engine installs live outside the cache:
+The patch files are a **record**, not an install gate. Nothing here runs
+automatically and nothing forces a build step. The engine that Kahin actually
+uses is whatever `$KAHIN_HOME/engines/current/camoufox-bin` points at:
 
 ```
 $KAHIN_HOME/engines/<version>-<build>-<stamp>/   # source-built distribution
 $KAHIN_HOME/engines/current -> <version>-...     # selected engine
 ```
 
-`kahin/the_twins/mirage.py` resolves `$KAHIN_HOME/engines/current/camoufox-bin`
-before any Camoufox cache path, and reads the sibling `version.json` so
-`launch_options` does not need a cache-resident active version.
+`kahin/the_twins/mirage.py` resolves `engines/current` before any Camoufox
+cache path, and reads the sibling `version.json` so `launch_options` does not
+need a cache-resident active version. `KAHIN_CAMOUFOX_BIN` overrides all of it.
 
-## Upgrading Camoufox
+## Updating
 
-1. Generate a fresh Camoufox source tree from the recipe (`make dir`).
-2. Apply this series and build:
+Plain `camoufox fetch` writes only to `~/.cache/camoufox`; it never touches
+`$KAHIN_HOME/engines`. To switch to a fetched version, repoint `current` (or
+set `KAHIN_CAMOUFOX_BIN`):
 
-   ```bash
-   scripts/build-camoufox-patched.sh /path/to/camoufox-<version>
-   ```
+```bash
+ln -sfn ~/.cache/camoufox/browsers/official/<version> \
+        "$KAHIN_HOME/engines/current"
+```
 
-   The script dry-runs every patch first. A rejected hunk is a rebase task,
-   never a silently skipped patch.
-
-3. Verify the installed engine starts and `navigator.buildID` matches the new
-   build. Then move `engines/current` to the new directory.
+To use the patches with a new source tree, apply them to that tree and put the
+result under `engines/` — or skip it. The stock fetched engine starts fine
+either way; the patches only add the OOPIF click, per-context timezone and
+Juggler child routing behaviour.
 
 ## Regenerating the series
 

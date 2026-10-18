@@ -39,9 +39,16 @@ Kapıların görevi, fonksiyoneliteyi %100 koruyarak, %0 regresyon ve %0 anomali
 
 ## Git
 
-- Mevcut git'ten nefret ediliyor.
-- Hedef: **Elon Musk'ın yaptığı, sıfır çakışma üreten yeni git**. Taşıma sistemi bu git üzerine kurulacak.
-- Mevcut git ile çakışma çözme, "hunk elle düzeltme" veya `rerere` benzeri tekrar çözüm mekanizmaları bu roadmap'in hedef çözümü değildir; yalnızca geçiş dönemi aracı olarak not edilir.
+-- Mevcut git'ten nefret ediliyor.
+-- Hedef: **Origin** — Elon Musk'ın SpaceX/Cursor hattından çıkan, sıfır çakışma iddialı yeni git.
+  - 17 Haziran 2026'da duyuruldu; SpaceX'in 60 milyar dolarlık Cursor satın alımının ardından.
+  - Git uyumlu, MCP-genişletilebilir.
+  - **Agent-resolved merge conflict** yerleşik: çakışmayı ajan çözüyor.
+  - GitHub ile gerçek zamanlı senkron/mirroring, stacked pull request'ler.
+  - Waitlist ücretsiz; fiyat açıklanmadı.
+-- Alternatifler (referans): Anthropic **Scion** (şirket içi, dışarıya kapalı), Zed **DeltaDB** (CRDT tabanlı, çakışmayı otomatik kaldırıyor), **Oak VCS** (ajanlar için, Apache-2.0, Rust).
+-- Taşıma sistemi Origin üzerine kurulacak; mevcut git ile çakışma çözme hedef çözüm değil.
+-- Not: Origin'in agent-resolved conflict'i A/B semantik kapılarının **yerine geçmez**; kapıların altında çalışır.
 
 ## Referans sistemler (girdi, çözüm değil)
 
@@ -64,3 +71,12 @@ Hiçbiri "sıfır efor + ultra hızlı + %100 semantik kapı" hedefini tek baş�
 - [ ] %100 / %95 eşiklerinin ölçüm yöntemi ve rapor formatı.
 - [ ] Reddedilen yükseltmenin geri alma (rollback) sözleşmesi.
 - [ ] Sıfır çakışmalı yeni git entegrasyonu.
+
+## Kaynaklar
+
+-- Origin (SpaceX/Cursor, 17 Haz 2026): https://wccftech.com/spacexs-cursor-attacks-microsofts-2-billion-github-moat-with-origin-a-repository-built-for-ai-agents
+-- Origin duyurusu/özellikler: https://www.instagram.com/reel/DapnzOwIqRc · https://www.youtube.com/shorts/8TE0W-7gnkM
+-- SpaceX/Cursor satın alımı: https://pinggy.io/blog/spacex_cursor_acquisition_developer_guide
+-- Anthropic Scion: https://thenewstack.io/anthropic-scion-git-replacement
+-- Zed DeltaDB / CRDT VCS: https://www.softwareseni.com/how-git-usage-and-dvcs-are-evolving-in-the-ai-age-with-next-generation-version-control-systems
+-- Oak VCS: https://saascity.io/blog/oak-git-alternative-for-ai-agents-2026

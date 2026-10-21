@@ -124,8 +124,8 @@ _STATE_MODE_ALIASES = {
     "kes": STATE_MODE_KES,
 }
 
-_MAX_ACTIVE_SUBAGENTS = 16
-_SUBAGENT_IDLE_TTL_SECONDS = 300.0  # 5 minutes idle eviction
+_MAX_ACTIVE_SUBAGENTS = 0  # 0 = unconstrained N-parallelism
+_DEFAULT_SUBAGENT_IDLE_TTL = 1800.0  # 30 minutes safety idle timeout for abandoned tabs
 
 
 def _canonical_state_mode(mode: str) -> str:
@@ -696,6 +696,7 @@ class Mirage(BrowserEngine):
         self._agent_targets: dict[str, str] = {}
         self._agent_contexts: dict[str, str] = {}
         self._agent_last_seen: dict[str, float] = {}
+        self._agent_in_flight: dict[str, int] = {}
         self._user_agent_overrides: dict[str, str] = {}
         # sessionId -> {frameId -> executionContextId} (main world only),
         # fed by Runtime.executionContextCreated/Destroyed/ContextsCleared
@@ -796,6 +797,7 @@ class Mirage(BrowserEngine):
         self._agent_targets.clear()
         self._agent_contexts.clear()
         self._agent_last_seen.clear()
+        self._agent_in_flight.clear()
         self._user_agent_overrides.clear()
         self._dom_binding_installed = False
         self._dom_init_script_installed = False
@@ -1872,6 +1874,21 @@ class Mirage(BrowserEngine):
             else _REQUEST_TIMEOUT
         )
         request_id: int | None = None
+        caller_name: str | None = None
+        if sid:
+            tid = next((t for t, s in self._sessions.items() if s == sid), None)
+            if tid:
+                caller_name = next((c for c, t in self._agent_targets.items() if t == tid), None)
+        if not caller_name:
+            try:
+                from kahin.subagent import get_active_subagent_context
+                caller_name = get_active_subagent_context().get("caller_id")
+            except Exception:
+                caller_name = None
+
+        if caller_name:
+            self._agent_in_flight[caller_name] = self._agent_in_flight.get(caller_name, 0) + 1
+            self._agent_last_seen[caller_name] = started
         try:
             request_id, fut = await self._send(method, params, sid)
             result = await self._await_reply(fut, method, sid, response_timeout)
@@ -1911,6 +1928,13 @@ class Mirage(BrowserEngine):
             if request_id is not None:
                 self._pending.pop(request_id, None)
             raise
+        finally:
+            if caller_name:
+                self._agent_in_flight[caller_name] = max(0, self._agent_in_flight.get(caller_name, 1) - 1)
+                try:
+                    self._agent_last_seen[caller_name] = asyncio.get_running_loop().time()
+                except RuntimeError:
+                    pass
 
     async def _send(
         self, method: str, params: dict[str, Any] | None, sid: str | None,
@@ -2130,11 +2154,14 @@ class Mirage(BrowserEngine):
             return await self.create_page("about:blank")
 
     async def _prune_zombie_contexts(self, *, force_cap: bool = False) -> None:
-        """Reap zombie tabs and isolated browser contexts from dead/idle subagents.
+        """Reap genuine zombie tabs and isolated browser contexts without false positives.
 
-        Prevents memory leaks across high-iteration subagent executions (100-10000+ runs).
-        Evicts callers whose targets detached, or who have been idle longer than TTL (300s),
-        or LRU eviction when active count exceeds _MAX_ACTIVE_SUBAGENTS (16).
+        Guarantees:
+        1. An agent with ANY operation in flight (_agent_in_flight > 0) is NEVER evicted.
+        2. Clean up callers whose targets detached or closed in Camoufox.
+        3. Clean up callers with confirmed dead PIDs (ProcessLookupError via os.kill).
+        4. Idle reaping applies ONLY when in_flight == 0 and idle time exceeds safety TTL.
+        5. Respects N-parallelism: no arbitrary ceiling killing live working subagents.
         """
         try:
             loop = asyncio.get_running_loop()
@@ -2143,31 +2170,59 @@ class Mirage(BrowserEngine):
             return
         to_evict: list[str] = []
 
-        # 1. Clean up callers whose targets no longer exist in self._sessions
+        # 1. Clean up callers whose targets detached or no longer exist in self._sessions
         for caller, tid in list(self._agent_targets.items()):
             if tid not in self._sessions:
                 to_evict.append(caller)
 
-        # 2. Clean up callers who have been idle longer than TTL (5 minutes)
+        # 2. Check callers with PID-based identities whose parent/harness process died
+        for caller in list(self._agent_targets.keys()):
+            if caller in to_evict or self._agent_in_flight.get(caller, 0) > 0:
+                continue
+            import re
+            m = re.search(r"(?:proc_|pid[_-])(\d+)", caller)
+            if m:
+                pid = int(m.group(1))
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    # Parent process confirmed dead -> 100% verified zombie
+                    to_evict.append(caller)
+                except (PermissionError, OSError):
+                    pass
+
+        # 3. Idle timeout check: ONLY applies if in_flight == 0 (never kill running operations)
+        ttl_env = os.environ.get("KAHIN_SUBAGENT_IDLE_TTL")
+        ttl_seconds = float(ttl_env) if ttl_env else _DEFAULT_SUBAGENT_IDLE_TTL
         for caller, last_seen in list(self._agent_last_seen.items()):
-            if caller not in to_evict and (now - last_seen) > _SUBAGENT_IDLE_TTL_SECONDS:
+            if caller in to_evict:
+                continue
+            if self._agent_in_flight.get(caller, 0) > 0:
+                # Active operation in flight -> protected against reap
+                continue
+            if (now - last_seen) > ttl_seconds:
                 to_evict.append(caller)
 
-        # 3. If exceeding maximum concurrent subagent slots, evict the oldest callers (LRU)
-        active_survivors = [c for c in self._agent_targets if c not in to_evict]
-        if len(active_survivors) >= _MAX_ACTIVE_SUBAGENTS or force_cap:
-            sorted_by_age = sorted(
-                active_survivors,
-                key=lambda c: self._agent_last_seen.get(c, 0.0),
-            )
-            excess = max(0, len(active_survivors) - (_MAX_ACTIVE_SUBAGENTS - 1))
-            for caller in sorted_by_age[:excess]:
-                to_evict.append(caller)
+        # 4. Optional user-configured max cap (0 = unlimited / pure N-parallel)
+        max_subagents_env = int(os.environ.get("KAHIN_MAX_SUBAGENTS", "0"))
+        if max_subagents_env > 0:
+            active_survivors = [c for c in self._agent_targets if c not in to_evict]
+            if len(active_survivors) >= max_subagents_env or force_cap:
+                # Evict only truly idle callers with ZERO operations in flight
+                idle_survivors = [
+                    c for c in active_survivors
+                    if self._agent_in_flight.get(c, 0) == 0
+                ]
+                idle_survivors.sort(key=lambda c: self._agent_last_seen.get(c, 0.0))
+                excess = max(0, len(active_survivors) - (max_subagents_env - 1))
+                for caller in idle_survivors[:excess]:
+                    to_evict.append(caller)
 
         for caller in set(to_evict):
             tid = self._agent_targets.pop(caller, None)
             ctx = self._agent_contexts.pop(caller, None)
             self._agent_last_seen.pop(caller, None)
+            self._agent_in_flight.pop(caller, None)
             if tid and tid in self._sessions:
                 try:
                     sid = self._sessions.get(tid)

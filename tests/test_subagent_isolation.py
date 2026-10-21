@@ -215,7 +215,7 @@ async def test_mirage_user_agent_runtime_reflection() -> None:
 
 @pytest.mark.asyncio
 async def test_mirage_zombie_context_auto_reap() -> None:
-    """Subagents that disconnect without closing tabs have their zombie contexts reaped automatically."""
+    """True zombies (detached targets or dead processes) are reaped, while in-flight agents are protected."""
     mirage = Mirage()
     mirage._dead = False
     mirage._sessions = {"initial-target": "sess-init"}
@@ -247,13 +247,27 @@ async def test_mirage_zombie_context_auto_reap() -> None:
 
     mirage.call = mock_call  # type: ignore[assignment]
 
-    # Spawn 18 callers (exceeding _MAX_ACTIVE_SUBAGENTS = 16)
-    for i in range(18):
+    # 1. Unconstrained N-parallelism: spawn 20 callers, NONE are evicted because all are alive
+    for i in range(20):
         await mirage.ensure_page(caller_id=f"agent-{i}")
+    assert len(mirage._agent_targets) == 20
+    assert len(removed_contexts) == 0
 
-    # Active callers must be capped at 16 (oldest LRU callers evicted)
-    assert len(mirage._agent_targets) <= 16
-    assert len(removed_contexts) >= 2
-    assert "agent-0" not in mirage._agent_targets  # Oldest evicted
-    assert "agent-1" not in mirage._agent_targets  # Next oldest evicted
-    assert "agent-17" in mirage._agent_targets     # Newest retained
+    # 2. Detached tab detection: agent-5's target crashes / detaches from self._sessions
+    target_5 = mirage._agent_targets["agent-5"]
+    mirage._sessions.pop(target_5, None)
+
+    # 3. In-flight protection: mark agent-10 as currently executing a long-running call
+    mirage._agent_in_flight["agent-10"] = 1
+    # artificially set its last_seen to 2 hours ago
+    mirage._agent_last_seen["agent-10"] = 0.0
+
+    # Prune
+    await mirage._prune_zombie_contexts()
+
+    # Verified: detached agent-5 is reaped
+    assert "agent-5" not in mirage._agent_targets
+    assert len(removed_contexts) == 1
+
+    # Verified: in-flight agent-10 is NEVER reaped despite 2 hours old timestamp
+    assert "agent-10" in mirage._agent_targets

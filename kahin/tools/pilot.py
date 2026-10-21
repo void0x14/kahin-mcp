@@ -913,7 +913,10 @@ async def browser_start(
                 _healer_ref.bind_engine(None)
                 state.clear_state()
 
-            browser_lock_error = state.acquire_browser_lock()
+            if canonical_mode == STATE_MODE_KES:
+                browser_lock_error = None
+            else:
+                browser_lock_error = state.acquire_browser_lock()
             if browser_lock_error is not None:
                 return _json_error(
                     "kahin_browser_start",

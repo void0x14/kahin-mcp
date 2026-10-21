@@ -690,6 +690,9 @@ class Mirage(BrowserEngine):
         self._sessions: dict[str, str] = {}
         self._target_infos: dict[str, dict[str, Any]] = {}
         self._current_target: str | None = None
+        self._agent_targets: dict[str, str] = {}
+        self._agent_contexts: dict[str, str] = {}
+        self._user_agent_overrides: dict[str, str] = {}
         # sessionId -> {frameId -> executionContextId} (main world only),
         # fed by Runtime.executionContextCreated/Destroyed/ContextsCleared
         # events the sidecar forwards verbatim. DOM tools resolve a frame_id
@@ -786,6 +789,9 @@ class Mirage(BrowserEngine):
         self._target_infos.clear()
         self._frame_contexts.clear()
         self._current_target = None
+        self._agent_targets.clear()
+        self._agent_contexts.clear()
+        self._user_agent_overrides.clear()
         self._dom_binding_installed = False
         self._dom_init_script_installed = False
         self._dom_signal.clear()
@@ -1715,13 +1721,46 @@ class Mirage(BrowserEngine):
         """Monotonic stream lifetime token for concurrent frame consumers."""
         return self._screencast_generation
 
-    def current_session_id(self) -> str | None:
-        """Return the Juggler session owning the selected target."""
-        return self._sessions.get(self._current_target or "")
+    def get_current_target(self, caller_id: str | None = None) -> str | None:
+        """Return the active target for the caller, or default current target."""
+        from kahin.subagent import get_active_subagent_context
+        ctx = get_active_subagent_context()
+        cid = caller_id or ctx.get("caller_id")
+        tid = ctx.get("target_id")
+        if tid and tid in self._sessions:
+            return tid
+        if cid and cid in self._agent_targets:
+            assigned = self._agent_targets[cid]
+            if assigned in self._sessions:
+                return assigned
+        return self._current_target
 
-    def current_browser_context_id(self) -> str | None:
+    def current_session_id(self, caller_id: str | None = None) -> str | None:
+        """Return the Juggler session owning the selected target."""
+        target = self.get_current_target(caller_id=caller_id)
+        return self._sessions.get(target or "")
+
+    def current_browser_context_id(self, caller_id: str | None = None) -> str | None:
         """Return the selected target's browser context, if it has one."""
-        info = self._target_infos.get(self._current_target or "") or {}
+        from kahin.subagent import get_active_subagent_context
+        ctx = get_active_subagent_context()
+        cid = caller_id or ctx.get("caller_id")
+        tid = ctx.get("target_id")
+        if tid:
+            info = self._target_infos.get(tid) or {}
+            value = info.get("browserContextId")
+            if isinstance(value, str) and value:
+                return value
+        if cid:
+            if cid in self._agent_contexts:
+                return self._agent_contexts[cid]
+            if cid in self._agent_targets:
+                info = self._target_infos.get(self._agent_targets[cid]) or {}
+                value = info.get("browserContextId")
+                if isinstance(value, str) and value:
+                    return value
+        target = self.get_current_target(caller_id=cid)
+        info = self._target_infos.get(target or "") or {}
         value = info.get("browserContextId")
         return value if isinstance(value, str) and value else None
 
@@ -1807,7 +1846,7 @@ class Mirage(BrowserEngine):
         async with self._target_lock:
             sid = session_id
             if sid is None and not method.startswith("Browser."):
-                sid = self._sessions.get(self._current_target or "")
+                sid = self.current_session_id()
         if method == "Page.setInterceptFileChooserDialog":
             # A new interception mode starts a new chooser lifetime. Clear a
             # chooser event from a previous page/action before sending the
@@ -2007,15 +2046,58 @@ class Mirage(BrowserEngine):
             await asyncio.sleep(0.05)
         raise RuntimeError("new page frame did not become ready before the bounded deadline")
 
-    async def ensure_page(self) -> dict[str, Any]:
-        """Return the current tab, creating one lazily inside this browser.
+    async def ensure_page(
+        self,
+        caller_id: str | None = None,
+        target_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the caller's tab/context, creating one lazily inside this browser.
 
         Browser startup intentionally does not create a second process or an
         eager throw-away page. The first page-oriented operation gets one
-        about:blank tab, and subsequent operations reuse it until the caller
-        explicitly asks for another tab.
+        about:blank tab, and subsequent operations reuse it. Subagents with distinct
+        caller identities receive their own dedicated tab and isolated browser context.
         """
+        from kahin.subagent import get_active_subagent_context
+        ctx = get_active_subagent_context()
+        cid = caller_id or ctx.get("caller_id")
+        tid = target_id or ctx.get("target_id")
+
         async with self._page_lock:
+            # 1. Explicit target requested
+            if tid and tid in self._sessions:
+                return {"targetId": tid, "sessionId": self._sessions[tid]}
+
+            # 2. Caller has an existing active tab
+            if cid and cid in self._agent_targets:
+                assigned = self._agent_targets[cid]
+                if assigned in self._sessions:
+                    return {"targetId": assigned, "sessionId": self._sessions[assigned]}
+
+            # 3. First caller adopts the initial boot window if nothing assigned yet
+            if not self._sessions and not self._agent_targets:
+                adopted = await self._adopt_existing_window()
+                if adopted is not None:
+                    if cid:
+                        self._agent_targets[cid] = adopted["targetId"]
+                    return adopted
+
+            # 4. If this is a specific caller/subagent, allocate a dedicated tab
+            # inside an isolated browser context (single Camoufox process)!
+            if cid:
+                browser_ctx_id = None
+                try:
+                    ctx_res = await self.call("Browser.createBrowserContext", {})
+                    browser_ctx_id = ctx_res.get("browserContextId")
+                    if browser_ctx_id:
+                        self._agent_contexts[cid] = browser_ctx_id
+                except Exception:
+                    pass
+                created = await self.create_page("about:blank", browser_context_id=browser_ctx_id)
+                self._agent_targets[cid] = created["targetId"]
+                return created
+
+            # 5. Default fallback for callers without agent identity
             if self._current_target in self._sessions:
                 return {
                     "targetId": self._current_target,
@@ -2024,8 +2106,8 @@ class Mirage(BrowserEngine):
             if self._sessions:
                 async with self._target_lock:
                     self._current_target = next(iter(self._sessions))
-                    target_id = self._current_target
-                return {"targetId": target_id, "sessionId": self._sessions[target_id]}
+                    target_id_val = self._current_target
+                return {"targetId": target_id_val, "sessionId": self._sessions[target_id_val]}
             adopted = await self._adopt_existing_window()
             if adopted is not None:
                 return adopted
@@ -2085,6 +2167,9 @@ class Mirage(BrowserEngine):
             # close by deleting a still-live session from Python state.
             if target_id in self._sessions:
                 raise RuntimeError(f"target {target_id} did not detach after Page.close")
+            for k, v in list(self._agent_targets.items()):
+                if v == target_id:
+                    self._agent_targets.pop(k, None)
             if self._current_target == target_id:
                 self._current_target = next(iter(self._sessions), None)
         return {"closed": target_id}
@@ -2094,13 +2179,19 @@ class Mirage(BrowserEngine):
         async with self._target_lock:
             if target_id not in self._sessions:
                 raise RuntimeError(f"unknown target: {target_id}")
+            from kahin.subagent import get_active_subagent_context
+            ctx = get_active_subagent_context()
+            cid = ctx.get("caller_id")
+            if cid:
+                self._agent_targets[cid] = target_id
             self._current_target = target_id
         return {"switched": target_id}
 
     async def list_pages(self) -> list[dict[str, Any]]:
         """All known tabs with their Juggler session ids."""
+        active_tid = self.get_current_target()
         return [
-            {"targetId": tid, "sessionId": sid, "current": tid == self._current_target}
+            {"targetId": tid, "sessionId": sid, "current": tid == active_tid}
             for tid, sid in self._sessions.items()
         ]
 
@@ -2453,7 +2544,17 @@ class Mirage(BrowserEngine):
             context_id = self.current_browser_context_id()
             if context_id:
                 mapped["browserContextId"] = context_id
-            return await self.call("Browser.setUserAgentOverride", mapped)
+            res = await self.call("Browser.setUserAgentOverride", mapped)
+            if user_agent:
+                self._user_agent_overrides[context_id or "default"] = user_agent
+                sid = session_id or self.current_session_id()
+                if sid:
+                    js = f"try {{ Object.defineProperty(Navigator.prototype, 'userAgent', {{ get: () => {json.dumps(user_agent)}, configurable: true }}); }} catch (e) {{}}"
+                    try:
+                        await self.call("Runtime.evaluate", {"expression": js}, session_id=sid)
+                    except Exception:
+                        pass
+            return res
         if command == "setTouchEmulationEnabled":
             enabled = params.get("enabled", False)
             if not isinstance(enabled, bool):
@@ -2497,6 +2598,8 @@ class Mirage(BrowserEngine):
     async def _execute_cdp_network(
         self, command: str, params: dict[str, Any], session_id: str | None = None,
     ) -> dict[str, Any]:
+        if command == "setUserAgentOverride":
+            return await self._execute_cdp_emulation("setUserAgentOverride", params, session_id=session_id)
         if command == "continueInterceptedRequest":
             request_id = params.get("requestId")
             if not isinstance(request_id, str) or not request_id:

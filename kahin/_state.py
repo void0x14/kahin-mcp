@@ -45,14 +45,14 @@ _crawl_jobs_lock = asyncio.Lock()
 _active_crawl_id: str | None = None
 
 
-def acquire_browser_lock() -> dict[str, Any] | None:
+def acquire_browser_lock(mode: str = "ağırbaş") -> dict[str, Any] | None:
     """Claim the machine-wide browser owner slot, or report its owner.
 
-    Engine reuse is process-local because Mirage is a stdio child. A second
-    MCP server cannot attach to that pipe, so silently starting another
-    browser is worse than returning a structured conflict. The advisory lock
-    is released automatically if the owning MCP process exits.
+    In 'keş' mode (ephemeral), sessions do not touch persistent profiles
+    and must not block on or claim the machine-wide exclusive browser.lock slot.
     """
+    if mode == "keş":
+        return None
     global _browser_lock_file
     if fcntl is None or _browser_lock_file is not None:
         return None

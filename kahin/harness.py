@@ -419,12 +419,22 @@ def install(mcp: Any) -> None:
             raw: Any = json.dumps({**refusal, "tool": name}, indent=2, default=str)
             return tool.fn_metadata.convert_result(raw) if convert_result else raw
         started = time.monotonic()
+        from kahin.subagent import (  # noqa: PLC0415
+            extract_caller_identity,
+            set_active_subagent_context,
+            reset_active_subagent_context,
+        )
+
+        caller_id, target_id = extract_caller_identity(arguments, context)
+        token = set_active_subagent_context(caller_id=caller_id, target_id=target_id)
         try:
             raw = await original(name, arguments, context=context, convert_result=False)
         except BaseException as exc:
             if isinstance(exc, Exception):
                 await _harness.record(name, arguments, None, exc)
             raise
+        finally:
+            reset_active_subagent_context(token)
         raw = _attach_stall(raw, started)
         await _harness.record(name, arguments, raw, None)
         return tool.fn_metadata.convert_result(raw) if convert_result else raw

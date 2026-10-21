@@ -346,9 +346,19 @@ async def mirage_set_user_agent(user_agent: str) -> str:
         )
         if validation_error:
             return validation_error
-        return await _mirage_call_checked(
+        res = await _mirage_call_checked(
             tool, "Browser.setUserAgentOverride", _context_params({"userAgent": checked}),
         )
+        if checked:
+            try:
+                engine = _mirage_engine()
+                sid = engine.current_session_id()
+                if sid:
+                    js = f"try {{ Object.defineProperty(Navigator.prototype, 'userAgent', {{ get: () => {json.dumps(checked)}, configurable: true }}); }} catch (e) {{}}"
+                    await engine.call("Runtime.evaluate", {"expression": js}, session_id=sid)
+            except Exception:
+                pass
+        return res
 
 
 @mcp.tool(name="kahin_mirage_set_viewport", annotations=_RW)

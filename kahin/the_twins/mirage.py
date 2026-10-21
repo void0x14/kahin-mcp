@@ -124,6 +124,9 @@ _STATE_MODE_ALIASES = {
     "kes": STATE_MODE_KES,
 }
 
+_MAX_ACTIVE_SUBAGENTS = 16
+_SUBAGENT_IDLE_TTL_SECONDS = 300.0  # 5 minutes idle eviction
+
 
 def _canonical_state_mode(mode: str) -> str:
     """Verilen mod adını kanonik Türkçe ada çevir (``ağırbaş``/``keş``)."""
@@ -692,6 +695,7 @@ class Mirage(BrowserEngine):
         self._current_target: str | None = None
         self._agent_targets: dict[str, str] = {}
         self._agent_contexts: dict[str, str] = {}
+        self._agent_last_seen: dict[str, float] = {}
         self._user_agent_overrides: dict[str, str] = {}
         # sessionId -> {frameId -> executionContextId} (main world only),
         # fed by Runtime.executionContextCreated/Destroyed/ContextsCleared
@@ -791,6 +795,7 @@ class Mirage(BrowserEngine):
         self._current_target = None
         self._agent_targets.clear()
         self._agent_contexts.clear()
+        self._agent_last_seen.clear()
         self._user_agent_overrides.clear()
         self._dom_binding_installed = False
         self._dom_init_script_installed = False
@@ -2080,6 +2085,7 @@ class Mirage(BrowserEngine):
             if cid and cid in self._agent_targets:
                 assigned = self._agent_targets[cid]
                 if assigned in self._sessions:
+                    self._agent_last_seen[cid] = asyncio.get_running_loop().time()
                     return {"targetId": assigned, "sessionId": self._sessions[assigned]}
 
             # 3. First caller adopts the initial boot window if nothing assigned yet
@@ -2093,6 +2099,8 @@ class Mirage(BrowserEngine):
             # 4. If this is a specific caller/subagent, allocate a dedicated tab
             # inside an isolated browser context (single Camoufox process)!
             if cid:
+                self._agent_last_seen[cid] = asyncio.get_running_loop().time()
+                await self._prune_zombie_contexts()
                 browser_ctx_id = None
                 try:
                     ctx_res = await self.call("Browser.createBrowserContext", {})
@@ -2120,6 +2128,58 @@ class Mirage(BrowserEngine):
             if adopted is not None:
                 return adopted
             return await self.create_page("about:blank")
+
+    async def _prune_zombie_contexts(self, *, force_cap: bool = False) -> None:
+        """Reap zombie tabs and isolated browser contexts from dead/idle subagents.
+
+        Prevents memory leaks across high-iteration subagent executions (100-10000+ runs).
+        Evicts callers whose targets detached, or who have been idle longer than TTL (300s),
+        or LRU eviction when active count exceeds _MAX_ACTIVE_SUBAGENTS (16).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+        except RuntimeError:
+            return
+        to_evict: list[str] = []
+
+        # 1. Clean up callers whose targets no longer exist in self._sessions
+        for caller, tid in list(self._agent_targets.items()):
+            if tid not in self._sessions:
+                to_evict.append(caller)
+
+        # 2. Clean up callers who have been idle longer than TTL (5 minutes)
+        for caller, last_seen in list(self._agent_last_seen.items()):
+            if caller not in to_evict and (now - last_seen) > _SUBAGENT_IDLE_TTL_SECONDS:
+                to_evict.append(caller)
+
+        # 3. If exceeding maximum concurrent subagent slots, evict the oldest callers (LRU)
+        active_survivors = [c for c in self._agent_targets if c not in to_evict]
+        if len(active_survivors) >= _MAX_ACTIVE_SUBAGENTS or force_cap:
+            sorted_by_age = sorted(
+                active_survivors,
+                key=lambda c: self._agent_last_seen.get(c, 0.0),
+            )
+            excess = max(0, len(active_survivors) - (_MAX_ACTIVE_SUBAGENTS - 1))
+            for caller in sorted_by_age[:excess]:
+                to_evict.append(caller)
+
+        for caller in set(to_evict):
+            tid = self._agent_targets.pop(caller, None)
+            ctx = self._agent_contexts.pop(caller, None)
+            self._agent_last_seen.pop(caller, None)
+            if tid and tid in self._sessions:
+                try:
+                    sid = self._sessions.get(tid)
+                    if sid:
+                        await self.call("Page.close", {}, session_id=sid)
+                except Exception:
+                    pass
+            if ctx:
+                try:
+                    await self.call("Browser.removeBrowserContext", {"browserContextId": ctx})
+                except Exception:
+                    pass
 
     async def _adopt_existing_window(self) -> dict[str, Any] | None:
         """Adopt the window Camoufox already opened at boot instead of opening

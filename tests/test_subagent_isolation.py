@@ -211,3 +211,49 @@ async def test_mirage_user_agent_runtime_reflection() -> None:
     assert res_reset == {}
     assert "default" not in mirage._user_agent_overrides
     assert any("delete Navigator.prototype.userAgent" in str(c[1]) for c in calls if c[0] == "Runtime.evaluate")
+
+
+@pytest.mark.asyncio
+async def test_mirage_zombie_context_auto_reap() -> None:
+    """Subagents that disconnect without closing tabs have their zombie contexts reaped automatically."""
+    mirage = Mirage()
+    mirage._dead = False
+    mirage._sessions = {"initial-target": "sess-init"}
+    mirage._target_infos = {"initial-target": {"targetId": "initial-target", "type": "page"}}
+    mirage._current_target = "initial-target"
+
+    closed_pages: list[str] = []
+    removed_contexts: list[str] = []
+
+    async def mock_call(method: str, params: dict | None = None, session_id: str | None = None) -> dict:
+        p = params or {}
+        if method == "Browser.createBrowserContext":
+            return {"browserContextId": f"ctx-{len(removed_contexts) + len(mirage._agent_contexts) + 1}"}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "frame-1"}}}
+        if method in ("Browser.newPage", "Target.createTarget"):
+            tid = f"target-{len(mirage._sessions) + 1}"
+            sid = f"session-{len(mirage._sessions) + 1}"
+            mirage._sessions[tid] = sid
+            mirage._target_infos[tid] = {"targetId": tid, "type": "page"}
+            return {"targetId": tid}
+        if method == "Page.close":
+            closed_pages.append(session_id or "")
+            return {}
+        if method == "Browser.removeBrowserContext":
+            removed_contexts.append(p.get("browserContextId", ""))
+            return {}
+        return {}
+
+    mirage.call = mock_call  # type: ignore[assignment]
+
+    # Spawn 18 callers (exceeding _MAX_ACTIVE_SUBAGENTS = 16)
+    for i in range(18):
+        await mirage.ensure_page(caller_id=f"agent-{i}")
+
+    # Active callers must be capped at 16 (oldest LRU callers evicted)
+    assert len(mirage._agent_targets) <= 16
+    assert len(removed_contexts) >= 2
+    assert "agent-0" not in mirage._agent_targets  # Oldest evicted
+    assert "agent-1" not in mirage._agent_targets  # Next oldest evicted
+    assert "agent-17" in mirage._agent_targets     # Newest retained

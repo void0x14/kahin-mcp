@@ -32,12 +32,27 @@ def test_extract_caller_identity_subagent_id() -> None:
 def test_extract_caller_identity_context_meta() -> None:
     context = MagicMock()
     req_ctx = MagicMock()
-    req_ctx.meta = {"claudecode/toolUseId": "tooluse-abc123"}
+    req_ctx.meta = {"agent_id": "agent-xyz", "claudecode/toolUseId": "tooluse-abc123"}
     context.request_context = req_ctx
 
     caller, target = extract_caller_identity({}, context)
-    assert caller == "tooluse-abc123"
+    assert caller == "agent-xyz"
     assert target is None
+
+    # Per-tool invocation IDs (like claudecode/toolUseId) must NOT be used as caller identity
+    req_ctx.meta = {"claudecode/toolUseId": "tooluse-abc123"}
+    req_ctx.session = None
+    context.session_id = None
+    context.client_id = None
+    caller_tooluse, _ = extract_caller_identity({}, context)
+    assert caller_tooluse is None
+
+    # FastMCP direct context.session_id is detected
+    context_sse = MagicMock()
+    context_sse.request_context = None
+    context_sse.session_id = "sse-client-session-789"
+    caller_sse, _ = extract_caller_identity({}, context_sse)
+    assert caller_sse == "sse-client-session-789"
 
 
 def test_extract_caller_identity_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,6 +111,11 @@ async def test_mirage_subagent_tab_isolation() -> None:
             ctx_counter += 1
             return {"browserContextId": f"ctx-{ctx_counter}"}
         if method == "Page.close":
+            for tid, sid in list(mirage._sessions.items()):
+                if sid == session_id:
+                    mirage._sessions.pop(tid, None)
+            return {}
+        if method == "Browser.removeBrowserContext":
             return {}
         if method == "Browser.setUserAgentOverride":
             return {}
@@ -151,6 +171,12 @@ async def test_mirage_subagent_tab_isolation() -> None:
     page_explicit = await mirage.ensure_page(caller_id="subagent-1", target_id="target-3")
     assert page_explicit["targetId"] == "target-3"
 
+    # Closing subagent-2's tab disposes its browser context
+    closed = await mirage.close_page("target-2")
+    assert closed == {"closed": "target-2"}
+    assert "subagent-2" not in mirage._agent_targets
+    assert "subagent-2" not in mirage._agent_contexts
+
 
 @pytest.mark.asyncio
 async def test_mirage_user_agent_runtime_reflection() -> None:
@@ -178,3 +204,10 @@ async def test_mirage_user_agent_runtime_reflection() -> None:
     assert "Browser.setUserAgentOverride" in called_methods
     assert "Runtime.evaluate" in called_methods
     assert mirage._user_agent_overrides.get("default") == "CustomUA/1.0"
+
+    # Resetting user agent deletes prototype property
+    calls.clear()
+    res_reset = await mirage.execute_cdp("Network", "setUserAgentOverride", {"userAgent": ""}, session_id="s1")
+    assert res_reset == {}
+    assert "default" not in mirage._user_agent_overrides
+    assert any("delete Navigator.prototype.userAgent" in str(c[1]) for c in calls if c[0] == "Runtime.evaluate")

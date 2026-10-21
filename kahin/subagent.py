@@ -60,6 +60,8 @@ def extract_caller_identity(
         or args.get("agentId")
         or args.get("subagent_id")
         or args.get("subagentId")
+        or args.get("caller_id")
+        or args.get("callerId")
     )
     explicit_target = (
         args.get("target_id")
@@ -79,6 +81,8 @@ def extract_caller_identity(
         req_ctx = getattr(context, "request_context", None)
         if req_ctx is not None:
             # Metadata dict in request
+            # Note: per-tool-call IDs (like claudecode/toolUseId) change on every
+            # turn and must NOT be used as caller/agent identity.
             meta = getattr(req_ctx, "meta", None)
             if isinstance(meta, dict):
                 meta_agent = (
@@ -86,8 +90,8 @@ def extract_caller_identity(
                     or meta.get("agentId")
                     or meta.get("subagent_id")
                     or meta.get("subagentId")
-                    or meta.get("claudecode/toolUseId")
-                    or meta.get("toolUseId")
+                    or meta.get("caller_id")
+                    or meta.get("callerId")
                     or meta.get("taskId")
                     or meta.get("task_id")
                     or meta.get("sessionId")
@@ -102,7 +106,6 @@ def extract_caller_identity(
                         meta_agent = (
                             p_meta.get("agent_id")
                             or p_meta.get("subagent_id")
-                            or p_meta.get("claudecode/toolUseId")
                             or p_meta.get("sessionId")
                             or p_meta.get("taskId")
                         )
@@ -116,8 +119,10 @@ def extract_caller_identity(
                 else:
                     session_id = f"mcp-session-{id(sess)}"
 
-        # Direct client_id on Context
-        if not session_id and getattr(context, "client_id", None):
+        # Direct session_id or client_id on Context (FastMCP HTTP/SSE)
+        if not session_id and getattr(context, "session_id", None):
+            session_id = str(getattr(context, "session_id"))
+        elif not session_id and getattr(context, "client_id", None):
             session_id = str(getattr(context, "client_id"))
 
     # Environment variables set by AI harnesses

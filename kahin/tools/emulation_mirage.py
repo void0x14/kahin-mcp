@@ -358,6 +358,15 @@ async def mirage_set_user_agent(user_agent: str) -> str:
                     await engine.call("Runtime.evaluate", {"expression": js}, session_id=sid)
             except Exception:
                 pass
+        else:
+            try:
+                engine = _mirage_engine()
+                sid = engine.current_session_id()
+                if sid:
+                    js = "try { delete Navigator.prototype.userAgent; } catch (e) {}"
+                    await engine.call("Runtime.evaluate", {"expression": js}, session_id=sid)
+            except Exception:
+                pass
         return res
 
 

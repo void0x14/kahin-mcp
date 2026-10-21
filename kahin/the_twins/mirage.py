@@ -2019,6 +2019,14 @@ class Mirage(BrowserEngine):
             self._current_target = target_id
             session_id = self._sessions[target_id]
         await self._wait_for_page_frame(session_id, deadline=min(deadline, loop.time() + 3.0))
+        # Reflect runtime user-agent override onto DOM prototype for newly created pages
+        ua = self._user_agent_overrides.get(browser_context_id or "") or self._user_agent_overrides.get("default")
+        if ua:
+            js = f"try {{ Object.defineProperty(Navigator.prototype, 'userAgent', {{ get: () => {json.dumps(ua)}, configurable: true }}); }} catch (e) {{}}"
+            try:
+                await self.call("Runtime.evaluate", {"expression": js}, session_id=session_id)
+            except Exception:
+                pass
         return {"targetId": target_id, "sessionId": session_id}
 
     async def _wait_for_page_frame(self, session_id: str, *, deadline: float) -> None:
@@ -2162,6 +2170,7 @@ class Mirage(BrowserEngine):
             if loop.time() > deadline:
                 raise RuntimeError(f"target {target_id} did not detach after Page.close")
             await asyncio.sleep(0.05)
+        contexts_to_remove: list[str] = []
         async with self._target_lock:
             # The detach event owns removal. Never manufacture a successful
             # close by deleting a still-live session from Python state.
@@ -2170,8 +2179,16 @@ class Mirage(BrowserEngine):
             for k, v in list(self._agent_targets.items()):
                 if v == target_id:
                     self._agent_targets.pop(k, None)
+                    ctx = self._agent_contexts.pop(k, None)
+                    if ctx:
+                        contexts_to_remove.append(ctx)
             if self._current_target == target_id:
                 self._current_target = next(iter(self._sessions), None)
+        for ctx in contexts_to_remove:
+            try:
+                await self.call("Browser.removeBrowserContext", {"browserContextId": ctx})
+            except Exception:
+                pass
         return {"closed": target_id}
 
     async def switch_page(self, target_id: str) -> dict[str, Any]:
@@ -2540,16 +2557,24 @@ class Mirage(BrowserEngine):
             user_agent = params.get("userAgent", "")
             if not isinstance(user_agent, str):
                 raise RuntimeError("Emulation.setUserAgentOverride userAgent must be a string")
-            mapped = {"userAgent": user_agent}
+            mapped = {"userAgent": user_agent or None}
             context_id = self.current_browser_context_id()
             if context_id:
                 mapped["browserContextId"] = context_id
             res = await self.call("Browser.setUserAgentOverride", mapped)
+            sid = session_id or self.current_session_id()
             if user_agent:
                 self._user_agent_overrides[context_id or "default"] = user_agent
-                sid = session_id or self.current_session_id()
                 if sid:
                     js = f"try {{ Object.defineProperty(Navigator.prototype, 'userAgent', {{ get: () => {json.dumps(user_agent)}, configurable: true }}); }} catch (e) {{}}"
+                    try:
+                        await self.call("Runtime.evaluate", {"expression": js}, session_id=sid)
+                    except Exception:
+                        pass
+            else:
+                self._user_agent_overrides.pop(context_id or "default", None)
+                if sid:
+                    js = "try { delete Navigator.prototype.userAgent; } catch (e) {}"
                     try:
                         await self.call("Runtime.evaluate", {"expression": js}, session_id=sid)
                     except Exception:

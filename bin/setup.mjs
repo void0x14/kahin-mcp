@@ -19,7 +19,9 @@ const isMac = process.platform === "darwin";
 const APPDATA = process.env.APPDATA || join(HOME, "AppData", "Roaming");
 
 const ENTRY = { command: "kahin", args: [] };
-const ENTRY_OPENCODE = { type: "local", command: ["kahin"], enabled: true };
+// timeout is part of the contract: a slow tool call must return a verdict,
+// not die at the client's default request timeout.
+const ENTRY_OPENCODE = { type: "local", command: ["kahin"], enabled: true, timeout: 180000 };
 const ENTRY_VSCODE = { type: "stdio", command: "kahin", args: [] };
 
 // VS Code uzantı globalStorage yolu (Cline/Roo/Kilo burada yaşar)
@@ -239,6 +241,12 @@ function upsertJson(client) {
   }
   cfg[root] = cfg[root] || {};
   if (cfg[root]["kahin"]) {
+    if (entry.timeout && cfg[root]["kahin"].timeout !== entry.timeout) {
+      cfg[root]["kahin"].timeout = entry.timeout;
+      writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n");
+      log(`${name}: timeout güncellendi (${file})`);
+      return true;
+    }
     log(`${name}: zaten kayıtlı, atlandı`);
     return false;
   }

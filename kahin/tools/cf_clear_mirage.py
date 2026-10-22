@@ -17,8 +17,8 @@ for ``input[type=checkbox]``, click gated on ``w > 0`` and not ``checked``,
 checkbox page coords = frame-element bounding-box origin + in-frame centre,
 native ``Page.dispatchMouseEvent`` press/release (no Bézier travel, no press
 delay — the reference passes without humanization), re-eval after click where
-success = checkbox not found or checked, up to 5 attempts with jittered 3s
-poll sleeps after a 5s post-navigation settle.
+success = checkbox not found or checked, re-clicked every jittered 3s poll
+until the caller's budget runs out (never abandoned after a fixed pass count).
 
 Ground truth for ``cleared`` is the page itself (title gate + challenge
 probe) plus host-scoped ``cf_clearance`` presence as supporting evidence —
@@ -58,26 +58,32 @@ from kahin.tools.pilot_mirage import (
     _is_error_response,
     _json_error,
 )
+from kahin.tools.storage_mirage import _context_params
 
 _TOOL = "kahin_cf_clear"
 
 # Bounds: every wait is finite, every retry counted. Defaults cover a slow
 # managed challenge (JS proof-of-work + a Turnstile click + settle).
-# Mirrors the Türk bypasser constants (cf_bypasser/utils/constants.py):
-# DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5 (Kahin: 9.0), RETRY_POLL_SECONDS=3.
+# Retry cadence mirrors the Türk bypasser (CHALLENGE_SETTLE_SECONDS=5,
+# RETRY_POLL_SECONDS=3); the loop itself is budget-driven, not count-driven.
 # Fast path (düz CF): curl_cffi impersonate ile tarayıcısız fingerprint
 # geçişi dener (safari18_0 → chrome131). Başarırsa browser ASLA açılmaz;
 # yalnızca JS/challenge/canvas gerektiğinde browser yoluna düşülür.
 # managed challenge (JS proof-of-work + a Turnstile click + settle).
-# Mirrors the Türk bypasser constants (cf_bypasser/utils/constants.py):
-# DEFAULT_MAX_RETRIES=5, CHALLENGE_SETTLE_SECONDS=5 (Kahin: 9.0), RETRY_POLL_SECONDS=3.
+# Retry cadence mirrors the Türk bypasser (CHALLENGE_SETTLE_SECONDS=5,
+# RETRY_POLL_SECONDS=3); the loop itself is budget-driven, not count-driven.
 _MAX_URL_LENGTH = 4096
 _DEFAULT_TIMEOUT = 60.0
-_MAX_TIMEOUT = 180.0
+# Hard ceiling under the MCP transport timeout (180s): a call the transport
+# kills returns an error instead of a verdict, which reads as a failed task.
+_MAX_TIMEOUT = 100.0
 _RETRY_POLL_SECONDS = 3.0
 _RETRY_POLL_JITTER_SECONDS = 1.0
-_INITIAL_SETTLE_SECONDS = 9.0  # TR ref 5s; widget iframe appears before it is interactive
+_INITIAL_SETTLE_SECONDS = 9.0  # ceiling, not a wait: polled below, exits the moment the page opens
 _MAX_ATTEMPTS = 5
+# Hard stop only so a stuck clock cannot spin forever; the caller's budget
+# normally ends the loop long before this.
+_MAX_PASSES = _MAX_ATTEMPTS * 12
 # Hızlı yol: tarayıcısız fingerprint profilleri, sırayla deneinecek.
 _FAST_IMPERSONATE = ("safari18_0", "chrome131")
 _FAST_TIMEOUT = 30.0
@@ -560,7 +566,9 @@ async def _cf_cookies(session_id: str, host: str) -> dict[str, str]:
     """
     engine = _mirage_engine()
     try:
-        payload = await engine.call("Browser.getCookies", {}, session_id=session_id)
+        # The tab lives in a named browser context, not the default one;
+        # without this id Juggler reads the default (empty) jar.
+        payload = await engine.call("Browser.getCookies", _context_params(), session_id=session_id)
     except Exception:  # noqa: BLE001
         return {}
     cookies = (payload or {}).get("cookies") if isinstance(payload, dict) else None
@@ -793,7 +801,12 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
         except Exception as exc:  # noqa: BLE001 - public tool returns JSON
             return _json_error(_TOOL, f"navigation failed: {exc}", "navigation_failed")
 
-        await asyncio.sleep(_INITIAL_SETTLE_SECONDS)
+        # Poll instead of a flat settle: an already-open page answers at once,
+        # a solving challenge answers the moment it clears.
+        for _ in range(int(_INITIAL_SETTLE_SECONDS / 0.25)):
+            if await _is_bypassed(session_id):
+                break
+            await asyncio.sleep(0.25)
 
         # Fast path: no challenge signals AND the interstitial title is gone.
         # Cookie presence alone proves nothing (profile-wide jar, other
@@ -816,21 +829,19 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                           "action": "stop_and_review_authorization",
                           "elapsedMs": elapsed_ms()})
 
-        # TR contract (cf_bypasser/core/bypasser.py:230-243): whether or
-        # not a widget is on screen, poll up to _MAX_ATTEMPTS passes of
-        # ``is_bypassed -> click -> sleep``. Non-interactive managed
-        # challenges self-resolve during the wait; interactive ones need a
-        # click. The click is re-attempted on every pass: the widget iframe
-        # appears before it is interactive, so a single click fired on the
-        # first pass can land on a widget that is not listening yet and be
-        # lost -- the loop must keep clicking until the challenge clears.
+        # Budget-driven, not count-driven: keep observing ``is_bypassed ->
+        # click -> sleep`` for as long as time remains. A challenge must be
+        # waited out, never abandoned after a fixed number of passes. The
+        # click is re-attempted every pass because the widget iframe appears
+        # before it is interactive, and a re-served challenge (click ->
+        # reload -> same page -> click) is handled by the same loop.
+        # ``clicks`` counts dispatched native press/release pairs even when
+        # the post-click re-eval does not verify.
         clicks = 0
+        passes = 0
         deadline = started + budget
-        # TR retry loop (cf_bypasser:232-239): up to _MAX_ATTEMPTS passes of
-        # verify -> click -> jittered retry-poll sleep. ``clicks`` counts
-        # dispatched native press/release pairs even when the post-click
-        # re-eval does not verify, so timeout evidence shows real attempts.
-        for _ in range(_MAX_ATTEMPTS):
+        while time.monotonic() < deadline and passes < _MAX_PASSES:
+            passes += 1
             # Ground truth: the interstitial title is gone. Cookies are only
             # supporting evidence (host-scoped + page-context agreement).
             bypassed = await _eval_value(_IS_BYPASSED_JS, session_id)

@@ -74,6 +74,12 @@ _CHALLENGE_STATUS_JS = r"""
   };
   has("captcha-text", /captcha|recaptcha|hcaptcha|turnstile|verify you are human|cloudflare.*challenge/, body + " " + title);
   has("captcha-url", /captcha|challenge-platform|challenges\.cloudflare|turnstile/, url);
+  // DOM contract, not page text: CF's interstitial is localised, but it always
+  // ships the Turnstile response input and its challenge-platform script.
+  has("captcha-dom", /cf-turnstile-response|g-recaptcha-response|challenge-platform/, Array.from(document.querySelectorAll(
+    "input[name='cf-turnstile-response'], input[name='g-recaptcha-response'], " +
+    "script[src*='challenge-platform'], script[src*='turnstile']"
+  )).map((el) => String(el.getAttribute("name") || el.getAttribute("src") || "")).join(" ").toLowerCase());
   has("captcha-element", /iframe|textarea|div/, Array.from(document.querySelectorAll(
     "iframe[src*='captcha'], iframe[src*='challenge'], [id*='captcha'], [class*='captcha'], " +
     "[id*='challenge'], [class*='challenge'], textarea[name*='captcha'], " +

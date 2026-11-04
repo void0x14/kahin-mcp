@@ -429,6 +429,63 @@ export async function buildNoxHost() {
   return { built: target };
 }
 
+// cf add-on host binary'sini derler: Cloudflare'ın challenge paketini
+// gömülü JS motorunda çalıştıran QuickJS host'u. Aynı QuickJS upstream'i
+// kullanır (nox ile paylaşılan build girdisi), sonuç
+// `kahin/addons/cf/bin/` altına yazılır. Idempotent: binary varsa derlenmez.
+export async function buildCfHost() {
+  if (process.env.KAHIN_SKIP_CF) {
+    log("cf host derlemesi atlandı (KAHIN_SKIP_CF)");
+    return { skipped: true };
+  }
+  const addon = join(PACKAGE_ROOT, "kahin", "addons", "cf");
+  const name = isWin ? "cfhost.exe" : "cfhost";
+  const target = join(addon, "bin", name);
+  if (existsSync(target)) {
+    return { present: true };
+  }
+  const source = join(addon, "cfhost.c");
+  const shim = join(addon, "shim.js");
+  if (!existsSync(source) || !existsSync(shim)) {
+    log("cf kaynakları eksik; derleme atlandı");
+    return { skipped: true };
+  }
+  const noxAddon = join(PACKAGE_ROOT, "kahin", "addons", "nox");
+  const quickjs = join(noxAddon, "_build", "quickjs");
+  if (!existsSync(join(quickjs, "CMakeLists.txt"))) {
+    const code = await run("git", ["clone", "--depth", 1, QUICKJS_REPO, quickjs]);
+    if (code !== 0 || !existsSync(join(quickjs, "CMakeLists.txt"))) {
+      log(`cf: QuickJS kaynağı alınamadı (git çıkış ${code}) — tarayıcısız CF yolu kapalı`);
+      return { skipped: true };
+    }
+  }
+  const cmake = await run("cmake", ["-B", join(quickjs, "build"), "-DCMAKE_BUILD_TYPE=Release", quickjs]);
+  if (cmake !== 0) {
+    log("cf: cmake başarısız — tarayıcısız CF yolu kapalı");
+    return { skipped: true };
+  }
+  const built = await run("cmake", ["--build", join(quickjs, "build"), "-j"]);
+  if (built !== 0) {
+    log("cf: QuickJS derlenemedi — tarayıcısız CF yolu kapalı");
+    return { skipped: true };
+  }
+  mkdirSync(join(addon, "bin"), { recursive: true });
+  const cc = process.env.CC || "cc";
+  const ccArgs = [
+    "-O2", "-o", target, source,
+    "-I", join(quickjs, "build"), "-I", quickjs,
+    join(quickjs, "build", "libqjs.a"),
+    "-lm", "-lpthread", "-ldl",
+  ];
+  const code = await run(cc, ccArgs, 180_000);
+  if (code !== 0 || !existsSync(target)) {
+    log(`cf: ${cc} derlemesi başarısız (çıkış ${code}) — tarayıcısız CF yolu kapalı`);
+    return { skipped: true };
+  }
+  log(`cf host derlendi: ${target}`);
+  return { built: target };
+}
+
 // Gömülü wheel'i venv'e kurar ve varsayılan Camoufox binary'sini hazırlar.
 // PyPI'a bağımlı DEĞİL — wheel paketle birlikte gelir; wheel'in bağımlılıkları
 // (Camoufox dahil) pip tarafından kurulup resmi `camoufox fetch` ile tarayıcı
@@ -521,6 +578,7 @@ function run(cmd, args, timeoutMs = SETUP_COMMAND_TIMEOUT_MS) {
 if (process.argv[1] && process.argv[1].endsWith("setup.mjs")) {
   setup();
   await buildNoxHost();
+  await buildCfHost();
   const result = await installPython();
   if (result?.error) process.exitCode = 1;
 }

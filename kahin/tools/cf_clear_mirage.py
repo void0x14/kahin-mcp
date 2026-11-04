@@ -704,6 +704,67 @@ async def _fast_fingerprint_clear(
     return None
 
 
+async def _engine_clear(
+    url: str, started: float, proxy: str | None = None
+) -> dict[str, Any] | None:
+    """Tarayıcısız JS motoru yolu: Cloudflare'ın kendi challenge paketi
+    QuickJS üzerinde çalışır (kahin/addons/cf).
+
+    Browser ASLA açılmaz. Kahin'in nox eklentisiyle aynı desen: challenge
+    paketi gömülü JS motorunda koşar, sayfanın network ihtiyacı Python
+    tarafından (curl_cffi, ayni TLS profili) karsilanir. Basari olcutu
+    sayfanin kendisi: challenge sonrasi sayfa yeniden yuklendiginde
+    interstitial gelmemeli (cf-hata-mezarligi M11).
+
+    Basarisizlikta None doner; cagiran browser yoluna duser."""
+    def elapsed_ms() -> int:
+        return int((time.monotonic() - started) * 1000)
+    try:
+        from kahin.cf_cookie import CfCookieError, CfCookieStore
+    except ImportError:
+        return None
+    store = CfCookieStore(url, write_file=False)
+    if proxy:
+        try:
+            transport = store._Transport(  # noqa: SLF001 - internal by design
+                store.user_agent, store.origin + "/", store.origin
+            )
+            transport._session.proxies = {"http": proxy, "https": proxy}
+            store._transport = transport
+        except Exception:  # noqa: BLE001 - proxy yoksa dogrudan yol
+            pass
+    try:
+        store.refresh()
+    except CfCookieError as exc:
+        return {
+            "cleared": False,
+            "method": "engine:quickjs",
+            "url": url,
+            "browser": False,
+            "reason": str(exc),
+            "elapsedMs": elapsed_ms(),
+        }
+    except Exception as exc:  # noqa: BLE001 - motor hatasi da browser yoluna dusmeli
+        return {
+            "cleared": False,
+            "method": "engine:quickjs",
+            "url": url,
+            "browser": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "elapsedMs": elapsed_ms(),
+        }
+    finally:
+        store.stop()
+    return {
+        "cleared": True,
+        "method": "engine:quickjs",
+        "url": url,
+        "cfCookies": ["cf_clearance"],
+        "browser": False,
+        "elapsedMs": elapsed_ms(),
+    }
+
+
 # kept for future refusal-evidence / debugging; currently unused.
 async def _ray_id(session_id: str) -> str | None:
     """CF Ray ID from page text; None when unreadable. Rotation detector."""
@@ -762,6 +823,18 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
     )
     if fast is not None:
         return _dump(fast)
+
+    # MOTOR YOLU: JS challenge gerekiyor. Browser HENUZ acilmaz — Cloudflare'in
+    # kendi challenge paketi gomulu QuickJS motorunda (kahin/addons/cf)
+    # calistirilir; sayfanin network istegi Python tarafindan ayni TLS
+    # profiliyle karsilanir. nox eklentisinin ayni deseni.
+    _engine_started = time.monotonic()
+    engine = await _engine_clear(
+        url, _engine_started, getattr(_mirage_engine(), "_proxy_url", None)
+    )
+    if engine is not None and engine.get("cleared"):
+        return _dump(engine)
+    _engine_evidence = engine
 
     async with _healer_ref.safe(_TOOL, url=url[:80], timeout=budget):
         started = time.monotonic()
@@ -919,11 +992,13 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                           "kind": kind, "cfCookies": sorted(cf),
                           "clicks": clicks, "scrubbed": scrubbed,
                           "action": "pause_for_human_or_authorized_provider",
+                           "engineAttempt": _engine_evidence,
                           "elapsedMs": elapsed_ms()})
         return _dump({"cleared": False, "method": "timeout", "url": url,
                       "kind": kind, "cfCookies": sorted(cf), "clicks": clicks,
                       "action": "pause_for_human_or_authorized_provider",
-                      "elapsedMs": elapsed_ms()})
+                      "elapsedMs": elapsed_ms(),
+                      "engineAttempt": _engine_evidence})
 
 
 @mcp.tool(name="kahin_cf_status", annotations=_RO)

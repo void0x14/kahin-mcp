@@ -648,6 +648,13 @@ async def _scrub_host_cf_cookies(session_id: str, host: str) -> int:
     return len(targets)
 
 
+async def _page_user_agent(session_id: str) -> str:
+    """Sayfanın gerçek User-Agent'i — cf_clearance UA'ya bağlıdır, sahte
+    UA ile replay edilemez (cf-hata-mezarligi Z)."""
+    value = await _eval_value("navigator.userAgent", session_id)
+    return str(value) if isinstance(value, str) and value else ""
+
+
 async def _page_cf_cookie_names(session_id: str) -> list[str]:
     """cf_ cookies visible in page context (non-httpOnly, this document)."""
     value = await _eval_value(
@@ -655,6 +662,18 @@ async def _page_cf_cookie_names(session_id: str) -> list[str]:
         session_id,
     )
     return [str(n) for n in value] if isinstance(value, list) else []
+
+
+def _publish_clearance(
+    host: str, value: str, url: str, user_agent: str = ""
+) -> str:
+    """`cf_clearance`'ı kahin'in cookie dosyasına yazar (scraper oradan okur)."""
+    try:
+        from kahin.cf_cookie import publish_clearance
+
+        return str(publish_clearance(host, value, url=url, user_agent=user_agent))
+    except Exception:  # noqa: BLE001 - dosya yazimi basarisiz olsa da sonuc bozulmaz
+        return ""
 
 
 async def _fast_fingerprint_clear(
@@ -892,8 +911,12 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
         ):
             cf = await _cf_cookies(session_id, host)
             if "cf_clearance" in cf:
+                _published = _publish_clearance(
+                    host, cf["cf_clearance"], url, await _page_user_agent(session_id)
+                )
                 return _dump({"cleared": True, "method": "none", "url": url,
-                              "cfCookies": sorted(cf), "elapsedMs": elapsed_ms()})
+                              "cfCookies": sorted(cf), "elapsedMs": elapsed_ms(),
+                              "cookieFile": _published})
 
         blocked = await _is_blocked(session_id)
         if blocked is not None:
@@ -923,11 +946,18 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                 cf = await _cf_cookies(session_id, host)
                 page_names = await _page_cf_cookie_names(session_id)
                 if "cf_clearance" in cf or (token and len(token) > 20):
+                    _published = (
+                        _publish_clearance(
+                            host, cf["cf_clearance"], url,
+                            await _page_user_agent(session_id))
+                        if "cf_clearance" in cf else ""
+                    )
                     return _dump({"cleared": True,
                                   "method": "token" if token else ("click" if clicks else "auto"),
                                   "url": url, "cfCookies": sorted(cf),
                                   "pageCfCookies": sorted(page_names),
                                   "token": (token[:32] + "...") if token else None,
+                                  "cookieFile": _published,
                                   "clicks": clicks, "elapsedMs": elapsed_ms()})
                 cf = await _cf_cookies(session_id, host)
                 page_names = await _page_cf_cookie_names(session_id)
@@ -936,6 +966,9 @@ async def cf_clear(url: str, timeout: float = _DEFAULT_TIMEOUT) -> str:
                                   "method": "click" if clicks else "auto",
                                   "url": url, "cfCookies": sorted(cf),
                                   "pageCfCookies": sorted(page_names),
+                                  "cookieFile": _publish_clearance(
+                                      host, cf["cf_clearance"], url,
+                                      await _page_user_agent(session_id)),
                                   "clicks": clicks, "elapsedMs": elapsed_ms()})
             if time.monotonic() >= deadline:
                 break

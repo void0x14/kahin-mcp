@@ -92,6 +92,41 @@ def _addon_dir() -> Path:
     return Path(__file__).resolve().parent / "addons" / "cf"
 
 
+def publish_clearance(
+    host: str,
+    value: str,
+    *,
+    url: str = "",
+    user_agent: str = _DEFAULT_UA,
+    source: str = "browser",
+) -> Path:
+    """`cf_clearance`'ı kahin'in cookie dosyasına yazar.
+
+    Scraper bu dosyayı okur: `$KAHIN_HOME/cf/<host>.cookie`.
+    """
+    path = _kahin_home() / "cf" / f"{host}.cookie"
+    if path.is_symlink():
+        raise CfCookieError(f"cookie file must not be a symlink: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "host": host,
+        "origin": f"https://{host}",
+        "url": url,
+        "name": _CLEARANCE_COOKIE,
+        "value": value,
+        "minted_at": time.time(),
+        "user_agent": user_agent,
+        "verified": True,
+        "source": source,
+    }
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+    return path
+
+
 def _host_binary() -> Path:
     override = os.environ.get("KAHIN_CF_HOST", "").strip()
     if override:

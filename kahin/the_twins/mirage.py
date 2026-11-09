@@ -98,6 +98,112 @@ def _window_size() -> tuple[int, int]:
         except (ValueError, TypeError):
             logger.warning("ignoring malformed KAHIN_WINDOW=%r; using default", raw)
     return _DEFAULT_WINDOW_SIZE
+
+
+def _browser_descendant_pids(root_pid: int) -> list[int]:
+    """Every descendant of ``root_pid`` (the sidecar).
+
+    The X11 window belongs to the Camoufox child process, not to the sidecar
+    that spawned it, so pinning has to look at the whole subtree.
+    """
+    pids: list[int] = []
+    try:
+        children = Path(f"/proc/{root_pid}/task/{root_pid}/children")
+        stack = [int(p) for p in children.read_text().split()]
+    except (OSError, ValueError):
+        return pids
+    while stack:
+        pid = stack.pop()
+        pids.append(pid)
+        try:
+            kids = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            stack.extend(int(k) for k in kids)
+        except (OSError, ValueError):
+            continue
+    return pids
+
+
+def _x11_windows_for_pid(pid: int) -> list[str]:
+    """Ids of the mapped top-level X11 windows owned by ``pid``.
+
+    Firefox's own chrome window is the only NORMAL window the browser process
+    owns; helper windows (the 10x10 offscreen ones) carry no window type and are
+    filtered out. Returns [] when there is no display or no xdotool.
+    """
+    if not os.environ.get("DISPLAY"):
+        return []
+    try:
+        out = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    windows = []
+    for win in out:
+        try:
+            props = subprocess.run(
+                ["xprop", "-id", win, "_NET_WM_WINDOW_TYPE"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if "_NET_WM_WINDOW_TYPE_NORMAL" in props:
+            windows.append(win)
+    return windows
+
+
+def _pin_window_geometry(root_pid: int, width: int, height: int) -> None:
+    """Force every normal window of the browser subtree to ``width``x``height``.
+
+    The browser cannot do this itself: resizeTo() sets the content area, the
+    window manager adds its decoration on top, and Firefox's own chrome (tab
+    strip, toolbar, a sidebar that opens on some launches) varies -- so the same
+    requested size produced a different outer window every time (measured
+    1370x890 against 1306x757 across runs). Setting the size on the X11 window
+    is authoritative and holds.
+    """
+    try:
+        screen = subprocess.run(
+            ["xdpyinfo"], capture_output=True, text=True, timeout=5,
+        ).stdout
+        dims = [line for line in screen.splitlines() if "dimensions:" in line]
+        if not dims:
+            return
+        sw, sh = (int(v) for v in dims[0].split()[1].split("x")[:2])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return
+    left = max(0, (sw - width) // 2)
+    top = max(0, (sh - height) // 2)
+    windows: list[str] = []
+    for pid in [root_pid, *_browser_descendant_pids(root_pid)]:
+        windows.extend(_x11_windows_for_pid(pid))
+    for win in dict.fromkeys(windows):
+        for cmd in (["windowsize", win, str(width), str(height)],
+                    ["windowmove", win, str(left), str(top)]):
+            try:
+                subprocess.run(["xdotool", *cmd], capture_output=True, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+
+async def _pin_window_geometry_until_settled(pid: int) -> None:
+    """Pin right after the window appears, and again whenever it drifts.
+
+    Firefox maps its chrome window a moment after boot and the window manager
+    may place it afterwards, so the first attempt can land before the window
+    exists. Poll briefly, then keep a slow watch for the life of the engine so a
+    late resize cannot move it.
+    """
+    width, height = _window_size()
+    for _ in range(80):  # ~20s to first map
+        if any(_x11_windows_for_pid(p) for p in [pid, *_browser_descendant_pids(pid)]):
+            _pin_window_geometry(pid, width, height)
+            break
+        await asyncio.sleep(0.25)
+    while True:
+        await asyncio.sleep(1.0)
+        _pin_window_geometry(pid, width, height)
 _MIRAGE_PAGE_DOMAINS = frozenset({"Page", "Runtime", "Network", "Input", "Accessibility", "Heap"})
 
 # Faz 4 Task 3 — per-identity profile pre-warm. Camoufox's launch_options()
@@ -560,6 +666,7 @@ class Mirage(BrowserEngine):
         # exposed by identity/status surfaces without any fingerprint data.
         self._launch_policy: dict[str, Any] | None = None
         self._started_monotonic: float | None = None
+        self._geometry_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._page_lock = asyncio.Lock()
         # Switching the current tab is a routing operation, not browser
@@ -691,6 +798,7 @@ class Mirage(BrowserEngine):
         self._prewarm_info = None
         self._launch_policy = None
         self._started_monotonic = None
+        self._geometry_task = None
         self._persistent_profile = False
         self._state_mode = None
         self._kes_profile_dir = None
@@ -806,7 +914,11 @@ class Mirage(BrowserEngine):
         # which destroys whatever the automation had open).
         policy_prefs.setdefault("browser.link.open_newwindow", 3)
         policy_prefs.setdefault("browser.link.open_newwindow.restriction", 0)
-        policy_prefs.setdefault("dom.disable_window_move_resize", True)
+        # NOTE: dom.disable_window_move_resize is deliberately NOT set. It
+        # applies to the chrome window too, which turns the Juggler side's
+        # moveTo/resizeTo into no-ops -- disarming the geometry pin and letting
+        # the window manager decide the position. Content scripts are already
+        # blocked from moving chrome windows by Firefox itself.
         # Pin one geometry per launch instead of letting the fingerprint
         # generator pick a random window each start. The Juggler side reads
         # these prefs and centers the window on screen.
@@ -981,6 +1093,16 @@ class Mirage(BrowserEngine):
             # boot — record helpers swallow OSError, and the lookup above
             # already tolerated corrupt cache state.
             self._started_monotonic = time.monotonic()
+            # One window, one geometry. The browser cannot hold this itself
+            # (see _pin_window_geometry); a headed launch gets the geometry
+            # pinned on the X11 window for as long as the engine lives.
+            self._geometry_task = None
+            if not headless and self._process is not None:
+                width, height = _window_size()
+                logger.info("kahin window pinned to %dx%d (centered)", width, height)
+                self._geometry_task = asyncio.create_task(
+                    _pin_window_geometry_until_settled(self._process.pid)
+                )
             if prewarm_hash is not None:
                 hits = (int(prewarm.get("hits", 0)) + 1) if prewarm is not None else 0
                 starts = (int(prewarm.get("starts", 0)) + 1) if prewarm is not None else 1
@@ -2817,6 +2939,9 @@ class Mirage(BrowserEngine):
         self._prewarm_info = None
         self._launch_policy = None
         self._started_monotonic = None
+        geometry_task, self._geometry_task = self._geometry_task, None
+        if geometry_task is not None:
+            geometry_task.cancel()
         self._marionette_port = None
         self._passkey_mode = False
         for fut in self._pending.values():

@@ -1,5 +1,5 @@
---- /proc/self/fd/11	2026-11-09 19:30:32.082127260 +0300
-+++ /proc/self/fd/12	2026-11-09 19:30:32.085127241 +0300
+--- /proc/self/fd/12	2026-11-09 19:33:34.815954306 +0300
++++ /proc/self/fd/13	2026-11-09 19:33:34.815954306 +0300
 @@ -33,6 +33,7 @@
  const helper = new Helper();
  
@@ -218,7 +218,31 @@
    defaultContext() {
      return this._defaultContext;
    }
-@@ -393,11 +563,35 @@
+@@ -361,7 +531,22 @@
+ 
+   async _newPageInternal({browserContextId}) {
+     const browserContext = this.browserContextForId(browserContextId);
+-    const features = "chrome,dialog=no,all";
++    // Kahin: size and place the window in the window features so the window
++    // manager creates it at the right geometry from the first frame. Resizing
++    // afterwards is a race against the WM and lost every time -- the window
++    // was opening at full screen and getting pushed back by a pin.
++    let features = "chrome,dialog=no,all";
++    if (this._managedWindowSize) {
++      const w = this._managedWindowSize.width;
++      const h = this._managedWindowSize.height;
++      features += `,width=${w},height=${h}`;
++      try {
++        const screen = Services.appShell.hiddenDOMWindow.screen;
++        const left = Math.max(0, Math.round((screen.availWidth - w) / 2) + (screen.availLeft || 0));
++        const top = Math.max(0, Math.round((screen.availHeight - h) / 2) + (screen.availTop || 0));
++        features += `,left=${left},top=${top}`;
++      } catch (e) {}
++    }
+     // See _callWithURIToLoad in browser.js for the structure of window.arguments
+     // window.arguments[1]: unused (bug 871161)
+     //                 [2]: referrerInfo (nsIReferrerInfo)
+@@ -393,11 +578,35 @@
      args.appendElement(undefined); // 7
      args.appendElement(Services.scriptSecurityManager.getSystemPrincipal()); // 8
  

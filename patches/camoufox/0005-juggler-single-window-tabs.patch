@@ -1,5 +1,5 @@
---- /proc/self/fd/11	2026-11-09 19:19:49.559209803 +0300
-+++ /proc/self/fd/12	2026-11-09 19:19:49.559209803 +0300
+--- /proc/self/fd/12	2026-11-09 19:28:57.230734732 +0300
++++ /proc/self/fd/13	2026-11-09 19:28:57.230734732 +0300
 @@ -33,6 +33,7 @@
  const helper = new Helper();
  
@@ -142,7 +142,7 @@
        helper.removeListeners(listeners);
        for (const tab of domWindow.gBrowser.tabs)
          onTabCloseListener({ target: tab });
-@@ -337,6 +438,75 @@
+@@ -337,6 +438,89 @@
      return proxyInfo;
    }
  
@@ -167,18 +167,32 @@
 +      const screen = domWindow.screen || Services.appShell.hiddenDOMWindow.screen;
 +      const left = Math.max(0, Math.round((screen.availWidth - size.width) / 2) + (screen.availLeft || 0));
 +      const top = Math.max(0, Math.round((screen.availHeight - size.height) / 2) + (screen.availTop || 0));
++      // resizeTo() sets the OUTER window size in Firefox, so the requested
++      // numbers are the geometry a page would see. A window manager can still
++      // refuse or adjust a placement (tiling WMs, min-size hints), and a pin
++      // that keeps re-asserting geometry the WM will never grant would fight
++      // it forever. So: ask, then give up after a few fruitless attempts and
++      // accept where the window actually settled.
 +      domWindow.moveTo(left, top);
 +      domWindow.resizeTo(size.width, size.height);
-+      // A page or an extension may still move the window later (saved
-+      // geometry, WM animation, a popup hint). Re-assert the pinned frame
-+      // until the window goes away, so nothing drifts even by a pixel.
 +      const locked = {left, top, width: size.width, height: size.height};
++      let attempts = 0;
 +      const pin = () => {
 +        try {
 +          if (domWindow.closed) return;
-+          if (domWindow.screenX !== locked.left || domWindow.screenY !== locked.top ||
-+              domWindow.outerWidth !== locked.width || domWindow.outerHeight !== locked.height)
-+            domWindow.moveTo(locked.left, locked.top), domWindow.resizeTo(locked.width, locked.height);
++          const drifted = domWindow.screenX !== locked.left || domWindow.screenY !== locked.top ||
++              domWindow.outerWidth !== locked.width || domWindow.outerHeight !== locked.height;
++          if (!drifted) {
++            attempts = 0;
++            return;
++          }
++          if (++attempts > 6) {
++            try { domWindow.clearInterval(domWindow.__kahinPinTimer); } catch (e) {}
++            domWindow.__kahinPinTimer = null;
++            return;
++          }
++          domWindow.moveTo(locked.left, locked.top);
++          domWindow.resizeTo(locked.width, locked.height);
 +        } catch (e) {}
 +      };
 +      if (!domWindow.__kahinPinTimer) {
@@ -218,7 +232,7 @@
    defaultContext() {
      return this._defaultContext;
    }
-@@ -393,11 +563,35 @@
+@@ -393,11 +577,35 @@
      args.appendElement(undefined); // 7
      args.appendElement(Services.scriptSecurityManager.getSystemPrincipal()); // 8
  

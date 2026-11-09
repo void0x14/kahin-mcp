@@ -1,5 +1,5 @@
---- /proc/self/fd/12	2026-11-09 19:28:57.230734732 +0300
-+++ /proc/self/fd/13	2026-11-09 19:28:57.230734732 +0300
+--- /proc/self/fd/11	2026-11-09 19:30:32.082127260 +0300
++++ /proc/self/fd/12	2026-11-09 19:30:32.085127241 +0300
 @@ -33,6 +33,7 @@
  const helper = new Helper();
  
@@ -55,7 +55,7 @@
      const domWindowTabListeners = new Map();
  
      const onOpenWindow = async (appWindow) => {
-@@ -249,10 +283,73 @@
+@@ -249,10 +283,59 @@
        }
        if (!domWindow.gBrowser)
          return;
@@ -65,26 +65,17 @@
 +        const primaryAlive = primary && primary !== domWindow && !primary.closed && primary.gBrowser;
 +        if (primaryAlive) {
 +          // Kahin: a second window for the same context is a popup that
-+          // escaped the open-newwindow pref. Move its tabs into the one true
-+          // window and close it, so nothing exists outside the fixed frame.
++          // escaped the open-newwindow pref. Move its tabs -- the tab objects
++          // themselves, so the loaded document and its Juggler target survive
++          // -- into the one true window, then close the emptied window. Copying
++          // URLs instead would reload the page and lose whatever state the
++          // popup had already built.
 +          try {
-+            const urls = [];
-+            for (const tab of Array.from(domWindow.gBrowser.tabs)) {
-+              try {
-+                urls.push({
-+                  url: tab.linkedBrowser.currentURI ? tab.linkedBrowser.currentURI.spec : 'about:blank',
-+                  userContextId: tab.userContextId,
-+                });
-+              } catch (e) {}
++            const tabs = Array.from(domWindow.gBrowser.tabs);
++            for (const tab of tabs) {
++              primary.gBrowser.adoptTab(tab, primary.gBrowser.tabs.length, true);
 +            }
-+            for (const entry of urls) {
-+              const moved = primary.gBrowser.addTab(entry.url, {
-+                userContextId: entry.userContextId,
-+                triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
-+              });
-+              primary.gBrowser.selectedTab = moved;
-+            }
-+            if (urls.length)
++            if (domWindow.gBrowser.tabs.length === 0)
 +              domWindow.close();
 +            if (domWindow.closed)
 +              return;
@@ -108,13 +99,8 @@
 +          const primary = targetWindow === domWindow ? null : this._contextWindows.get(this._contextKeyForWindow(targetWindow));
 +          if (primary && primary !== targetWindow && primary.gBrowser) {
 +            const tab = event.target;
-+            const url = tab.linkedBrowser && tab.linkedBrowser.currentURI ? tab.linkedBrowser.currentURI.spec : 'about:blank';
-+            const moved = primary.gBrowser.addTab(url, {
-+              userContextId: tab.userContextId,
-+              triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
-+            });
-+            primary.gBrowser.selectedTab = moved;
-+            try { targetWindow.gBrowser.removeTab(tab); } catch (e) {}
++            // adoptTab keeps the live tab: no reload, no lost document.
++            primary.gBrowser.adoptTab(tab, primary.gBrowser.tabs.length, true);
 +            try { if (targetWindow.gBrowser.tabs.length === 0) targetWindow.close(); } catch (e) {}
 +            return;
 +          }
@@ -131,7 +117,7 @@
        ]);
        for (const tab of domWindow.gBrowser.tabs)
          onTabOpenListener(appWindow, domWindow, { target: tab });
-@@ -267,6 +364,10 @@
+@@ -267,6 +350,10 @@
  
        const listeners = domWindowTabListeners.get(domWindow) || [];
        domWindowTabListeners.delete(domWindow);
@@ -142,7 +128,7 @@
        helper.removeListeners(listeners);
        for (const tab of domWindow.gBrowser.tabs)
          onTabCloseListener({ target: tab });
-@@ -337,6 +438,89 @@
+@@ -337,6 +424,89 @@
      return proxyInfo;
    }
  
@@ -232,7 +218,7 @@
    defaultContext() {
      return this._defaultContext;
    }
-@@ -393,11 +577,35 @@
+@@ -393,11 +563,35 @@
      args.appendElement(undefined); // 7
      args.appendElement(Services.scriptSecurityManager.getSystemPrincipal()); // 8
  

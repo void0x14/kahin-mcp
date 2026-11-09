@@ -802,7 +802,9 @@ class Mirage(BrowserEngine):
         # One window, one geometry, nothing moves. `window.open` popups and
         # target=_blank links become tabs in the same window instead of new
         # windows, and no page may resize or move the chrome window at all.
-        policy_prefs.setdefault("browser.link.open_newwindow", 1)
+        # 3 = new tab in the same window (1 would replace the current page,
+        # which destroys whatever the automation had open).
+        policy_prefs.setdefault("browser.link.open_newwindow", 3)
         policy_prefs.setdefault("browser.link.open_newwindow.restriction", 0)
         policy_prefs.setdefault("dom.disable_window_move_resize", True)
         # Pin one geometry per launch instead of letting the fingerprint

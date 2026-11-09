@@ -94,6 +94,12 @@ pub const Instance = struct {
         try argv_list.append(allocator, "-no-remote");
         // KAHIN_HEADLESS=0 => visible window (stealth; some anti-bot layers
         // distrust the -headless flag). Unset/other => headless (default).
+        // `-silent` suppresses Firefox's own startup window. Without it every
+        // headed launch leaves a second, Juggler-unattached about:blank window
+        // that no tool can close (Firefox opens the initial window before
+        // final-ui-startup registers the target registry). Playwright passes
+        // the same flag for exactly this reason.
+        try argv_list.append(allocator, "-silent");
         if (headless) try argv_list.append(allocator, "-headless");
         inst.child = try pipe.spawn(allocator, argv_list.items);
         errdefer if (inst.child.pid > 0) inst.ensureStopped();

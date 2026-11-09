@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import importlib.util
 import json
 import logging
 import os
@@ -80,9 +79,6 @@ _READER_SHUTDOWN_TIMEOUT = 1.0
 # in tools/_common.py).
 _SIDECAR_SHUTDOWN_TIMEOUT = 6.0
 _SIDECAR_KILL_TIMEOUT = 2.0
-_CAMOUFOX_FETCH_TIMEOUT = 120.0
-_CAMOUFOX_PROBE_TIMEOUT = 10.0
-_CAMOUFOX_OUTPUT_LIMIT = 600
 _MIRAGE_PAGE_DOMAINS = frozenset({"Page", "Runtime", "Network", "Input", "Accessibility", "Heap"})
 
 # Faz 4 Task 3 — per-identity profile pre-warm. Camoufox's launch_options()
@@ -411,67 +407,6 @@ def _usable_camoufox_bin(path: Path) -> bool:
     return path.is_file() and (os.name == "nt" or os.access(path, os.X_OK))
 
 
-def _camoufox_package_roots() -> list[Path]:
-    try:
-        spec = importlib.util.find_spec("camoufox")
-    except (ImportError, ModuleNotFoundError, ValueError):
-        return []
-    if spec is None:
-        return []
-    roots = [Path(root) for root in (spec.submodule_search_locations or ())]
-    if spec.origin and spec.origin not in {"built-in", "frozen"}:
-        roots.append(Path(spec.origin).parent)
-    return list(dict.fromkeys(roots))
-
-
-def _camoufox_cli_commands(subcommand: str) -> list[list[str]]:
-    """Return official Camoufox CLI forms available in this environment."""
-    commands: list[list[str]] = []
-    if _camoufox_package_roots():
-        commands.append([sys.executable, "-m", "camoufox", subcommand])
-    cli = shutil.which("camoufox")
-    if cli:
-        commands.append([cli, subcommand])
-    return [list(command) for command in dict.fromkeys(tuple(command) for command in commands)]
-
-
-def _camoufox_package_candidates() -> list[Path]:
-    candidates: list[Path] = []
-    for root in _camoufox_package_roots():
-        for name in ("camoufox-bin", "camoufox", "camoufox.exe"):
-            direct = root / name
-            if _usable_camoufox_bin(direct):
-                candidates.append(direct)
-        try:
-            candidates.extend(
-                path for path in root.glob("**/camoufox-bin") if _usable_camoufox_bin(path)
-            )
-        except OSError:
-            continue
-    return list(dict.fromkeys(candidates))
-
-
-def _camoufox_cache_candidates() -> list[Path]:
-    roots: list[Path] = []
-    if os.environ.get("XDG_CACHE_HOME"):
-        roots.append(Path(os.environ["XDG_CACHE_HOME"]))
-    roots.append(Path.home() / ".cache")
-    if os.environ.get("LOCALAPPDATA"):
-        roots.append(Path(os.environ["LOCALAPPDATA"]))
-    roots.append(Path.home() / "Library" / "Caches")
-
-    candidates: list[Path] = []
-    for root in dict.fromkeys(roots):
-        official = root / "camoufox" / "browsers" / "official"
-        try:
-            candidates.extend(
-                path for path in official.glob("*/camoufox-bin") if _usable_camoufox_bin(path)
-            )
-        except OSError:
-            continue
-    return sorted(dict.fromkeys(candidates), key=lambda path: (path.parent.name, str(path)))
-
-
 def _installed_engine_candidates() -> list[Path]:
     """Kahin-managed Camoufox engines under ``$KAHIN_HOME/engines``.
 
@@ -513,78 +448,14 @@ def _camoufox_ff_version(binary: Path) -> str | None:
     return None
 
 
-def _camoufox_cli_path() -> Path | None:
-    """Ask the installed official CLI for its resolved executable path."""
-    for command in _camoufox_cli_commands("path"):
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=_CAMOUFOX_PROBE_TIMEOUT,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if result.returncode != 0:
-            continue
-        for line in reversed((result.stdout or "").splitlines()):
-            candidate = Path(line.strip().strip("\"'")).expanduser()
-            if _usable_camoufox_bin(candidate):
-                return candidate
-    return None
-
-
-def _run_camoufox_fetch() -> dict[str, Any]:
-    """Run the official fetch command once, with a hard wall-clock bound."""
-    commands = _camoufox_cli_commands("fetch")
-    if not commands:
-        raise _camoufox_readiness_error(
-            "python_package_missing",
-            detail="The Camoufox Python package/CLI is not installed in this interpreter.",
-        )
-
-    deadline = time.monotonic() + _CAMOUFOX_FETCH_TIMEOUT
-    attempts: list[dict[str, Any]] = []
-    for command in commands:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=remaining,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            attempts.append({"command": command, "status": "timeout"})
-            break
-        except OSError as exc:
-            attempts.append({"command": command, "status": "exec_error", "detail": str(exc)})
-            continue
-        if result.returncode == 0:
-            return {"command": command, "status": "ok"}
-        attempts.append({
-            "command": command,
-            "status": "failed",
-            "returncode": result.returncode,
-            "output": ((result.stderr or result.stdout or "").strip())[:_CAMOUFOX_OUTPUT_LIMIT],
-        })
-    raise _camoufox_readiness_error(
-        "fetch_failed",
-        detail="The official Camoufox fetch command did not complete successfully.",
-        timeoutSeconds=_CAMOUFOX_FETCH_TIMEOUT,
-        attempts=attempts,
-    )
-
-
 def _camoufox_bin() -> Path:
-    """Resolve a usable Camoufox binary, fetching it through the official CLI.
+    """Resolve the Camoufox binary to launch.
 
-    Resolution is deliberately confined to Camoufox's own package/CLI and
-    cache. It never installs or invokes another automation engine.
+    Only a Kahin-managed engine (``$KAHIN_HOME/engines``) or an explicit
+    ``KAHIN_CAMOUFOX_BIN`` is accepted. The Camoufox package cache holds a
+    different, unpatched build whose fingerprint and stealth behaviour differ;
+    falling back to it silently hid which binary actually ran, so that path is
+    gone and the operator must name a non-managed build explicitly.
     """
     env = os.environ.get("KAHIN_CAMOUFOX_BIN")
     if env:
@@ -601,30 +472,18 @@ def _camoufox_bin() -> Path:
     if installed:
         return installed[0]
 
-    package_bin = _camoufox_cli_path()
-    if package_bin is not None:
-        return package_bin
-    package_candidates = _camoufox_package_candidates()
-    if package_candidates:
-        return package_candidates[-1]
-    cache_candidates = _camoufox_cache_candidates()
-    if cache_candidates:
-        return cache_candidates[-1]
-
-    _run_camoufox_fetch()
-    package_bin = _camoufox_cli_path()
-    if package_bin is not None:
-        return package_bin
-    package_candidates = _camoufox_package_candidates()
-    if package_candidates:
-        return package_candidates[-1]
-    cache_candidates = _camoufox_cache_candidates()
-    if cache_candidates:
-        return cache_candidates[-1]
     raise _camoufox_readiness_error(
-        "fetch_succeeded_binary_missing",
-        detail="Camoufox fetch completed, but no executable was reported or found in its cache.",
-        cacheHints=["~/.cache/camoufox/browsers/official/*/camoufox-bin"],
+        "managed_engine_missing",
+        detail=(
+            "No Kahin-managed Camoufox engine under $KAHIN_HOME/engines. Refusing "
+            "to silently run an unpatched build from Camoufox's cache; install the "
+            "fork engine or set KAHIN_CAMOUFOX_BIN explicitly."
+        ),
+        enginesRoot=str(_kahin_home() / "engines"),
+        actions={
+            "install_engine": "point $KAHIN_HOME/engines/current at the patched build",
+            "explicit_binary": "KAHIN_CAMOUFOX_BIN=/absolute/path/to/camoufox-bin",
+        },
     )
 
 

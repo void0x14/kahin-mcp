@@ -79,6 +79,25 @@ _READER_SHUTDOWN_TIMEOUT = 1.0
 # in tools/_common.py).
 _SIDECAR_SHUTDOWN_TIMEOUT = 6.0
 _SIDECAR_KILL_TIMEOUT = 2.0
+# One fixed, centered window for every headed launch. Without an explicit size
+# Camoufox's fingerprint generator draws a new window.outerWidth/outerHeight on
+# every start and Firefox cascades each new page-window 40px down-right, so the
+# same script looked different on every run. Override with
+# KAHIN_WINDOW=1280x800; never fullscreen.
+_DEFAULT_WINDOW_SIZE = (1280, 800)
+
+
+def _window_size() -> tuple[int, int]:
+    raw = os.environ.get("KAHIN_WINDOW", "").strip().lower().replace(",", "x")
+    if raw:
+        try:
+            w, h = raw.split("x", 1)
+            width, height = int(w), int(h)
+            if width > 0 and height > 0:
+                return (width, height)
+        except (ValueError, TypeError):
+            logger.warning("ignoring malformed KAHIN_WINDOW=%r; using default", raw)
+    return _DEFAULT_WINDOW_SIZE
 _MIRAGE_PAGE_DOMAINS = frozenset({"Page", "Runtime", "Network", "Input", "Accessibility", "Heap"})
 
 # Faz 4 Task 3 — per-identity profile pre-warm. Camoufox's launch_options()
@@ -780,6 +799,19 @@ class Mirage(BrowserEngine):
             if key not in ("config", "firefox_user_prefs")
         }
         launch_kwargs["firefox_user_prefs"] = policy_prefs
+        # One window, one geometry, nothing moves. `window.open` popups and
+        # target=_blank links become tabs in the same window instead of new
+        # windows, and no page may resize or move the chrome window at all.
+        policy_prefs.setdefault("browser.link.open_newwindow", 1)
+        policy_prefs.setdefault("browser.link.open_newwindow.restriction", 0)
+        policy_prefs.setdefault("dom.disable_window_move_resize", True)
+        # Pin one geometry per launch instead of letting the fingerprint
+        # generator pick a random window each start. The Juggler side reads
+        # these prefs and centers the window on screen.
+        window_size = _window_size()
+        launch_kwargs.setdefault("window", window_size)
+        policy_prefs.setdefault("kahin.window.width", window_size[0])
+        policy_prefs.setdefault("kahin.window.height", window_size[1])
         launch_kwargs["executable_path"] = str(camoufox_bin)
         if ff_version:
             launch_kwargs["ff_version"] = ff_version

@@ -1,0 +1,261 @@
+--- /proc/self/fd/11	2026-11-09 19:19:49.559209803 +0300
++++ /proc/self/fd/12	2026-11-09 19:19:49.559209803 +0300
+@@ -33,6 +33,7 @@
+ const helper = new Helper();
+ 
+ const IDENTITY_NAME = 'JUGGLER ';
++try { Services.prefs.setBoolPref('kahin.patch.loaded', true); } catch (e) {}
+ const HUNDRED_YEARS = 60 * 60 * 24 * 365 * 100;
+ 
+ // Capture rate for the compositor-backed screencast. Playwright muxes at 25fps
+@@ -153,6 +154,24 @@
+     this._proxiesWithClashingAuthCacheKeys = new Set();
+     this._browserProxy = null;
+ 
++    // Kahin: chrome windows keyed by browserContextId (undefined = default).
++    // The kahin-juggler-tabs patch opens new pages as tabs in an existing
++    // window instead of spawning one window per page (Playwright's model
++    // spawns a window per page, which cascades every window 40px right/down
++    // and leaves an unattached stack of about:blank windows on screen).
++    this._contextWindows = new Map();
++    this._windowToContextKey = new Map();
++    // A Kahin-managed window opens at a fixed, centered geometry so every
++    // launch looks the same instead of inheriting Firefox's remembered
++    // cascade position.
++    // Prefs let the launcher pin one geometry (mirag.py writes them into
++    // user.js). Unset keeps the previous behaviour.
++    const managedWidth = Math.round(Number(Preferences.get('kahin.window.width', 0)) || 0);
++    const managedHeight = Math.round(Number(Preferences.get('kahin.window.height', 0)) || 0);
++    this._managedWindowSize = (managedWidth > 0 && managedHeight > 0)
++      ? {width: managedWidth, height: managedHeight}
++      : null;
++
+     // Cleanup containers from previous runs (if any)
+     for (const identity of ContextualIdentityService.getPublicIdentities()) {
+       if (identity.name && identity.name.startsWith(IDENTITY_NAME)) {
+@@ -209,6 +228,21 @@
+           target.dispose();
+     };
+ 
++    // Kahin: a window that just lost its last tab has nothing left to show.
++    // Leaving it open produced the empty windows that no tool could reach.
++    const onTabContainerClose = (appWindow, window, event) => {
++      onTabCloseListener(event);
++      try {
++        if (window.closed || window.gBrowser.tabs.length !== 0)
++          return;
++        if (window.gBrowser.browsers.length !== 0)
++          return;
++        window.close();
++      } catch (e) {
++        dump('kahin: closing emptied window failed: ' + e.message + '\n');
++      }
++    };
++
+     const domWindowTabListeners = new Map();
+ 
+     const onOpenWindow = async (appWindow) => {
+@@ -249,10 +283,73 @@
+       }
+       if (!domWindow.gBrowser)
+         return;
++      const contextKey = this._contextKeyForWindow(domWindow);
++      if (contextKey !== null) {
++        const primary = this._contextWindows.get(contextKey);
++        const primaryAlive = primary && primary !== domWindow && !primary.closed && primary.gBrowser;
++        if (primaryAlive) {
++          // Kahin: a second window for the same context is a popup that
++          // escaped the open-newwindow pref. Move its tabs into the one true
++          // window and close it, so nothing exists outside the fixed frame.
++          try {
++            const urls = [];
++            for (const tab of Array.from(domWindow.gBrowser.tabs)) {
++              try {
++                urls.push({
++                  url: tab.linkedBrowser.currentURI ? tab.linkedBrowser.currentURI.spec : 'about:blank',
++                  userContextId: tab.userContextId,
++                });
++              } catch (e) {}
++            }
++            for (const entry of urls) {
++              const moved = primary.gBrowser.addTab(entry.url, {
++                userContextId: entry.userContextId,
++                triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
++              });
++              primary.gBrowser.selectedTab = moved;
++            }
++            if (urls.length)
++              domWindow.close();
++            if (domWindow.closed)
++              return;
++          } catch (e) {
++            dump('kahin: popup window fold failed: ' + e.message + '\n');
++          }
++        } else {
++          this._contextWindows.set(contextKey, domWindow);
++          this._windowToContextKey.set(domWindow, contextKey);
++          if (this._managedWindowSize)
++            this._applyManagedWindowSize(domWindow);
++        }
++      }
+       const tabContainer = domWindow.gBrowser.tabContainer;
++      // Kahin: a popup that still lands in its own window is folded into the
++      // one true window as a tab, then its now-empty window is closed. This
++      // covers window.open() popups that Firefox routes around the
++      // open-newwindow pref.
++      const onTabOpen = (appWindow, targetWindow, event) => {
++        try {
++          const primary = targetWindow === domWindow ? null : this._contextWindows.get(this._contextKeyForWindow(targetWindow));
++          if (primary && primary !== targetWindow && primary.gBrowser) {
++            const tab = event.target;
++            const url = tab.linkedBrowser && tab.linkedBrowser.currentURI ? tab.linkedBrowser.currentURI.spec : 'about:blank';
++            const moved = primary.gBrowser.addTab(url, {
++              userContextId: tab.userContextId,
++              triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
++            });
++            primary.gBrowser.selectedTab = moved;
++            try { targetWindow.gBrowser.removeTab(tab); } catch (e) {}
++            try { if (targetWindow.gBrowser.tabs.length === 0) targetWindow.close(); } catch (e) {}
++            return;
++          }
++        } catch (e) {
++          dump('kahin: popup fold failed: ' + e.message + '\n');
++        }
++        onTabOpenListener(appWindow, targetWindow, event);
++      };
+       domWindowTabListeners.set(domWindow, [
+-        helper.addEventListener(tabContainer, 'TabOpen', event => onTabOpenListener(appWindow, domWindow, event)),
+-        helper.addEventListener(tabContainer, 'TabClose', onTabCloseListener),
++        helper.addEventListener(tabContainer, 'TabOpen', event => onTabOpen(appWindow, domWindow, event)),
++        helper.addEventListener(tabContainer, 'TabClose', event => onTabContainerClose(appWindow, domWindow, event)),
+       ]);
+       for (const tab of domWindow.gBrowser.tabs)
+         onTabOpenListener(appWindow, domWindow, { target: tab });
+@@ -267,6 +364,10 @@
+ 
+       const listeners = domWindowTabListeners.get(domWindow) || [];
+       domWindowTabListeners.delete(domWindow);
++      const closedKey = this._windowToContextKey.get(domWindow);
++      if (closedKey !== undefined && this._contextWindows.get(closedKey) === domWindow)
++        this._contextWindows.delete(closedKey);
++      this._windowToContextKey.delete(domWindow);
+       helper.removeListeners(listeners);
+       for (const tab of domWindow.gBrowser.tabs)
+         onTabCloseListener({ target: tab });
+@@ -337,6 +438,75 @@
+     return proxyInfo;
+   }
+ 
++  /// Kahin: browserContextId (undefined = default context) for a chrome window.
++  _contextKeyForWindow(domWindow) {
++    if (!domWindow || !domWindow.gBrowser || !domWindow.gBrowser.selectedTab)
++      return null;
++    const userContextId = domWindow.gBrowser.selectedTab.userContextId;
++    for (const [id, context] of this._browserContextIdToBrowserContext) {
++      if (context.userContextId === userContextId)
++        return id === undefined ? 'default' : id;
++    }
++    return userContextId === 0 ? 'default' : String(userContextId);
++  }
++
++  /// Kahin: fixed, screen-centered geometry for every Kahin-managed window.
++  _applyManagedWindowSize(domWindow) {
++    const size = this._managedWindowSize;
++    if (!size)
++      return;
++    try {
++      const screen = domWindow.screen || Services.appShell.hiddenDOMWindow.screen;
++      const left = Math.max(0, Math.round((screen.availWidth - size.width) / 2) + (screen.availLeft || 0));
++      const top = Math.max(0, Math.round((screen.availHeight - size.height) / 2) + (screen.availTop || 0));
++      domWindow.moveTo(left, top);
++      domWindow.resizeTo(size.width, size.height);
++      // A page or an extension may still move the window later (saved
++      // geometry, WM animation, a popup hint). Re-assert the pinned frame
++      // until the window goes away, so nothing drifts even by a pixel.
++      const locked = {left, top, width: size.width, height: size.height};
++      const pin = () => {
++        try {
++          if (domWindow.closed) return;
++          if (domWindow.screenX !== locked.left || domWindow.screenY !== locked.top ||
++              domWindow.outerWidth !== locked.width || domWindow.outerHeight !== locked.height)
++            domWindow.moveTo(locked.left, locked.top), domWindow.resizeTo(locked.width, locked.height);
++        } catch (e) {}
++      };
++      if (!domWindow.__kahinPinTimer) {
++        domWindow.__kahinPinTimer = domWindow.setInterval(pin, 500);
++        domWindow.addEventListener('unload', () => {
++          try { domWindow.clearInterval(domWindow.__kahinPinTimer); } catch (e) {}
++          domWindow.__kahinPinTimer = null;
++        }, {once: true});
++      }
++    } catch (e) {
++      // A window that refuses geometry must still work; layout falls back
++      // to Firefox's own placement rather than failing the page.
++      dump('kahin: managed window size failed: ' + e.message + '\n');
++    }
++  }
++
++  /// Kahin: open about:blank as a tab in the context's existing window.
++  /// Returns the chrome window when the tab could be added.
++  _reuseWindowForContext(browserContextId) {
++    // The sidecar sends `{}` for the default context, so the parameter
++    // arrives as undefined OR null; both mean "default context".
++    const key = (browserContextId === undefined || browserContextId === null)
++      ? 'default'
++      : browserContextId;
++    const win = this._contextWindows.get(key);
++    if (!win)
++      return null;
++    try {
++      if (!win.gBrowser || win.closed)
++        return null;
++      return win;
++    } catch (e) {
++      return null;
++    }
++  }
++
+   defaultContext() {
+     return this._defaultContext;
+   }
+@@ -393,11 +563,35 @@
+     args.appendElement(undefined); // 7
+     args.appendElement(Services.scriptSecurityManager.getSystemPrincipal()); // 8
+ 
+-    const window = Services.ww.openWindow(null, AppConstants.BROWSER_CHROME_URL, '_blank', features, args);
+-    await waitForWindowReady(window);
+-    if (window.gBrowser.browsers.length !== 1)
+-      throw new Error(`Unexpected number of tabs in the new window: ${window.gBrowser.browsers.length}`);
+-    const browser = window.gBrowser.browsers[0];
++    // Kahin: reuse the context's window and add a tab. Opening one window per
++    // page is what cascaded windows across the screen and left unattachable
++    // about:blank windows behind; a tab keeps one window and closes it with
++    // its last tab.
++    let window = this._reuseWindowForContext(browserContextId);
++    let browser;
++    if (window) {
++      const tab = window.gBrowser.addTab('about:blank', {
++        userContextId: browserContext.userContextId,
++        triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
++      });
++      window.gBrowser.selectedTab = tab;
++      browser = tab.linkedBrowser;
++    } else {
++      window = Services.ww.openWindow(null, AppConstants.BROWSER_CHROME_URL, '_blank', features, args);
++      await waitForWindowReady(window);
++      // Kahin: the first window is the one true frame. Record it before any
++      // tab can open so a popup arriving mid-startup lands in it instead of
++      // spawning a second window at a different position.
++      const firstKey = this._contextKeyForWindow(window);
++      if (firstKey !== null) {
++        this._contextWindows.set(firstKey, window);
++        this._windowToContextKey.set(window, firstKey);
++      }
++      if (window.gBrowser.browsers.length !== 1)
++        throw new Error(`Unexpected number of tabs in the new window: ${window.gBrowser.browsers.length}`);
++      browser = window.gBrowser.browsers[0];
++      this._applyManagedWindowSize(window);
++    }
+     let target = this._browserToTarget.get(browser);
+     while (!target) {
+       await helper.awaitEvent(this, TargetRegistry.Events.TargetCreated);

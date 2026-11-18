@@ -19,6 +19,7 @@
 'use strict';
 
 var __ka_events = [];
+var __ka_timer_labels = [];
 var __ka_wlog = [];
 var __ka_cookies = {};
 var __ka_timers = [];
@@ -37,7 +38,7 @@ var noop = function () {};
 
 function __ka_note(kind, detail) {
   __ka_events.push(kind + (detail ? ': ' + detail : ''));
-  if (__ka_events.length > 400) __ka_events.shift();
+  if (__ka_events.length > 4000) __ka_events.shift();
 }
 
 function __ka_wlog_push(line) {
@@ -45,12 +46,62 @@ function __ka_wlog_push(line) {
   if (__ka_wlog.length > 400) __ka_wlog.shift();
 }
 
+/* An error inside a bundle is only useful with the offending source. The
+ * bundle that was running is known (`__ka_last_code`), so the position is
+ * resolved here and the surrounding source is reported. */
+function __ka_report_error(e, where) {
+  var stack = e && e.stack ? String(e.stack) : '';
+  var pos = stack.match(/<input>:(\d+):(\d+)/) || stack.match(/<anonymous>:(\d+):(\d+)/);
+  var detail = (e && e.name ? e.name + ': ' + e.message : String(e));
+  if (pos) {
+    var line = parseInt(pos[1], 10) - (__ka_global.__ka_line_offset || 0);
+    var col = parseInt(pos[2], 10);
+    __ka_note('err-pos', 'rawLine=' + pos[1] + ' col=' + col + ' bodyLen=' + (__ka_global.__ka_body_len||0) + ' bundleLen=' + (__ka_global.__ka_bundle_len||0));
+    /* The wrapper's own text sits in front of the bundle, so the reported
+     * column counts it too. */
+    var bodyLen = __ka_global.__ka_body_len || 0;
+    var all = (__ka_global.__ka_last_code || '').split('\n');
+    if (col > bodyLen + 2 && bodyLen > 0 && pos[1] === '2') {
+      col -= bodyLen + 1;
+    }
+    if (col > all.join('').length) {
+      /* The position is past the current bundle: the code is in a script
+       * that was evaluated inside another realm (an iframe). */
+      all = (__ka_global.__ka_iframe_code || '').split('\n');
+      if (!all.length || all.length === 1) all = (__ka_global.__ka_last_code || '').split('\n');
+    }
+    /* The bundle is one long line; the reported column is into that line. */
+    var src = '';
+    for (var li = 0; li < all.length; li++) {
+      if (col <= all[li].length && col > 0) { src = all[li]; break; }
+      col -= all[li].length + 1;
+    }
+    detail += ' | ' + __ka_global.__ka_last_script + ' rawLine=' + pos[1] + ' off=' + (__ka_global.__ka_line_offset || 0) + ' line=' + line + ' col=' + col +
+      ' :: ' + src.slice(Math.max(0, col - 200), col + 120);
+    __ka_global.__ka_fail = {
+      where: where,
+      source: src,
+      code: __ka_global.__ka_last_code || '',
+      len: (__ka_global.__ka_last_code || '').length
+  }
+  }
+  __ka_note(where + '-error', detail);
+}
+
 /* Every global read is recorded: the challenge reads the window hundreds of
  * times and the log shows where it stops. */
-var __ka_probe = new Proxy(globalThis, {
+/* The global object. In a script's global scope `this` is the global
+ * object; `globalThis` is not available in every engine the host runs on,
+ * so the shim takes the global from `this` and keeps a reference. */
+var __ka_global = (typeof __KA_GLOBAL === 'object' && __KA_GLOBAL)
+  ? __KA_GLOBAL
+  : ((typeof globalThis === 'object' && globalThis) ? globalThis : this);
+/* The widget's site key, when the host knows it. */
+__ka_global.__ka_real_sitekey = (typeof __KA_SITEKEY === 'string') ? __KA_SITEKEY : '';
+
+var __ka_probe = new Proxy(__ka_global, {
   get: function (target, key) {
     if (key === '__ka_probe' || key === '__ka_wlog' || key === '__ka_events') return target[key];
-    __ka_wlog_push('g:' + String(key));
     var value = target[key];
     if (value === undefined && typeof key === 'string' && key.charAt(0) !== '_') {
       __ka_wlog_push('g-missing:' + key);
@@ -271,6 +322,7 @@ TextDecoder.prototype.decode = function (bytes) {
 var __ka_parsed = __ka_parse_url(__ka_url);
 var location = {
   _href: __ka_url,
+  _hostname: __ka_parsed.hostname,
   protocol: __ka_parsed.protocol,
   host: __ka_parsed.host,
   hostname: __ka_parsed.hostname,
@@ -282,7 +334,44 @@ var location = {
   ancestorOrigins: { length: 0 },
   assign: function (u) { this.href = String(u); },
   replace: function (u) { this.href = String(u); },
-  reload: noop,
+  /* A reload re-requests the page. The challenge ends with a reload: that
+   * request is where the server hands out the cf_clearance cookie, so the
+   * shim has to perform it instead of dropping it. */
+  reload: function () {
+    /* A reload re-requests the page. Cloudflare's challenge ends with a
+     * reload: that request is where the server hands out the clearance
+     * cookie — or a fresh interstitial that has to run again. The shim
+     * therefore performs the request and feeds the new markup back into
+     * the DOM, exactly like a browser would. */
+    __ka_note('reload', location._href);
+    __ka_note('reload-stack', (new Error().stack || '').split('\n').slice(1, 6).join(' | '));
+    var url = location._href;
+    var headers = 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n';
+    var res = __ka_http('GET', url, headers, '');
+    if (!res) { __ka_note('reload-failed', 'no response'); return; }
+    __ka_note('reload-done', String(res.status));
+    if (res.status !== 200) return;
+    var body = String(res.body || '');
+    /* The clearance arrives as a Set-Cookie header; the driver already put
+     * it in the session, the page sees it through document.cookie. */
+    try {
+      var setCookie = res.headers && (res.headers['set-cookie'] || res.headers['Set-Cookie']);
+      if (setCookie) __ka_apply_set_cookie(String(setCookie));
+    } catch (e) {}
+    if (body.indexOf('_cf_chl_opt') < 0) {
+      /* The real page: the challenge is over. */
+      __ka_note('reload-clear', 'body has no challenge');
+      return;
+    }
+    /* A fresh interstitial: run it again. */
+    __ka_note('reload-challenge', 're-running the challenge');
+    try {
+      document.body.innerHTML = '';
+      __ka_parse_html(body);
+    } catch (e) {
+      __ka_note('reload-error', String(e));
+    }
+  },
   toString: function () { return this._href; }
 };
 /* document.location and window.location are the SAME object in a browser.
@@ -303,11 +392,17 @@ function __ka_navigate(target) {
   var next = __ka_absolute(target, location._href);
   var parsed = __ka_parse_url(next);
   location._href = next;
+  location._hostname = parsed.hostname;
+  location.protocol = parsed.protocol;
+  location.host = parsed.host;
+  location.port = parsed.port;
   location.pathname = parsed.pathname;
   location.search = parsed.search;
   location.hash = parsed.hash;
+  location.origin = parsed.origin;
   document.URL = next;
   document.documentURI = next;
+  document.location = location;
   __ka_note('navigate', next);
 }
 
@@ -423,16 +518,31 @@ var crypto = (function () {
 /* ---------------------------------------------------------------- timers */
 
 function setTimeout(fn, delay) {
+  __ka_note('setTimeout', 'delay=' + String(delay) + ' fn=' + String(fn).slice(0, 40));
+  if (typeof fn === 'string') {
+    __ka_note('setTimeout-string', 'delay=' + String(delay) + ' code=' + fn.slice(0, 120));
+  }
   var args = Array.prototype.slice.call(arguments, 2);
+  var __ka_label = String(fn).replace(/\s+/g, ' ').slice(0, 70);
   __ka_timers.push(function () {
-    try { fn.apply(null, args); } catch (e) { __ka_note('timer-error', (e && e.name ? e.name + ': ' + e.message : String(e)) + ' | ' + (e && e.stack ? String(e.stack).split('\n').slice(0, 3).join(' <> ') : '')); }
+    try {
+      fn.apply(null, args);
+    } catch (e) {
+      __ka_report_error(e, 'timer');
+    }
   });
+  __ka_timer_labels.push(__ka_label);
   return __ka_timers.length;
+}
+
+/* The host reports which timer it ran, so a stalled challenge can be located. */
+function __ka_timer_label(fn) {
+  try { return String(fn).slice(0, 70); } catch (e) { return '?'; }
 }
 function setInterval(fn, delay) {
   var args = Array.prototype.slice.call(arguments, 2);
   __ka_timers.push(function () {
-    try { fn.apply(null, args); } catch (e) { __ka_note('timer-error', (e && e.name ? e.name + ': ' + e.message : String(e)) + ' | ' + (e && e.stack ? e.stack : '')); }
+    try { fn.apply(null, args); } catch (e) { __ka_report_error(e, 'interval'); }
   });
   return __ka_timers.length;
 }
@@ -605,7 +715,7 @@ function dispatchEvent(ev) {
   for (var i = 0; i < list.length; i++) {
     try { list[i](ev); } catch (e) { __ka_note('listener-error', String(e)); }
   }
-  var handler = globalThis['on' + ev.type] || __ka_probe['on' + ev.type];
+  var handler = __ka_global['on' + ev.type] || __ka_probe['on' + ev.type];
   if (typeof handler === 'function') {
     try { handler(ev); } catch (e) { __ka_note('handler-error', String(e)); }
   }
@@ -676,10 +786,71 @@ function Element(tag) {
 }
 Element.prototype = Object.create(EventTarget.prototype);
 
+/* innerHTML is a real parser in a browser: assigning markup builds the DOM
+ * and the scripts inside it run. The Turnstile widget creates its frame
+ * exactly this way, so the shim parses the markup too. */
+Object.defineProperty(Element.prototype, 'innerHTML', {
+  configurable: true,
+  get: function () {
+    var out = '';
+    for (var i = 0; i < this.childNodes.length; i++) {
+      out += __ka_serialize(this.childNodes[i]);
+    }
+    return out;
+  },
+  set: function (html) {
+    this.childNodes = [];
+    this.children = [];
+    this.__ka_markup = String(html);
+    var __ka_m = String(html);
+    if (__ka_m.length < 400 && __ka_m.indexOf('<') >= 0) {
+      __ka_note('innerHTML-set', this.tagName + ' :: ' + __ka_m.replace(/\s+/g, ' ').slice(0, 200));
+    }
+    __ka_parse_into(this, String(html));
+  }
+});
+
+function __ka_serialize(node) {
+  if (!node) return '';
+  if (node.nodeType === 3) return String(node.textContent || '');
+  if (node.nodeType !== 1) return '';
+  var tag = node.tagName.toLowerCase();
+  var attrs = '';
+  for (var k in node.attributes) {
+    if (Object.prototype.hasOwnProperty.call(node.attributes, k)) {
+      attrs += ' ' + k + '="' + String(node.attributes[k]).replace(/"/g, '&quot;') + '"';
+    }
+  }
+  var inner = '';
+  for (var i = 0; i < node.childNodes.length; i++) {
+    inner += __ka_serialize(node.childNodes[i]);
+  }
+  if (inner === '' && !node.__ka_void) return '<' + tag + attrs + '></' + tag + '>';
+  return '<' + tag + attrs + '>' + inner + '</' + tag + '>';
+}
+
 Element.prototype.setAttribute = function (k, v) {
   this.attributes[k] = String(v);
+  if (this.tagName === 'INPUT' || this.tagName === 'BUTTON') {
+    __ka_note('button-attr', this.tagName + ' ' + k + '=' + String(v).slice(0, 40));
+  }
   if (k === 'class') this.className = String(v);
   if (k === 'id') { this.id = String(v); __ka_elements[String(v)] = this; }
+  if (k === 'src' && this.tagName === 'IFRAME') {
+    /* An iframe's src property has to follow the attribute, and the frame
+     * loads from it. */
+    this.src = String(v);
+  }
+  if (k === 'id') {
+  }
+  if (k === 'src' && this.tagName === 'IFRAME') {
+    __ka_note('iframe-src-attr', String(v).slice(0, 120));
+    if (this.__ka_load_frame_now) this.__ka_load_frame_now(String(v));
+  }
+  if (k === 'src' && this.tagName === 'IFRAME' && this.__ka_load_frame_now) {
+    /* The frame's document comes from its src. */
+    this.__ka_load_frame_now(String(v));
+  }
   if (k === 'src' && this.tagName === 'SCRIPT') {
     /* The property has to follow the attribute, like in a browser, and the
      * load starts once the script is in the document. */
@@ -719,12 +890,23 @@ Element.prototype.getElementsByClassName = function () { return []; };
 Element.prototype.querySelector = function () { return null; };
 Element.prototype.querySelectorAll = function () { return []; };
 Element.prototype.getBoundingClientRect = function () {
-  return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 };
+  /* The widget measures its container to size the frame; a zero-sized box
+   * makes the widget refuse to render. */
+  var w = Number(this.__ka_width) || 300;
+  var h = Number(this.__ka_height) || 65;
+  return {
+    top: 0, left: 0, right: w, bottom: h, width: w, height: h,
+    x: 0, y: 0,
+    toJSON: function () { return this; }
+  };
 };
 Element.prototype.getClientRects = function () { return []; };
 Element.prototype.focus = noop;
 Element.prototype.blur = noop;
-Element.prototype.click = function () { this.dispatchEvent(new MouseEvent('click')); };
+Element.prototype.click = function () {
+  __ka_note('element-click', (this.tagName || '?') + '#' + (this.id || '') + '.' + (this.className || ''));
+  this.dispatchEvent(new MouseEvent('click'));
+};
 Element.prototype.getContext = function () { return __ka_canvas_context(); };
 Element.prototype.toDataURL = function () { return 'data:image/png;base64,iVBORw0KGgo='; };
 Element.prototype.attachShadow = function () { return __ka_shadow_root(); };
@@ -866,7 +1048,10 @@ document.createRange = function () {
   };
 };
 document.getElementById = function (id) {
-  return __ka_elements[String(id)] || null;
+  var key = String(id);
+  var hit = __ka_elements[key] || null;
+  if (!hit) __ka_note('getElementById-miss', key);
+  return hit;
 };
 document.getElementsByTagName = function (tag) {
   var t = String(tag).toLowerCase();
@@ -891,6 +1076,7 @@ document.querySelector = function (sel) {
   for (var i = 0; i < __ka_all.length; i++) {
     if (__ka_matches(__ka_all[i], sel)) return __ka_all[i];
   }
+  __ka_note('querySelector-miss', String(sel));
   return null;
 };
 document.querySelectorAll = function (sel) {
@@ -920,7 +1106,10 @@ document.createTreeWalker = function () {
 
 Object.defineProperty(document, 'cookie', {
   configurable: true,
-  get: function () { return __ka_cookie_string(); },
+  get: function () {
+    var v = __ka_cookie_string();
+    return v;
+  },
   set: function (v) {
     var s = String(v);
     var first = s.split(';')[0];
@@ -969,7 +1158,7 @@ function __ka_matches(el, sel) {
  * page's global object — like a <script> tag in a browser. The wrapper
  * passes the page's globals in, so the bundle sees window/self/top as the
  * page's global object. */
-function __ka_script_scope(code) {
+function __ka_script_scope(code, source, frameDoc) {
   var names = ['window', 'self', 'top', 'parent', 'document', 'navigator',
     'location', 'screen', 'history', 'performance', 'crypto', 'console',
     'localStorage', 'sessionStorage', 'globalThis'];
@@ -977,25 +1166,66 @@ function __ka_script_scope(code) {
   var body = names.map(function (n) {
     return 'var ' + n + ' = __ka_g_' + n + ';';
   }).join('');
+  __ka_global.__ka_line_offset = body.split('\n').length;
+  __ka_global.__ka_body_len = body.length;
+  __ka_global.__ka_bundle_len = code.length;
+  __ka_global.__ka_last_code = code;
+  __ka_global.__ka_all_bundles = __ka_global.__ka_all_bundles || [];
+  __ka_global.__ka_all_bundles.push({ len: code.length, src: String(source).slice(0, 90) });
+
+  __ka_global.__ka_last_script = source;
   /* eslint-disable no-new-func */
   var fn = new Function(params, body + '\n' + code);
-  return fn.apply(null, names.map(function (n) {
+
+  var result = fn.apply(null, names.map(function (n) {
     if (n === 'window' || n === 'self' || n === 'top' || n === 'parent' || n === 'globalThis') return __ka_probe;
-    return globalThis[n];
+    /* A script inside a frame sees the frame's own document. */
+    if (n === 'document' && frameDoc) return frameDoc;
+    if (n === 'document') {
+      __ka_note('global-doc', 'docEl=' + (__ka_global['document'] && __ka_global['document']['documentElement'] ?
+        __ka_global['document']['documentElement'].tagName : 'null') +
+        ' isFrame=' + (n === 'document' && !!frameDoc));
+    }
+    return __ka_global[n];
   }));
+  __ka_turnstile_wrap();
+  return result;
 }
 
-function __ka_eval_global(code, source, element) {
+function __ka_eval_global(code, source, element, frameDoc) {
+/* The challenge's PoW runs in the page. Its state machine is driven by the
+ * bundle's own timers, so the host has to give the page a real clock. */
   var previous = document.currentScript;
   if (element) {
     try { document.currentScript = element; } catch (e) {}
   }
   try {
-    __ka_script_scope(code);
+    /* The challenge keeps its state in window._cf_chl_opt. The object is
+     * wrapped so the arrays it collects into stay observable, without the
+     * shim having to know the per-challenge hash keys. */
+    if (!__ka_global.__ka_opt_wrapped) {
+      __ka_global.__ka_opt_wrapped = true;
+      var __ka_wrap = function () {
+        var o = __ka_global._cf_chl_opt;
+        if (!o || o.__ka_wrapped) return;
+        var proxy = new Proxy(o, {
+          get: function (t, k, r) {
+            return Reflect.get(t, k, r);
+          }
+        });
+        try {
+          proxy.__ka_is_proxy = true;
+          __ka_global._cf_chl_opt = proxy;
+        } catch (e) {}
+      };
+      __ka_global.__ka_wrap_opt = __ka_wrap;
+    }
+    if (__ka_global.__ka_wrap_opt) __ka_global.__ka_wrap_opt();
+    __ka_script_scope(code, source, frameDoc);
+    if (__ka_global.__ka_wrap_opt) __ka_global.__ka_wrap_opt();
     return true;
   } catch (e) {
-    __ka_note('script-error', source + ': ' + (e && e.name ? e.name + ': ' + e.message : String(e)) +
-      ' | ' + (e && e.stack ? String(e.stack).split('\n').slice(0, 3).join(' <> ') : ''));
+    __ka_report_error(e, 'script');
     return false;
   } finally {
     try { document.currentScript = previous; } catch (e) {}
@@ -1005,6 +1235,37 @@ function __ka_eval_global(code, source, element) {
 function __ka_load_script(src, element) {
   var url = __ka_absolute(src, location._href);
   __ka_note('script-load', url);
+  /* The api.js URL carries the widget's site key: /turnstile/v0/g/<key>/... */
+  /* The api.js URL carries the widget's short key; the full site key is in
+   * the challenge's own state and is what the widget frame needs. */
+  var __ka_sk = url && url.match(/\/turnstile\/v0\/[^/]+\/([^/]+)/);
+  if (__ka_sk) {
+    /* The bundle builds the full key as <prefix> + 0x<suffix>; the prefix is
+     * a placeholder, so the key in the URL is the whole key. */
+    __ka_global.__ka_sitekey = '0x' + __ka_sk[1];
+  }
+  /* The widget's own bundle carries the key the frame is addressed with. The
+   * key is handed over when the widget's script is fetched, so it is read
+   * from that response. */
+  try {
+    var __ka_probe_body = res && res.body ? String(res.body) : '';
+    var __ka_hit = __ka_probe_body.match(/0x4[A-Za-z0-9]{10,24}/);
+    if (__ka_hit) __ka_global.__ka_real_sitekey = __ka_hit[0];
+  } catch (e) {}
+  /* The widget's full site key: the challenge state holds its prefix and
+   * the api.js URL its suffix. Together they form the key the widget frame
+   * is addressed with. */
+  var __ka_full = __ka_global.__ka_full_sitekey;
+  if (!__ka_full && __ka_global._cf_chl_opt) {
+    for (var __ka_k in __ka_global._cf_chl_opt) {
+      var __ka_v = __ka_global._cf_chl_opt[__ka_k];
+      if (typeof __ka_v === 'string' && __ka_v.indexOf('0x4AAAA') >= 0) {
+        __ka_full = __ka_v;
+        break;
+      }
+    }
+  }
+  if (__ka_full) __ka_global.__ka_full_sitekey = __ka_full;
   var __ka_started = performance.now();
   var headers = 'Accept: */*\r\n';
   var res = __ka_http('GET', url, headers, '');
@@ -1017,6 +1278,55 @@ function __ka_load_script(src, element) {
     return;
   }
   var ok = __ka_eval_global(res.body, url, element);
+  /* The bundle registers the onload callback the api.js will call. The
+   * callback is wrapped so its failures are visible. */
+  var __ka_m = url && url.match(/onload=([A-Za-z0-9_]+)/);
+  if (__ka_m) {
+    var __ka_name = __ka_m[1];
+    var __ka_cb = globalThis[__ka_name];
+    if (typeof __ka_cb === 'function' && !__ka_cb.__ka_wrapped) {
+      var __ka_wrapped = function () {
+        __ka_note('onload-called', __ka_name);
+        /* The api.js is loaded with render=explicit, so the widget is
+         * created by the challenge itself. When the challenge's callback
+         * did not create it, the shim renders it with the challenge's
+         * own site key — that is what a browser does for the implicit
+         * case, and the widget then talks to Cloudflare itself. */
+        try {
+          if (__ka_global.turnstile &&
+              typeof __ka_global.turnstile.render === 'function' &&
+              !__ka_global.__ka_widget_rendered) {
+            __ka_global.__ka_widget_rendered = true;
+            __ka_note('ts-implicit-render', String(__ka_global.__ka_sitekey));
+            __ka_global.turnstile.render('.main-content', {
+              sitekey: __ka_global.__ka_real_sitekey || __ka_global.__ka_sitekey || ''
+            });
+          }
+        } catch (e) {
+          __ka_report_error(e, 'ts-implicit-render');
+        }
+        __ka_note('ts-onload-reached', 'turnstile=' + typeof __ka_global.turnstile +
+          ' cbSrc=' + String(__ka_cb).replace(/\s+/g, ' ').slice(0, 200));
+        try {
+          __ka_note('onload-state', 'turn=' + typeof __ka_global.turnstile + ' render=' + (__ka_global.turnstile ? typeof __ka_global.turnstile.render : 'n/a') + ' kids=' + (document.body ? document.body.childNodes.length : -1));
+        } catch (e) {
+          __ka_report_error(e, 'onload');
+          throw e;
+        } finally {
+          __ka_note('onload-done', __ka_name);
+        }
+          __ka_note('onload-state', 'turn=' + typeof __ka_global.turnstile + ' render=' + (__ka_global.turnstile ? typeof __ka_global.turnstile.render : 'n/a') + ' kids=' + (document.body ? document.body.childNodes.length : -1));
+      };
+      __ka_wrapped.__ka_wrapped = true;
+      globalThis[__ka_name] = __ka_wrapped;
+    }
+  }
+  if (!ok) {
+    try {
+      __ka_http('POST', 'kahin://dump-' + (url.split('/').pop() || 'script').replace(/[^a-zA-Z0-9.-]/g, '_'),
+        'Content-Type: text/plain\r\n', res.body);
+    } catch (e) {}
+  }
   if (element) {
     if (ok && typeof element.onload === 'function') {
       try { element.onload(new Event('load')); } catch (e) {}
@@ -1046,6 +1356,142 @@ function __ka_load_srcdoc(html, element) {
 /* A sandboxed iframe gets its own realm in a browser. Kahin runs it in the
  * same realm but with its own document/window pair, which is what the
  * challenge actually uses it for: a clean document to write into. */
+/* An iframe's document: fetched from its src, parsed, and its scripts
+ * evaluated in the frame's own realm. The Turnstile widget lives here. */
+function __ka_load_frame(src, element) {
+  var url = __ka_absolute(src, location._href);
+  __ka_note('frame-load', url);
+  var res = __ka_http('GET', url, 'Accept: text/html\r\n', '');
+  if (!res || res.status !== 200) {
+    __ka_note('frame-failed', url + ' status=' + (res ? res.status : 'none'));
+    return;
+  }
+  __ka_global.__ka_iframe_code = res.body;
+  /* The frame's document is built from the frame's markup first: the frame's
+   * scripts look their elements up in it while they run. */
+  __ka_frame_root = new Element('html');
+  __ka_frame_root.__ka_parts = {};
+  __ka_parse_into(__ka_frame_root, res.body);
+  /* The frame's scripts run in the frame's realm. A script with a src is
+   * fetched first, exactly like a browser does when it parses the frame. */
+  var fre = /<script([^>]*)>([\s\S]*?)<\/script>/gi;
+  var fm;
+  while ((fm = fre.exec(res.body)) !== null) {
+    var __ka_attrs = fm[1] || '';
+    var __ka_src = /\ssrc=["']([^"']+)["']/i.exec(__ka_attrs);
+    if (__ka_src) {
+      var __ka_surl = __ka_absolute(__ka_src[1], url);
+      __ka_note('frame-script-load', __ka_surl);
+      var __ka_sres = __ka_http('GET', __ka_surl, 'Accept: */*\r\n', '');
+      if (__ka_sres && __ka_sres.status === 200) {
+        __ka_eval_global(__ka_sres.body, __ka_surl, null, __ka_frame_document());
+      }
+      continue;
+    }
+    if (fm[2] && fm[2].trim()) {
+      __ka_eval_global(fm[2], 'frame-inline', null, __ka_frame_document());
+    }
+  }
+  var frame = element.__ka_frame;
+  if (frame) {
+    try { frame.document.documentElement.innerHTML = ''; } catch (e) {}
+  }
+}
+
+/* The frame's document tree. The widget builds its UI inside the frame and
+ * then finds the pieces again by id and by selector. */
+var __ka_frame_root = null;
+var __ka_frame_doc = null;
+
+function __ka_frame_collect(root, out) {
+  out = out || [];
+  /* The frame's head and body are held beside the root. */
+  if (root.__ka_parts) {
+    for (var __ka_p in root.__ka_parts) {
+      if (Object.prototype.hasOwnProperty.call(root.__ka_parts, __ka_p)) {
+        var __ka_part = root.__ka_parts[__ka_p];
+        out.push(__ka_part);
+        __ka_frame_collect(__ka_part, out);
+      }
+    }
+  }
+  for (var i = 0; i < root.childNodes.length; i++) {
+    var c = root.childNodes[i];
+    if (!c) continue;
+    if (c.nodeType === 1) {
+      out.push(c);
+      __ka_frame_collect(c, out);
+    }
+  }
+  return out;
+}
+
+function __ka_frame_find(id) {
+  var key = String(id);
+  if (__ka_frame_root) {
+    var all = __ka_frame_collect(__ka_frame_root);
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].id === key) return all[i];
+    }
+  }
+  /* The frame's elements are also in the shared id table when the frame was
+   * parsed with the page's own factory. */
+  return __ka_elements[key] || null;
+}
+
+function __ka_frame_find_all(kind, value) {
+  var out = [];
+  if (!__ka_frame_root) return out;
+  var all = __ka_frame_collect(__ka_frame_root);
+  var want = String(value).toLowerCase();
+  for (var i = 0; i < all.length; i++) {
+    var e = all[i];
+    if (kind === 'tag') {
+      if (String(e.tagName || '').toLowerCase() === want) out.push(e);
+    } else if (String(e.className || '').split(/\s+/).indexOf(want) >= 0) {
+      out.push(e);
+    }
+  }
+  return out;
+}
+
+function __ka_frame_query(sel) {
+  if (!__ka_frame_root) return null;
+  var all = __ka_frame_collect(__ka_frame_root);
+  for (var i = 0; i < all.length; i++) {
+    if (__ka_matches(all[i], String(sel || ''))) return all[i];
+  }
+  return null;
+}
+
+function __ka_frame_query_all(sel) {
+  var out = [];
+  if (!__ka_frame_root) return out;
+  var all = __ka_frame_collect(__ka_frame_root);
+  for (var i = 0; i < all.length; i++) {
+    if (__ka_matches(all[i], String(sel || ''))) out.push(all[i]);
+  }
+  return out;
+}
+
+/* The document the frame's own scripts see. The frame's markup is parsed
+ * into it, so the scripts find the pieces they build. */
+function __ka_frame_document() {
+  if (!__ka_frame_doc) {
+    __ka_frame_doc = __ka_frame_window().document;
+    __ka_note('frame-doc-make', 'root=' + (__ka_frame_root ? __ka_frame_root.tagName : 'NULL') +
+      ' parts=' + (__ka_frame_root && __ka_frame_root.__ka_parts ? Object.keys(__ka_frame_root.__ka_parts).join(',') : 'none'));
+  }
+  if (__ka_frame_root) {
+    var __ka_parts = __ka_frame_root.__ka_parts || {};
+    __ka_frame_doc.__ka_parts = __ka_parts;
+    __ka_frame_doc.body = __ka_parts.body || __ka_frame_root;
+    __ka_frame_doc.head = __ka_parts.head || new Element('head');
+    __ka_frame_doc.documentElement = __ka_frame_root;
+  }
+  return __ka_frame_doc;
+}
+
 function __ka_frame_window() {
   var frameDoc = {
     nodeType: 9, readyState: 'complete', URL: 'about:blank', domain: '',
@@ -1064,11 +1510,14 @@ function __ka_frame_window() {
     open: noop, close: noop,
     createElement: function (tag) { return document.createElement(tag); },
     createTextNode: function (t) { return document.createTextNode(t); },
-    getElementById: function () { return null; },
-    getElementsByTagName: function () { return []; },
-    getElementsByClassName: function () { return []; },
-    querySelector: function () { return null; },
-    querySelectorAll: function () { return []; },
+    /* The frame has its own document: the widget's scripts look up their
+     * elements by id and by selector, so the frame's document answers from
+     * the frame's own tree. */
+    getElementById: function (id) { return __ka_frame_find(id); },
+    getElementsByTagName: function (tag) { return __ka_frame_find_all('tag', tag); },
+    getElementsByClassName: function (cls) { return __ka_frame_find_all('class', cls); },
+    querySelector: function (sel) { return __ka_frame_query(sel); },
+    querySelectorAll: function (sel) { return __ka_frame_query_all(sel); },
     addEventListener: noop, removeEventListener: noop, dispatchEvent: noop,
     body: new Element('body'), head: new Element('head'), documentElement: new Element('html'),
     forms: [], scripts: [], images: [], links: [],
@@ -1110,6 +1559,7 @@ function __ka_frame_window() {
 document.createElementNS = function (ns, tag) { return document.createElement(tag); };
 
 document.createElement = function (tag) {
+  var __ka_tag = String(tag).toLowerCase();
   var t = String(tag || 'div').toLowerCase();
   var node = new Element(t);
   node.ownerDocument = document;
@@ -1135,11 +1585,24 @@ document.createElement = function (tag) {
     };
   } else if (t === 'iframe') {
     var iframeSrc = '';
+    /* setAttribute('src') on a raw element must still start the load. */
+    node.__ka_load_frame_now = function (url) {
+      iframeSrc = String(url);
+      if (node.parentNode) __ka_load_frame(iframeSrc, node);
+      else node.__ka_pending_frame = iframeSrc;
+    };
     Object.defineProperty(node, 'src', {
       configurable: true,
       get: function () { return iframeSrc; },
       set: function (v) {
         iframeSrc = String(v);
+        /* An iframe loads its document from src. The Turnstile widget's
+         * frame carries the challenge's own script, so it has to be
+         * fetched and evaluated. */
+        if (iframeSrc) {
+          if (node.parentNode) __ka_load_frame(iframeSrc, node);
+          else node.__ka_pending_frame = iframeSrc;
+        }
       }
     });
     var frameWin = null;
@@ -1161,6 +1624,10 @@ document.createElement = function (tag) {
     });
     node.__ka_on_append = function () {
       __ka_note('iframe', iframeSrc);
+      if (node.__ka_pending_frame) {
+        __ka_load_frame(node.__ka_pending_frame, node);
+        node.__ka_pending_frame = null;
+      }
       try { node.dispatchEvent(new Event('load')); } catch (e) { __ka_note('iframe-load-error', String(e)); }
       try { if (typeof node.onload === 'function') node.onload(new Event('load')); } catch (e) { __ka_note('iframe-onload-error', (e && e.stack) ? e.stack : String(e)); }
       setTimeout(function () {
@@ -1183,21 +1650,24 @@ document.createElement = function (tag) {
       if (target.attributes && Object.prototype.hasOwnProperty.call(target.attributes, dashed)) {
         return target.attributes[dashed];
       }
-      __ka_note('missing-element-property', String(key));
       return undefined;
     },
     set: function (target, key, value) {
       var name = String(key);
-      if (name !== 'src' && name !== 'textContent' && name !== 'innerHTML' &&
-          name !== 'style' && name !== 'nodeValue' && name !== 'parentNode' &&
-          name !== 'childNodes' && name !== 'children' && name !== 'ownerDocument' &&
-          name !== 'attributes' && name !== '__ka_on_append' && name !== 'nodeType' &&
-          name !== 'tagName' && name !== 'nodeName' && name !== 'id' && name !== 'className') {
-        __ka_note('el-set', target.tagName + '.' + name + '=' + String(value).slice(0, 300));
+      if (name === 'textContent' && typeof value === 'string' &&
+          value.length > 8 && value.length < 300) {
       }
-      /* Reflect the write onto the element itself, so the property setters
-       * (script.src, iframe.src) run. */
-      Reflect.set(target, key, value);
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'BUTTON')) {
+        __ka_note('button-prop', target.tagName + '.' + name + '=' + String(value).slice(0, 40));
+      }
+      /* A property write on an element: the accessors defined for src and
+       * srcdoc have to run, like in a browser. */
+      var desc = Object.getOwnPropertyDescriptor(target, key);
+      if (desc && desc.set) {
+        desc.set.call(target, value);
+      } else {
+        target[key] = value;
+      }
       if (name === 'srcdoc') __ka_load_srcdoc(String(value), target);
       if (name === 'id' && value) __ka_elements[String(value)] = target;
       return true;
@@ -1208,6 +1678,7 @@ document.createElement = function (tag) {
 /* ------------------------------------------------------------------ XHR */
 
 function XMLHttpRequest() {
+  __ka_note('xhr-new', 'url=' + String(arguments[0] || '').slice(0, 80));
   EventTarget.call(this);
   this.readyState = 0;
   this.status = 0;
@@ -1231,8 +1702,11 @@ function XMLHttpRequest() {
 }
 XMLHttpRequest.prototype = Object.create(EventTarget.prototype);
 XMLHttpRequest.prototype.open = function (method, url, async) {
+  __ka_note('xhr-open', String(method).toUpperCase() + ' ' + String(url).slice(0, 140));
+  __ka_note('xhr-open', String(method).toUpperCase() + ' ' + String(url).slice(0, 160));
   this._method = String(method || 'GET').toUpperCase();
   this._url = String(url);
+  __ka_note('xhr-open', String(method).toUpperCase() + ' ' + String(url).slice(0, 140));
   this.readyState = 1;
   this._fire('readystatechange');
 };
@@ -1446,6 +1920,8 @@ FormData.prototype.entries = function () {
 
 /* --------------------------------------------------------------- others */
 
+
+
 function Blob(parts, options) {
   var text = '';
   if (parts) {
@@ -1457,8 +1933,35 @@ function Blob(parts, options) {
   this._text = text;
   this.size = text.length;
   this.type = (options && options.type) || '';
+  /* A Blob can carry binary parts. The challenge's proof of work hands the
+   * VM a byte array, so the bytes are kept next to the text form. */
+  var bytes = [];
+  for (var b = 0; b < parts.length; b++) {
+    var part = parts[b];
+    if (part && typeof part === 'object' && part.__ka_bytes) {
+      for (var c = 0; c < part.__ka_bytes.length; c++) bytes.push(part.__ka_bytes[c]);
+    } else if (typeof part === 'number') {
+      bytes.push(part & 255);
+    } else {
+      var str = String(part);
+      for (var d = 0; d < str.length; d++) {
+        var code = str.charCodeAt(d);
+        if (code < 0x80) bytes.push(code);
+        else if (code < 0x800) bytes.push(0xc0 | (code >> 6), 0x80 | (code & 63));
+        else bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+      }
+    }
+  }
+  this._bytes = bytes;
 }
 Blob.prototype.text = function () { return Promise.resolve(this._text); };
+Blob.prototype.arrayBuffer = function () {
+  var buf = new ArrayBuffer(this._bytes.length);
+  var view = new Uint8Array(buf);
+  for (var i = 0; i < this._bytes.length; i++) view[i] = this._bytes[i];
+  return Promise.resolve(buf);
+};
+Blob.prototype.bytes = function () { return Promise.resolve(new Uint8Array(this._bytes)); };
 Blob.prototype.slice = function () { return new Blob([this._text]); };
 
 /* URL.createObjectURL/revokeObjectURL are part of the browser support check:
@@ -1568,10 +2071,79 @@ function TransformStream() {
   this.writable = new WritableStream();
 }
 
+/* A Worker runs a script in its own realm. Cloudflare's challenge uses one
+ * to prove the client is not a bot: it builds a Blob, hands it to a Worker
+ * and reads the result. The shim therefore has to really run the script
+ * — a stub would make the challenge report an unsupported browser. */
 function Worker(url) {
+  __ka_note('worker-new', String(url).slice(0, 90));
+  __ka_note('blob-registry', JSON.stringify(Object.keys(__ka_blob_urls)));
+  __ka_note('worker-new', String(url).slice(0, 90));
   this.url = String(url || '');
-  this.postMessage = noop; this.addEventListener = noop;
-  this.removeEventListener = noop; this.terminate = noop;
+  var blob = __ka_blob_urls[this.url];
+  this.onmessage = null;
+  this.onerror = null;
+  this._listeners = {};
+  var self = this;
+  this.postMessage = function (data) {
+    var handler = self.onmessage;
+    if (typeof handler === 'function') {
+      try { handler({ data: data }); } catch (e) { __ka_note('worker-error', String(e)); }
+    }
+    var list = self._listeners.message || [];
+    for (var i = 0; i < list.length; i++) {
+      try { list[i]({ data: data }); } catch (e) { __ka_note('worker-error', String(e)); }
+    }
+  };
+  this.addEventListener = function (type, fn) {
+    if (typeof fn !== 'function') return;
+    (self._listeners[type] = self._listeners[type] || []).push(fn);
+  };
+  this.removeEventListener = function (type, fn) {
+    var list = self._listeners[type];
+    if (!list) return;
+    var i = list.indexOf(fn);
+    if (i >= 0) list.splice(i, 1);
+  };
+  this.terminate = noop;
+  if (!blob) __ka_note('worker-no-blob', String(url).slice(0, 60));
+  if (blob && typeof blob._text === 'string') {
+    __ka_note('worker-script-ran', blob._text.slice(0, 60));
+    /* The worker's scope: onmessage/postMessage/close live in it, like in a
+     * browser. */
+    var scope = {
+      onmessage: null,
+      onerror: null,
+      postMessage: function (data) { self.postMessage(data); },
+      close: function () {},
+      importScripts: function () {},
+      location: { href: self.url },
+      navigator: navigator,
+      console: console,
+      setTimeout: setTimeout,
+      clearTimeout: clearTimeout,
+      setInterval: setInterval,
+      clearInterval: clearInterval,
+      crypto: crypto,
+      performance: performance
+    };
+    scope.self = scope;
+    scope.globalThis = scope;
+    try {
+      var fn = new Function(
+        'onmessage', 'postMessage', 'close', 'importScripts', 'location',
+        'navigator', 'console', 'setTimeout', 'clearTimeout', 'setInterval',
+        'clearInterval', 'crypto', 'performance', 'self', 'globalThis',
+        blob._text + '\n;return {onmessage: onmessage};'
+      );
+      fn(scope.onmessage, scope.postMessage, scope.close, scope.importScripts,
+        scope.location, scope.navigator, scope.console, scope.setTimeout,
+        scope.clearTimeout, scope.setInterval, scope.clearInterval,
+        scope.crypto, scope.performance, scope, scope);
+    } catch (e) {
+      __ka_note('worker-script-error', String(e));
+    }
+  }
 }
 Worker.prototype.postMessage = noop;
 Worker.prototype.terminate = noop;
@@ -1622,8 +2194,8 @@ var WebAssembly = {
  * property the bundle touches is recorded, so a gap names itself. */
 function __ka_missing(name) {
   __ka_note('missing', name);
-  if (typeof globalThis.__ka_missing_names === 'undefined') globalThis.__ka_missing_names = [];
-  globalThis.__ka_missing_names.push(name);
+  if (typeof __ka_global.__ka_missing_names === 'undefined') __ka_global.__ka_missing_names = [];
+  __ka_global.__ka_missing_names.push(name);
   return undefined;
 }
 
@@ -1656,6 +2228,18 @@ window.self = self;
 window.top = top;
 window.parent = parent;
 window.document = document;
+/* window.body is document.body in a browser. The challenge's state machine
+ * checks it before it starts, so the shim has to expose it. */
+window.body = document.body;
+window.head = document.head;
+/* window.cookie is document.cookie in a browser. The challenge reads its
+ * retry counter through the window object. */
+Object.defineProperty(window, 'cookie', {
+  configurable: true,
+  get: function () { return __ka_cookie_string(); },
+  set: function (v) { __ka_apply_set_cookie(String(v)); }
+});
+window.documentElement = document.documentElement;
 /* window.readyState mirrors document.readyState in a browser. */
 Object.defineProperty(window, 'readyState', {
   configurable: true,
@@ -1734,6 +2318,16 @@ window.TransformStream = TransformStream;
 window.structuredClone = structuredClone;
 window.CSS = CSS;
 window.isSecureContext = true;
+window.ShadowRoot = function () {};
+window.DOMRect = function () { this.x = 0; this.y = 0; this.width = 0; this.height = 0; this.top = 0; this.left = 0; this.right = 0; this.bottom = 0; };
+window.DOMRectReadOnly = window.DOMRect;
+window.HTMLCollection = function () { this.length = 0; };
+window.NodeList = function () { this.length = 0; };
+window.HTMLFormElement = Element;
+window.HTMLOptionElement = Element;
+window.Selection = function () {};
+window.Range = function () {};
+window.getComputedStyle = getComputedStyle;
 window.origin = __ka_parsed.origin;
 window.frameElement = null;
 window.closed = false;
@@ -1743,19 +2337,79 @@ window.onload = null;
 window.onerror = null;
 window.__ka_events = __ka_events;
 window.__ka_cookies = __ka_cookies;
-/* The Turnstile bundle checks these DOM constructors by identity. */
-window.HTMLScriptElement = Element;
-window.HTMLIFrameElement = Element;
-window.HTMLDivElement = Element;
-window.HTMLInputElement = Element;
-window.HTMLCanvasElement = Element;
-window.HTMLFormElement = Element;
-window.HTMLAnchorElement = Element;
-window.HTMLParagraphElement = Element;
-window.HTMLSpanElement = Element;
-window.HTMLBodyElement = Element;
-window.HTMLHeadElement = Element;
-window.HTMLHtmlElement = Element;
+/* The Turnstile API is observable: the widget's render call is the point
+ * where the challenge starts talking to the server. */
+function __ka_turnstile_wrap() {
+  __ka_note('ts-wrap', 'turnstile=' + typeof __ka_global.turnstile);
+  if (!__ka_global.turnstile || typeof __ka_global.turnstile !== 'object') return;
+  var api = __ka_global.turnstile;
+  if (api.__ka_wrapped) return;
+  api.__ka_wrapped = true;
+  var realRender = api.render;
+  api.render = function () {
+    __ka_note('ts-render', 'args=' + Array.prototype.slice.call(arguments).length +
+      ' a0=' + JSON.stringify(String(arguments[0])) +
+      ' a1=' + JSON.stringify(arguments[1] || null).slice(0, 300));
+    if (!__ka_global.__ka_render_calls) __ka_global.__ka_render_calls = [];
+    try { __ka_global.__ka_render_calls.push([String(arguments[0]), JSON.stringify(arguments[1] || null)]); } catch (e) {}
+    var r = realRender.apply(this, arguments);
+    __ka_note('ts-render-done', '');
+    return r;
+  };
+  var realReady = api.ready;
+  api.ready = function (cb) {
+    __ka_note('ts-ready', '');
+    return realReady.apply(this, arguments);
+  };
+}
+/* The Turnstile bundle checks these DOM constructors with instanceof, and it
+ * picks elements by tag (document.querySelectorAll('script')). Every element
+ * being the same class would make a <div> pass for a <script>, so each tag
+ * gets its own constructor and the elements are instances of it. */
+(function () {
+  var tags = ['Script', 'IFrame', 'Div', 'Input', 'Canvas', 'Form', 'Anchor',
+    'Paragraph', 'Span', 'Body', 'Head', 'Html', 'Label', 'Button', 'Select',
+    'Option', 'TextArea', 'Style', 'Link', 'Meta', 'Img', 'Table', 'Video',
+    'Audio', 'Object', 'Embed', 'Source', 'Picture', 'Template', 'Slot',
+    'CustomElement', 'DocumentFragment', 'CharacterData', 'Text', 'Comment',
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'P', 'Ol', 'Ul', 'Li', 'A', 'B',
+    'I', 'U', 'S', 'Strong', 'Em', 'Small', 'Big', 'Center', 'Article',
+    'Section', 'Header', 'Footer', 'Nav', 'Aside', 'Main', 'Figure',
+    'Figcaption', 'Address', 'Blockquote', 'Pre', 'Code', 'Hr', 'Svg',
+    'Iframe', 'Div', 'Table', 'Td', 'Tr', 'Th', 'Thead', 'Tbody', 'Tfoot',
+    'Ulist', 'Olist', 'Li', 'Dl', 'Dt', 'Dd', 'Fieldset', 'Legend',
+    'Abbr', 'Bdi', 'Bdo', 'Cite', 'Code', 'Dfn', 'Kbd', 'Mark', 'Pre',
+    'Q', 'Samp', 'Small', 'Sub', 'Sup', 'Time', 'Var', 'Wbr', 'Data',
+    'Details', 'Summary', 'Dialog', 'Menu', 'Meter', 'Progress', 'Ruby',
+    'Rt', 'Rp', 'Output', 'Picture', 'Map', 'Area', 'Base', 'Col', 'Colgroup',
+    'Frame', 'Frameset', 'Noframes', 'Param', 'Portal', 'Search'];
+  for (var i = 0; i < tags.length; i++) {
+    var name = 'HTML' + tags[i] + 'Element';
+    var Ctor = function () {};
+    Ctor.prototype = Object.create(Element.prototype);
+    Ctor.prototype.constructor = Ctor;
+    window[name] = Ctor;
+    globalThis[name] = Ctor;
+    /* The Turnstile bundle reads the lowercase spelling too (HTMLdivElement);
+     * a real browser only has the capitalised one, so the lowercase name
+     * must resolve to the same constructor. */
+    var lower = 'HTML' + tags[i].toLowerCase() + 'Element';
+    if (!window[lower]) {
+      window[lower] = Ctor;
+      globalThis[lower] = Ctor;
+    }
+  }
+  /* The element factory has to build instances of the matching class. */
+  var __ka_make = document.createElement;
+  document.createElement = function (tag) {
+    var node = __ka_make.call(document, String(tag || 'div').toLowerCase());
+    var Ctor = window['HTML' + String(tag || 'div').toLowerCase() + 'Element'];
+    if (Ctor && Ctor.prototype) {
+      try { Object.setPrototypeOf(node, Ctor.prototype); } catch (e) {}
+    }
+    return node;
+  };
+})();
 window.HTMLStyleElement = Element;
 window.HTMLLinkElement = Element;
 window.HTMLMetaElement = Element;
@@ -1825,41 +2479,63 @@ document.getSelection = window.getSelection;
 
 /* -------------------------------------------------- HTML page -> DOM tree */
 
-function __ka_parse_html(html) {
+function __ka_parse_into(root, html) {
   var voidTags = {
     area: 1, base: 1, br: 1, col: 1, embed: 1, hr: 1, img: 1,
     input: 1, link: 1, meta: 1, param: 1, source: 1, track: 1, wbr: 1
   };
-  var stack = [document.body];
-  var re = /<!--[\s\S]*?-->|<\/?([a-zA-Z][a-zA-Z0-9:-]*)((?:"[^"]*"|'[^']*'|[^'">])*)\/?>|([^<]+)/g;
+  var stack = [root];
+  var re = /<!--[\s\S]*?-->|<script[^>]*>([\s\S]*?)<\/script>|<\/?([a-zA-Z][a-zA-Z0-9:-]*)((?:"[^"]*"|'[^']*'|[^'">])*)\/?>|([^<]+)/g;
   var m, skip = null;
+  var scripts = [];
   while ((m = re.exec(String(html))) !== null) {
     if (m[0].indexOf('<!--') === 0) continue;
-    if (m[3] !== undefined) {
+    if (m[1] !== undefined) {
+      /* An inline script: it runs when the markup is inserted. */
+      if (m[1].trim()) scripts.push(m[1]);
+      continue;
+    }
+    if (m[4] !== undefined) {
       if (skip) continue;
-      if (m[3].trim()) {
-        var text = document.createTextNode(m[3]);
+      if (m[4].trim()) {
+        var text = document.createTextNode(m[4]);
         stack[stack.length - 1].appendChild(text);
       }
       continue;
     }
-    var tag = m[1].toLowerCase();
+    var tag = m[2].toLowerCase();
     var closing = m[0].charAt(1) === '/';
+    try {
+      if (root !== document.body && (tag === 'body' || tag === 'head')) {
+      }
+    } catch (e) {}
     if (skip) {
       if (closing && tag === skip) skip = null;
       continue;
     }
     if (closing) {
+      var __ka_found = -1;
       for (var i = stack.length - 1; i > 0; i--) {
-        if (stack[i].tagName === tag.toUpperCase()) { stack.length = i; break; }
+        if (stack[i].tagName === tag.toUpperCase()) { __ka_found = i; break; }
       }
+      if (__ka_found >= 0) stack.length = __ka_found;
       continue;
     }
     if (tag === 'html') continue;
-    if (tag === 'head' || tag === 'body') { stack.push(document[tag]); continue; }
-    if (tag === 'script' || tag === 'style') skip = tag;
+    if (tag === 'head' || tag === 'body') {
+      /* A frame's head and body belong to the frame, not to the page. */
+      if (root === document.body) {
+        stack.push(document[tag]);
+      } else {
+        var __ka_part = root.__ka_parts[tag] || (root.__ka_parts[tag] = new Element(tag));
+        root.appendChild(__ka_part);
+        stack.push(__ka_part);
+      }
+      continue;
+    }
+    if (tag === 'style') skip = tag;
     var el = document.createElement(tag);
-    var attrs = m[2] || '';
+    var attrs = m[3] || '';
     var attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
     var a;
     while ((a = attrRe.exec(attrs)) !== null) {
@@ -1873,6 +2549,13 @@ function __ka_parse_html(html) {
     }
     if (!voidTags[tag] && attrs.charAt(attrs.length - 1) !== '/') stack.push(el);
   }
+  for (var s = 0; s < scripts.length; s++) {
+    __ka_eval_global(scripts[s], 'inline-markup');
+  }
+}
+
+function __ka_parse_html(html) {
+  __ka_parse_into(document.body, html);
 }
 
 /* The challenged page itself: the bundle reads its own markup before it

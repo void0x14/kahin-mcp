@@ -179,12 +179,87 @@ def _pin_window_geometry(root_pid: int, width: int, height: int) -> None:
     for pid in [root_pid, *_browser_descendant_pids(root_pid)]:
         windows.extend(_x11_windows_for_pid(pid))
     for win in dict.fromkeys(windows):
-        for cmd in (["windowsize", win, str(width), str(height)],
-                    ["windowmove", win, str(left), str(top)]):
-            try:
-                subprocess.run(["xdotool", *cmd], capture_output=True, timeout=5)
-            except (OSError, subprocess.SubprocessError):
-                pass
+        _drive_window(win, left, top, width, height)
+
+
+def _xdo(*args: str) -> str:
+    try:
+        return subprocess.run(
+            ["xdotool", *args], capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _frame_extents(win: str) -> tuple[int, int, int, int]:
+    """(left, right, top, bottom) the window manager wraps around ``win``.
+
+    A reparenting WM puts the client inside a frame, so xdotool windowsize --
+    which sizes the client -- yields an OUTER window of client+extents. On a
+    bare Xvfb there is no WM and these are all zero; under KWin the same
+    request grew the outer window to the measured 1370x890.
+    """
+    try:
+        props = subprocess.run(
+            ["xprop", "-id", win, "_NET_FRAME_EXTENTS"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return (0, 0, 0, 0)
+    if "=" not in props:
+        return (0, 0, 0, 0)
+    try:
+        values = [int(v.strip()) for v in props.split("=", 1)[1].split(",")]
+    except ValueError:
+        return (0, 0, 0, 0)
+    return tuple(values[:4]) if len(values) >= 4 else (0, 0, 0, 0)  # type: ignore[return-value]
+
+
+def _client_geometry(win: str) -> tuple[int, int, int, int] | None:
+    """(x, y, width, height) of the client area, as the server reports it."""
+    geom = dict(
+        kv.split("=", 1) for kv in _xdo("getwindowgeometry", "--shell", win).split()
+        if "=" in kv
+    )
+    try:
+        return (int(geom["X"]), int(geom["Y"]), int(geom["WIDTH"]), int(geom["HEIGHT"]))
+    except (KeyError, ValueError):
+        return None
+
+
+def _outer_of(win: str) -> tuple[int, int, int, int] | None:
+    """(x, y, width, height) of the window including its WM frame."""
+    client = _client_geometry(win)
+    if client is None:
+        return None
+    x, y, w, h = client
+    fl, fr, ft, fb = _frame_extents(win)
+    return (x - fl, y - ft, w + fl + fr, h + ft + fb)
+
+
+def _drive_window(win: str, left: int, top: int, width: int, height: int) -> None:
+    """Closed loop: measure the real outer box and correct until it lands.
+
+    Blindly issuing windowsize is not enough -- xdotool sizes the CLIENT, the
+    WM decides the frame, and the resulting outer size differs per display
+    (0px on bare Xvfb, +90px under KWin measured on :0). Reading back what the
+    server actually granted and steering on the error converges on both.
+    """
+    for _ in range(6):
+        outer = _outer_of(win)
+        client = _client_geometry(win)
+        if outer is None or client is None:
+            return
+        ox, oy, ow, oh = outer
+        cx, cy, cw, ch = client
+        dw, dh = width - ow, height - oh
+        dx, dy = left - ox, top - oy
+        if not (dx or dy or dw or dh):
+            return
+        if dw or dh:
+            _xdo("windowsize", win, str(max(1, cw + dw)), str(max(1, ch + dh)))
+        if dx or dy:
+            _xdo("windowmove", win, str(cx + dx), str(cy + dy))
 
 
 async def _pin_window_geometry_until_settled(pid: int) -> None:

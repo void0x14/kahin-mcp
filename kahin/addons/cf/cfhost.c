@@ -259,7 +259,9 @@ static int eval_script(JSContext *ctx, const char *code, const char *label) {
  * a self-rescheduling interval cannot spin forever. */
 static void drain_timers(JSContext *ctx, int rounds) {
     static const char tick[] =
-        "(function(){var f=__ka_timers.shift();if(!f)return 0;try{f({});}catch(e){"
+        "(function(){var f=__ka_timers.shift();if(!f)return 0;"
+        "__ka_note('tick', __ka_timer_labels.shift() || '?');"
+        "try{f({});}catch(e){"
         "__ka_note('tick-error', (e && e.stack) ? e.stack : String(e));}return 1;})()";
     JSContext *pctx = NULL;
     for (int i = 0; i < rounds; i++) {
@@ -297,6 +299,9 @@ static void install_globals(JSContext *ctx) {
     JSValue load = JS_NewCFunction(ctx, js_ka_load, "load", 1);
     JS_SetPropertyStr(ctx, global, "__ka_load", load);
     JS_SetPropertyStr(ctx, global, "__ka_log", log);
+    /* The shim needs the global object itself: some engine builds do not
+     * expose \`globalThis\`, and the shim must not depend on it. */
+    JS_SetPropertyStr(ctx, global, "__KA_GLOBAL", JS_DupValue(ctx, global));
     JS_FreeValue(ctx, global);
 }
 
@@ -337,6 +342,7 @@ int main(int argc, char **argv) {
 
     set_string_global(ctx, "__KA_USER_AGENT", ua);
     set_string_global(ctx, "__KA_LOCATION", loc);
+    set_string_global(ctx, "__KA_SITEKEY", getenv("CF_SITEKEY"));
     set_string_global(ctx, "__KA_HTML_FILE", html_file);
 
     char *shim = read_file(shim_path);
@@ -380,8 +386,8 @@ int main(int argc, char **argv) {
      * DOMContentLoaded still sees the event. */
     eval_script(ctx,
         "(function(){"
-        "try{document.dispatchEvent(new Event('DOMContentLoaded'));}catch(e){}"
         "try{document.readyState='interactive';}catch(e){}"
+        "try{document.dispatchEvent(new Event('DOMContentLoaded'));}catch(e){}"
         "try{document.dispatchEvent(new Event('readystatechange'));}catch(e){}"
         "try{if(typeof document.onreadystatechange==='function')document.onreadystatechange();}catch(e){}})()",
         "<domcontentloaded>");
@@ -410,16 +416,38 @@ int main(int argc, char **argv) {
         "title: document.title, "
         "events: __ka_events, "
         "wlog: __ka_wlog, "
+        "fail: (globalThis.__ka_fail||null), "
+        "bundleLen: (globalThis.__ka_bundle_len||0), "
+        "codeLen: ((globalThis.__ka_fail&&globalThis.__ka_fail.code)||'').length, "
+        "bundles: (globalThis.__ka_all_bundles || []), "
+        "turnstileKeys: (globalThis.turnstile ? Object.keys(globalThis.turnstile) : null), "
+        "cfoptAll: (function(){var o=window._cf_chl_opt||{};var r=[];for(var k in o){var v=o[k];var s;try{s=(typeof v==='object')?JSON.stringify(v):String(v);}catch(e){s='[obj]';}if(s&&s.length<300)r.push(k+'='+s.slice(0,150));}return r;})(), "
+        "cfoptLong: (function(){var o=window._cf_chl_opt||{};var r=[];for(var k in o){var v=o[k];var s;try{s=(typeof v==='object')?JSON.stringify(v):String(v);}catch(e){s='';}if(s&&(s.indexOf('0x4AAAA')>=0||s.length>90))r.push(k+'='+s.slice(0,200));}return r;})(), "
+        "renderCalls: (globalThis.__ka_render_calls || []), "
+        "tsPrivate: (globalThis.turnstile && globalThis.turnstile._private ? JSON.stringify(globalThis.turnstile._private).slice(0,300) : null), "
         "turn: (typeof globalThis.turnstile), "
         "cfopt: (function(){var o=window._cf_chl_opt||{};var r={};"
         "for(var k in o){var v=o[k];"
-        "if(typeof v==='boolean'||typeof v==='number'||typeof v==='string')r[k]=String(v).slice(0,80);}"
+        "if(typeof v==='boolean'||typeof v==='number'||typeof v==='string')r[k]=String(v).slice(0,200);"
+        "else if(v&&typeof v==='object'){try{r[k]='[obj]'+JSON.stringify(v).slice(0,300);}catch(e){r[k]='[obj]';}}"
+        "}"
         "return r;})(), "
+        "cfoptKeys: Object.keys(window._cf_chl_opt||{}), "
+        "cfoptSetCount: (function(){var o=window._cf_chl_opt||{};var n=0;for(var k in o){if(o[k]!==undefined)n++;}return n;})(), "
+        "cfoptStrings: (function(){var o=window._cf_chl_opt||{};var r=[];for(var k in o){var v=o[k];if(typeof v==='string'&&v.length>4)r.push(k+'='+v.slice(0,150));}return r;})(), "
+        "winHashProps: (function(){var o=window;var r=[];for(var k in o){if(typeof k==='string'&&k.charAt(0)==='_'&&k.length>20)r.push(k+'='+String(o[k]).slice(0,80));}return r.slice(0,40);})(), "
+        "cfoptFo: (function(){var o=window._cf_chl_opt||{};var r=[];for(var k in o){var v=o[k];if(typeof v==='string'&&(v.indexOf('/fo/')>=0||v.indexOf('/eb/')>=0||v.indexOf('4AAAA')>=0||v.indexOf('8340802')>=0))r.push(k+'='+v.slice(0,120));}return r;})(), "
         "dom: (function(){var out=[];"
         "for(var i=0;i<__ka_all.length;i++){"
         "var e=__ka_all[i];var t=e.textContent||'';"
-        "if(t&&t.trim())out.push(e.tagName+':'+t.trim().slice(0,300));"
-        "}return out.slice(0,60);})()"
+        "if(t&&t.trim())out.push(e.tagName+':'+t.trim().slice(0,600));"
+        "}return out.slice(0,60);})(), "
+        "bodyHtml: (function(){var o=[];"
+        "for(var i=0;i<__ka_all.length;i++){var e=__ka_all[i];"
+        "if(e.tagName==='DIV'||e.tagName==='H2'||e.tagName==='P'||e.tagName==='SPAN'){"
+        "var t=(e.textContent||e.innerHTML||'').trim();"
+        "if(t&&t.length>4&&t.length<400&&!/^@|^\\{|spin|scale/.test(t))o.push(e.tagName+'|'+t);}}"
+        "return o.slice(0,40);})()"
         "})";
     JSValue sv = JS_Eval(ctx, state, strlen(state), "<state>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(sv)) {

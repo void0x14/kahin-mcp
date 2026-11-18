@@ -209,19 +209,24 @@ class _Transport:
                 "User-Agent": user_agent,
                 "Accept": "*/*",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Referer": referer,
-                "Origin": origin,
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-origin",
             }
         )
+        self._page_origin = origin
+        self._page_referer = referer
         self.user_agent = user_agent
         self.requests: list[dict[str, Any]] = []
         self.clearance: str = ""
 
     def perform(self, method: str, url: str, headers: str, body: str) -> tuple[int, str, dict[str, str]]:
         request_headers: dict[str, str] = {}
+        if url.startswith("kahin://"):
+            import pathlib as _pl
+            name = url.split("/")[-1]
+            _pl.Path("/tmp/opencode/dump-" + name).write_text(body, encoding="utf-8")
+            return 200, "", {}
+            import pathlib as _pl
+            _pl.Path("/tmp/opencode/dump-" + url.split("/")[-1]).write_text(body, encoding="utf-8")
+            return 200, "", {}
         for line in headers.splitlines():
             if not line.strip():
                 continue
@@ -229,6 +234,26 @@ class _Transport:
             if name.strip():
                 request_headers[name.strip()] = value.strip()
         request_headers.setdefault("User-Agent", self.user_agent)
+        # The page and Cloudflare's widget host are different origins. A
+        # cross-origin request carries its own Origin/Referer and the
+        # browser's Sec-Fetch-Site value.
+        from urllib.parse import urlparse as _up
+
+        _parts = _up(url)
+        _req_origin = f"{_parts.scheme}://{_parts.netloc}"
+        if _req_origin == self._page_origin:
+            request_headers.setdefault("Referer", self._page_referer)
+            request_headers.setdefault("Origin", self._page_origin)
+            request_headers.setdefault("Sec-Fetch-Dest", "empty")
+            request_headers.setdefault("Sec-Fetch-Mode", "cors")
+            request_headers.setdefault("Sec-Fetch-Site", "same-origin")
+        else:
+            request_headers.setdefault("Referer", self._page_referer)
+            request_headers.setdefault("Origin", _req_origin)
+            request_headers.setdefault("Sec-Fetch-Dest", "iframe")
+            request_headers.setdefault("Sec-Fetch-Mode", "navigate")
+            request_headers.setdefault("Sec-Fetch-Site", "cross-site")
+            request_headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
         kwargs: dict[str, Any] = {"headers": request_headers, "timeout": CHALLENGE_TIMEOUT}
         if method.upper() != "GET" and body:
@@ -319,6 +344,30 @@ class CfCookieStore:
             )
         return body
 
+    def _site_key(self) -> str:
+        """The widget's site key for this host.
+
+        Cloudflare's Turnstile widget is addressed with a key that belongs to
+        the site, not to the challenge. The challenge bundle only carries a
+        placeholder for it, so the real key comes from the site's own
+        configuration: an environment variable, or a file under the kahin
+        home.
+        """
+        host = self.host
+        env_key = os.environ.get("CF_SITEKEY", "").strip()
+        if env_key:
+            return env_key
+        mapping = _kahin_home() / "cf" / "sitekeys.json"
+        try:
+            if mapping.is_file():
+                data = json.loads(mapping.read_text(encoding="utf-8"))
+                value = data.get(host)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        except Exception:  # noqa: BLE001 - a broken map must not stop the mint
+            pass
+        return ""
+
     def _run_host(self, transport: _Transport, bootstrap: str, page_html: str = "") -> dict[str, Any]:
         binary = _host_binary()
         shim = _shim_path()
@@ -333,6 +382,7 @@ class CfCookieStore:
             env["CF_SCRIPTS"] = str(script_path)
             env["CF_USER_AGENT"] = self.user_agent
             env["CF_LOCATION"] = self.url
+            env["CF_SITEKEY"] = self._site_key()
             self._proc = subprocess.Popen(
                 [str(binary), "--solve"],
                 stdin=subprocess.PIPE,

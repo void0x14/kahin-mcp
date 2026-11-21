@@ -902,12 +902,15 @@ async def identity_report() -> str:
 async def agent_status() -> str:
     """Agent-loop overview of the running engine and its live page.
 
-    Reports engine liveness, the current page's url/title/readyState (read
-    from the live page), tab count and current tab, whether snapshot refs are
-    still live plus the latest DOM-stream cursor, pending dialogs, and the
-    buffered network/console event counts. Never raises: with no engine this
-    returns a structured idle response, and every engine-backed field
-    degrades to a neutral value when its source is unavailable.
+    Reports engine liveness, active ``stateMode`` (``ağırbaş``/``keş``), the
+    current page's url/title/readyState (read from the live page), tab count
+    and current tab, whether snapshot refs are still live plus the latest
+    DOM-stream cursor and ``domNextSeq``, pending dialogs, buffered
+    network/console event counts, unified ``windows`` inventory +
+    ``windowSummary`` (tabs, Marionette windows, open dialogs), and operator
+    discipline ``harness`` state. Never raises: with no engine this returns
+    a structured idle response, and every engine-backed field degrades to a
+    neutral value when its source is unavailable.
     ``identityHash`` (active bounded digest) and ``stealth`` (enabled launch
     policy) are reported for any running Mirage engine, configured or not.
     ``refsLive``/``domCursor`` come from real DOM-stream bookkeeping — refs
@@ -918,11 +921,13 @@ async def agent_status() -> str:
         from kahin import _state as state  # noqa: PLC0415
         from kahin.the_twins.mirage import Mirage  # noqa: PLC0415
         from kahin.the_twins.shadow import Obscura  # noqa: PLC0415
+        from kahin.tools.pilot import _engine_state_mode  # noqa: PLC0415
 
         engine = state._current_engine
         if engine is None:
             return orjson.dumps({
                 "engine": None,
+                "stateMode": None,
                 "alive": False,
                 "url": None,
                 "title": None,
@@ -941,13 +946,14 @@ async def agent_status() -> str:
                 "windows": [],
                 "windowSummary": None,
                 "harness": get_harness().snapshot(),
-                "hint": "use kahin_browser_start",
+                "hint": "use kahin_browser_start(mode='ağırbaş') or kahin_browser_start(mode='keş', ephemeral_ack=true)",
             }, option=orjson.OPT_INDENT_2).decode()
 
         payload: dict[str, Any] = {
             "engine": "mirage" if isinstance(engine, Mirage) else (
                 "shadow" if isinstance(engine, Obscura) else type(engine).__name__.lower()
             ),
+            "stateMode": _engine_state_mode(engine),
             "alive": False,
             "url": None,
             "title": None,

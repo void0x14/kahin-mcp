@@ -34,21 +34,50 @@ function sh(cmd, args, opts = {}) {
   });
 }
 
+async function checkImport(python, source) {
+  if (source === "editable") {
+    return sh(
+      python,
+      [
+        "-c",
+        "import pathlib, sys, kahin, kahin.oracle; " +
+          "assert pathlib.Path(kahin.__file__).resolve().is_relative_to(pathlib.Path(sys.argv[1]).resolve())",
+        PACKAGE_ROOT,
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        cwd: PYTHON_CWD,
+      },
+    );
+  }
+  return sh(python, ["-c", "import kahin.oracle"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    cwd: PYTHON_CWD,
+  });
+}
+
 async function setup() {
-  // venv yoksa gömülü wheel'den kur (postinstall atlanmışsa / bozuksa)
-  const { installPython } = await import("./setup.mjs");
+  // venv yoksa veya editable/wheel kaynağı değiştiyse ortamı eşitle
+  const { installPython, resolveInstallSource } = await import("./setup.mjs");
+  const source = resolveInstallSource();
   const res = await installPython();
   if (res && res.error) {
     process.stderr.write(`[kahin] python kurulumu başarısız (çıkış ${res.error})\n`);
     process.exit(1);
   }
   const python = existsSync(PY) ? PY : (process.env.KAHIN_PY || "python3");
-  const check = await sh(python, ["-c", "import kahin"], {
-    stdio: ["ignore", "pipe", "pipe"],
-    cwd: PYTHON_CWD,
-  });
+  let check = await checkImport(python, source);
   if (check !== 0) {
-    process.stderr.write(`[kahin] kahin Python paketi bulunamadı. ${python} ile çalıştırılamıyor.\n`);
+    // Tek seferlik kendi kendini onarma: eksik bağımlılık veya stale wheel shadowing durumunda zorla yeniden eşitle.
+    const healed = await installPython({ force: true });
+    if (healed && healed.error) {
+      process.stderr.write(`[kahin] python ortamı onarılamadı (çıkış ${healed.error})\n`);
+      process.exit(1);
+    }
+    check = await checkImport(python, source);
+  }
+  if (check !== 0) {
+    process.stderr.write(`[kahin] kahin.oracle paketi doğrulanamadı (${source}). ${python} ile çalıştırılamıyor.\n`);
     process.exit(1);
   }
   return python;

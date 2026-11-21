@@ -49,8 +49,5 @@
     "opencode",
     "codex",
     "python"
-  ],
-  "dependencies": {
-    "@kahinmcp/kahin": "^0.3.9"
-  }
+  ]
 }

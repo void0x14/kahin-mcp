@@ -43,8 +43,9 @@ Bu belge, durumu iki net moda ayırır. İki mod **serbestçe** seçilir.
   başlatmaz, iki modun sözleşmesini döndürür.
 - `keş` yalnızca `ephemeral_ack=true` ile başlar (hiçbir şeyin kalıcı
   olmayacağının açık onayı).
-- Eski `persistent_profile` bayrağı modlara eşlenir ama `mode` verilirse
-  `mode` kazanır.
+- Eski `persistent_profile` bayrağı uyumluluk için korunur, ancak `mode`
+  zorunludur (yalnız `passkey_mode=true` örtük `ağırbaş` kabul edilir) ve `mode`
+  verilirse her zaman `mode` kazanır.
 
 ### 2.4 Otomasyon modu — ayrı eksen
 
@@ -281,13 +282,13 @@ Bu, mevcut iki modun ötesinde ayrı bir yetenektir; şimdilik yalnızca nottur.
 2. **Gömülü Bitwarden** — pinli, idempotent, tek kurulum, doğrulanmış durum.
    **Bitti** (Faz 1).
 3. **Kilit/timeout kökten kapatma** — ayar yazımı + yeniden başlatma
-   doğrulaması. **Sırada** (Faz 2).
+   doğrulaması (`kahin_passkey_setup_finish` / `configure_vault_timeout_root`). **Bitti** (Faz 2).
 4. **Otomasyon modu** — ayrı eksen; hesap havuzu + kimlik/passkey doldurma
-   kodu. **Sırada** (Faz 2/3).
+   kodu (`kahin_vault_login`). **Bitti** (Faz 2/3).
 5. **Passkey** — Camoufox Firefox 152'nin yerel Marionette sanal
    authenticator'ı (`WebAuthn:AddVirtualAuthenticator` / `AddCredential`)
-   üzerinden; Bitwarden `keyValue` → Marionette `privateKey`. **Sırada**
-   (Faz 3).
+   üzerinden; Bitwarden `keyValue` → Marionette `privateKey`. **Bitti**
+   (Faz 3; canlı FIDO2 popout satır tıklaması §11.1'de izleniyor).
 
 ## 10. Kabul kapıları
 

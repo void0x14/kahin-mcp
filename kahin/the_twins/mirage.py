@@ -315,6 +315,7 @@ STATE_MODE_KES = "keş"
 
 _STATE_MODE_ALIASES = {
     STATE_MODE_AGIRBAS: STATE_MODE_AGIRBAS,
+    "ağirbaş": STATE_MODE_AGIRBAS,  # "AĞIRBAŞ".lower() in Python produces dotted-i after ğ
     "agirbas": STATE_MODE_AGIRBAS,
     STATE_MODE_KES: STATE_MODE_KES,
     "kes": STATE_MODE_KES,

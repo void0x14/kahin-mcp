@@ -42,7 +42,7 @@ MCP tool
 Dinamik bir sayfada güvenilir akış şöyledir:
 
 ```text
-browser_start(mirage)
+kahin_browser_start(mode="keş", ephemeral_ack=true, engine="mirage")
   -> navigate
   -> dom_start
   -> dom_snapshot
@@ -287,6 +287,7 @@ araçları kullanılır:
 - `kahin_crawl_start` — bounded seed/depth/page/time policy ile background job başlatır.
 - `kahin_crawl_status` — state, queue, sonuç, rotation, challenge ve engine health özetini döndürür.
 - `kahin_crawl_results` — opaque cursor ile en fazla 100 bounded sonucu döndürür.
+- `kahin_crawl_events` — bounded monotonic cursor ve opsiyonel long-poll ile canlı crawl ilerleme delta'larını okur.
 - `kahin_crawl_pause` / `kahin_crawl_resume` — CAPTCHA/access-denied sonrasında explicit insan/provider kararıyla devam eder.
 - `kahin_crawl_stop` — job'ı durdurur; browser'ı otomatik kapatmaz.
 
@@ -393,7 +394,7 @@ script'i ayrıca evaluate eder. Observer sayfa tarafında bounded olduğu için
 
 ## 6. Juggler tool kataloğu (A-Z)
 
-Aşağıdaki liste Mirage'ın 106 Juggler-native tool'unun tamamıdır. `MIRAGE`
+Aşağıdaki liste Mirage'ın 112 Juggler-native tool'unun tamamıdır. `MIRAGE`
 tool'ları `engine="mirage"` aktifken kullanılır.
 
 ### DOM gözlem ve adaptif action (5)
@@ -532,14 +533,15 @@ gerekirse DOM snapshot/selector ile hedef alanı daraltın.
   listele/sil); `kahin_browser_start(identity=...)` ile başlatmada uygulanır
 - `kahin_identity_report` — aktif engine'in kimlik özeti + sayfa-içi canlı
   `navigator.userAgent` (set_user_agent onayından uydurulmaz)
-- `kahin_agent_status` — agent döngüsü özeti: engine/alive, url/title/
-  readyState, tabCount/currentTab, `refsLive` + `domCursor` (gerçek DOM-stream
-  bookkeeping; snapshot sonrası live, reset/dropped/stale/stop sonrası geçersiz),
-  pendingDialogs, networkEvents, consoleMessages, identity; engine yoksa
-  yapılandırılmış idle yanıt döner ve asla hata fırlatmaz
+- `kahin_agent_status` — agent döngüsü özeti: engine/`stateMode`/alive, url/title/
+  readyState, tabCount/currentTab, `refsLive` + `domCursor` + `domNextSeq`
+  (gerçek DOM-stream bookkeeping; snapshot sonrası live, reset/dropped/stale/stop
+  sonrası geçersiz), pendingDialogs, networkEvents, consoleMessages, identity,
+  `windows` envanteri, `windowSummary` ve operatör disiplini `harness` durumu;
+  engine yoksa yapılandırılmış idle yanıt döner ve asla hata fırlatmaz
 - `kahin_challenge_status` — CAPTCHA/access-denied/rate-limit algılar; `retryAfterSeconds` ve güvenli pause/backoff kararını döndürür; bypass etmez
 
-### Stealth ve anti-detect (9)
+### Stealth ve anti-detect (10)
 
 - `kahin_stealth_audit` — salt-okunur leak probe paketi (14 check: webdriver,
   cdp-markers, binding-hidden, plugins, languages, platform, oscpu,
@@ -564,6 +566,8 @@ gerekirse DOM snapshot/selector ile hedef alanı daraltın.
   timezone/locale/geolocation önerisi; URL'deki kimlik bilgileri asla
   yankılanmaz; `browser_start(proxy=...)` ile gerçek proxy env uygulanır,
   aktif engine config'iyle çakışma `engine_config_conflict` döner
+- `kahin_mirage_clear_overlays` — bir noktayı örten kalıntı overlay'leri
+  `elementsFromPoint` ile bulup deterministik gizler
 
 Stealth CI kapısı: `KAHIN_REQUIRE_STEALTH=1` altında audit ratio ≥ 0.8 ve
 identity rotasyonu tam fingerprint özetini değiştirmek zorundadır;
@@ -577,7 +581,7 @@ identity rotasyonu tam fingerprint özetini değiştirmek zorundadır;
 ### 7.1 Dinamik form doldurma
 
 ```text
-1. kahin_browser_start(engine="mirage", headless=true)
+1. kahin_browser_start(mode="keş", ephemeral_ack=true, engine="mirage", headless=true)
 2. kahin_navigate(url="https://example.test/account")
 3. kahin_mirage_dom_start(max_events=512)
 4. kahin_mirage_dom_snapshot()
@@ -612,7 +616,10 @@ dom_events(after_seq=C, stream_id=S, frame_id=F, wait_ms=5000)
 
 | Hata/sinyal | Sebep | Kurtarma |
 |---|---|---|
-| `No browser engine running. Use kahin_browser_start first.` | Start yok | `kahin_browser_start()` |
+| `No browser engine running. Use kahin_browser_start first.` | Start yok | `kahin_browser_start(mode="ağırbaş")` veya `mode="keş", ephemeral_ack=true` |
+| `mode_required` | `mode` parametresi verilmedi | `mode="ağırbaş"` ya da `mode="keş", ephemeral_ack=true` seç |
+| `ephemeral_ack_required` | `mode="keş"` için açık onay verilmedi | Geçici profili onaylamak için `ephemeral_ack=true` ekle |
+| `unknown_argument` | Şemada olmayan/hatalı parametre gönderildi | `unexpected_arguments` alanını sil veya `suggestions` ile düzelt |
 | `Browser engine is dead (crashed). Use kahin_browser_stop, then kahin_browser_start to restart.` | Sidecar/Camoufox öldü | `kahin_browser_stop`, sonra yeni `start` |
 | `stale_node` | Node silindi veya document değişti | Snapshot + yeni nodeId |
 | `reset`/`dropped` | Stream değişti veya ring overflow | Snapshot; eski cursor'u bırak |

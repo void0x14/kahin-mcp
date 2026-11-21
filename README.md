@@ -16,7 +16,7 @@ AI modeller Chrome'un içine girip sayfa gezip kod çalıştırabilir ama CDP'yi
 
 56 domain, 667 komut, 237 event, 609 type — Chrome 148 protokolü gömülü.
 
-## 162 Tool · 5 Kategori Ailesi · 2 Engine
+## 165 Tool · 5 Kategori Ailesi · 2 Engine
 
 Tool'lar engine-ayrımlı kategori dosyalarında (`kahin/tools/`): paylaşılan çekirdek + Obscura + Camoufox aileleri.
 
@@ -32,12 +32,13 @@ Tool'lar engine-ayrımlı kategori dosyalarında (`kahin/tools/`): paylaşılan 
 |  MIRAGE — Camoufox Native (112) | Juggler protokolü üstünde gerçek-zamanlı DOM stream, DOM, Reliability, Input, PageEx, Tab, Network, Storage, Emulation, Dialog/Download/Worker/WS, Upload, Screencast + Watch, Accessibility, Engine sağlığı/istatistik, Agent-native snapshot/form/state/identity/status/challenge, Stealth audit/insansı girdi/identity rotasyonu/proxy-geo, kalıntı overlay temizliği | 112 |
 |  ORBIT — Long Crawler (7) | Tek Mirage browser/tab üzerinde bounded background crawl, canlı crawl event stream (`kahin_crawl_events`), sonuç cursor'ı, rate-limit backoff, challenge pause/resume, rotation ve cancel | 7 |
 |  VISUALIZATION (1) | Deterministik SVG görselleştirme (`kahin_visualize_data`) | 1 |
+|  WAF-COOKIE (3) | Baidu ADAS `nox_jst_v1` çerez üretimi (`kahin_waf_cookie_mint`, `kahin_waf_cookie_status`, `kahin_waf_cookie_header`) | 3 |
 |  EXTENSIONS (1) | Güvenli WebExtension hazırlama ve uyumluluk raporu (`kahin_extension_prepare`) | 1 |
 |  CF-CLEAR — Cloudflare (2) | Embedded challenge solver + salt-okunur clearance raporu (`kahin_cf_clear`, `kahin_cf_status`) | 2 |
 |  VAULT — Bitwarden (5) | Kod güdümlü hesap girişi (`kahin_vault_login`; sıra passkey → credentials → kullanıcı) + passkey kurulum araçları | 5 |
 |  OBSCURA — Ayrı kategori | Obscura'ya özel tool'lar (hazırlanıyor) | 0 |
 
-**Toplam: 162 tool.**
+**Toplam: 165 tool.** (Tüm araçlarda bilinmeyen parametreler `unknown_argument` ile reddedilir.)
 
 ## Bir satırda özet
 
@@ -90,7 +91,7 @@ Gerisini AI halleder. Ama dilersen tool'ları direkt de çağırabilirsin:
 → kahin_list_domains                    → 56 domain listeler
 → kahin_get_command(Page,navigate)      → parametreleri gösterir
 → kahin_validate_command(Page,navigate) → doğrular
-→ kahin_browser_start → navigate → extract → screenshot → stop
+→ kahin_browser_start(mode="keş", ephemeral_ack=true) → navigate → extract → screenshot → stop
 → kahin_error_decode(error_code=-32601) → hatayı çözümler
 ```
 
@@ -141,7 +142,7 @@ Ayrıntı ve canlı kanıt: [durum modları §4](docs/state-modes.md).
 Camoufox (Juggler native) ile:
 
 ```
-→ kahin_browser_start(engine="mirage")
+→ kahin_browser_start(mode="keş", ephemeral_ack=true, engine="mirage")
 → kahin_mirage_query("#input") → kahin_mirage_type("merhaba")
 → kahin_mirage_click("#btn") → kahin_mirage_get_text("#result")
 → kahin_mirage_query("#btn", frame_id="subframe-...")   # iframe içi erişim
@@ -222,7 +223,7 @@ Kahin'de hata loglama ve kendini onarma sistemi gömülüdür:
 
 ```
 oracle.py               → MCP server (bootstrap: mcp instance + engine lifecycle + main)
-  tools/                → 162 tool, engine-ayrımlı kategori dosyaları
+  tools/                → 165 tool, engine-ayrımlı kategori dosyaları
     _common.py          → capability routing, _safe_cdp, _require_engine, _auto_learn
     the_twins/capabilities → motor-yetenek sözleşmesi ve Mirage yükseltme matrisi
     grimoire/seraph/prophecy/healer → CDP bilgi + doğrulama + pattern (paylaşılan)
@@ -251,7 +252,7 @@ camoufox-harness/       → Zig sidecar (Juggler protocol, vendor binary gömül
 - [x] **Tek tık kurulum** — `pnpm add -g @kahinmcp/kahin`, sonra `kahin` (ilk çalıştırmada Python ortamını otomatik kurar)
 - [ ] **Zero-dependency** hedefi (Go/Rust portu)
 - [ ] **LSP modu** — kod içinde hata yakalama, AI'a yanlışını yüzüne vurma
-- [x] **Tool sayısı 162** — Camoufox Juggler-native 112 tool (gerçek-zamanlı DOM stream, DOM, Reliability, Input, Network, Storage, Emulation, Dialog, Tab, Worker/WS, Upload, Screencast + Watch, Accessibility, Engine sağlığı/istatistik, Agent-native snapshot/form/state/identity/status, Stealth audit/humanized input/identity pins/proxy geo) + CF-Clear 2 (tarayıcısız hızlı yol: curl_cffi impersonate safari18_0 → chrome131, düz CF'yi browser'sız geçer + JS/challenge/canvas için embedded solver + status) + paylaşılan 48 çekirdek (Grimoire 7, Seraph 3, Pilot 9, Trainman 4, DejaVu 4, Prophecy 5, Healer 2, Crawler 7, Engine 2, Visualization 1, Extensions 1, OCR dahil)
+- [x] **Tool sayısı 165** — Camoufox/Mirage 112 tool (DOM stream 5, DOM 13, Reliability 9, Input 7, PageEx 6, Tab 7, Network/Console 10, Storage 6, Emulation 10, Dialog/Download/Worker/WS 7, Engine 2, Upload 2, Screencast + Watch 6, Accessibility 1, Agent 11, Stealth 10) + ORBIT 7 + VAULT 5 + WAF-COOKIE 3 + CF-CLEAR 2 + paylaşılan 36 çekirdek (Grimoire 7, Seraph 3, Pilot 9, Trainman 4, DejaVu 4, Prophecy 5, Healer 2, Visualization 1, Extensions 1)
 - [x] **Faz 4 performans yüzeyi** — non-blocking Zig sidecar (N=20 probe: paralel duvar 56.89 → 8.71 ms, ratio 1.314 → 3.281), `kahin_engine_stats` (monotonic uptime + per-tool rollup, top_slow ≤ 10) ve identity başına bounded prewarm metadata (launch asla atlanmaz; dürüst reuse kaydı)
 - [ ] **Obscura ayrı tool'ları** — CDP-yeteneklerine özel pilot_obscura/trainman_obscura/dejavu_obscura kategorilerini doldur
 

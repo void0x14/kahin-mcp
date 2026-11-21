@@ -1069,6 +1069,12 @@ async def agent_status() -> str:
                         payload["pageState"] = "unresponsive"
                 except Exception:  # noqa: BLE001
                     payload["pageState"] = "unresponsive"
+                if payload.get("pageState") == "unresponsive":
+                    recheck = engine.open_dialogs(session_id)
+                    if recheck:
+                        payload["pendingDialogs"] = len(recheck)
+                        payload["activeDialogs"] = [describe_dialog(item) for item in recheck]
+                        payload["pageState"] = "blocked_by_dialog"
                 stream = _dom_stream_status(session_id)
                 if stream is not None:
                     payload["refsLive"] = bool(stream.get("refsLive"))

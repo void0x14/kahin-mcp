@@ -50,13 +50,15 @@ def _dialog_owner_session(dialog_id: str) -> str | None:
         if isinstance(sid, str) and sid:
             return sid
     for event in reversed(state._current_event_log):
-        if event.get("event") != "Page.dialogOpened":
-            continue
+        ev_name = event.get("event")
         params = event.get("params") or {}
         if params.get("dialogId") != dialog_id:
             continue
-        session_id = event.get("session_id")
-        return session_id if isinstance(session_id, str) and session_id else None
+        if ev_name in {"Page.dialogClosed", "Page.javascriptDialogClosed"}:
+            return None
+        if ev_name in {"Page.dialogOpened", "Page.javascriptDialogOpening"}:
+            session_id = event.get("session_id")
+            return session_id if isinstance(session_id, str) and session_id else None
     return None
 
 
@@ -103,15 +105,19 @@ async def mirage_dialog_accept(
                 "code": "stale_dialog",
             }).decode()
         is_prompt = (meta or {}).get("type") == "prompt"
+        engine = state._current_engine
+        nav_seq_map = getattr(engine, "_nav_seq", None)
+        nav_seq_before = int(nav_seq_map.get(owner_session, 0)) if isinstance(nav_seq_map, dict) else 0
         visible_typed = False
         if prompt_text is not None and is_prompt:
-            engine = state._current_engine
             type_fn = getattr(engine, "type_into_visible_dialog", None)
             if callable(type_fn) and not getattr(engine, "_headless", True):
                 visible_typed = await type_fn(
                     prompt_text,
                     char_delay_ms=55 if humanize else 35,
                     settle_ms=300 if humanize else 250,
+                    allow_empty_clear=bool((meta or {}).get("defaultValue")),
+                    humanize=humanize,
                 )
             elif humanize:
                 await asyncio.sleep(min(1.5, 0.12 + 0.04 * len(prompt_text)))
@@ -122,6 +128,15 @@ async def mirage_dialog_accept(
             return raw
         if isinstance(parsed, dict) and parsed.get("error"):
             return raw
+        settle_fn = getattr(engine, "settle_after_dialog", None)
+        if callable(settle_fn):
+            await settle_fn(
+                owner_session,
+                dialog_id,
+                dialog_type=(meta or {}).get("type"),
+                accepted=True,
+                nav_seq_before=nav_seq_before,
+            )
         reply: dict[str, Any] = {
             "handled": "accepted",
             "dialogId": dialog_id,
@@ -130,6 +145,22 @@ async def mirage_dialog_accept(
         if prompt_text is not None:
             reply["promptText"] = prompt_text
             reply["visibleTyped"] = visible_typed
+        peek_fn = getattr(engine, "peek_unreported_auto_dialogs", None)
+        mark_fn = getattr(engine, "mark_auto_dialogs_delivered", None)
+        if callable(peek_fn):
+            unreported_auto, max_seq = peek_fn(owner_session)
+            if unreported_auto:
+                reply["dialogs"] = unreported_auto
+                if callable(mark_fn):
+                    mark_fn(owner_session, max_seq)
+        open_fn = getattr(engine, "open_dialogs", None)
+        if callable(open_fn):
+            next_open = open_fn(owner_session)
+            if next_open:
+                described_next = [describe_dialog(item) for item in next_open]
+                reply["nextDialog"] = described_next[0]
+                if len(described_next) > 1:
+                    reply["openDialogs"] = described_next
         return orjson.dumps(reply, option=orjson.OPT_INDENT_2).decode()
 
 
@@ -146,6 +177,9 @@ async def mirage_dialog_dismiss(dialog_id: str) -> str:
                 "error": "dialog_id is not present in the live dialog buffer; refusing to route it to the current tab",
                 "code": "stale_dialog",
             }).decode()
+        engine = state._current_engine
+        nav_seq_map = getattr(engine, "_nav_seq", None)
+        nav_seq_before = int(nav_seq_map.get(owner_session, 0)) if isinstance(nav_seq_map, dict) else 0
         raw = await _mirage_call(
             "Page.handleDialog", {"dialogId": dialog_id, "accept": False}, session_id=owner_session,
         )
@@ -155,11 +189,37 @@ async def mirage_dialog_dismiss(dialog_id: str) -> str:
             return raw
         if isinstance(parsed, dict) and parsed.get("error"):
             return raw
-        return orjson.dumps({
+        settle_fn = getattr(engine, "settle_after_dialog", None)
+        if callable(settle_fn):
+            await settle_fn(
+                owner_session,
+                dialog_id,
+                dialog_type=(meta or {}).get("type"),
+                accepted=False,
+                nav_seq_before=nav_seq_before,
+            )
+        reply: dict[str, Any] = {
             "handled": "dismissed",
             "dialogId": dialog_id,
             "type": (meta or {}).get("type") or "dialog",
-        }, option=orjson.OPT_INDENT_2).decode()
+        }
+        peek_fn = getattr(engine, "peek_unreported_auto_dialogs", None)
+        mark_fn = getattr(engine, "mark_auto_dialogs_delivered", None)
+        if callable(peek_fn):
+            unreported_auto, max_seq = peek_fn(owner_session)
+            if unreported_auto:
+                reply["dialogs"] = unreported_auto
+                if callable(mark_fn):
+                    mark_fn(owner_session, max_seq)
+        open_fn = getattr(engine, "open_dialogs", None)
+        if callable(open_fn):
+            next_open = open_fn(owner_session)
+            if next_open:
+                described_next = [describe_dialog(item) for item in next_open]
+                reply["nextDialog"] = described_next[0]
+                if len(described_next) > 1:
+                    reply["openDialogs"] = described_next
+        return orjson.dumps(reply, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_mirage_download_list", annotations=_RO)

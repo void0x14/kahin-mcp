@@ -26,11 +26,28 @@ import orjson
 
 from kahin import _state as state
 from kahin._mcp import mcp
+from kahin.the_twins.mirage import describe_dialog
 from kahin.tools._common import _RO, _RW, _healer_ref, _mirage_call, _mirage_engine, _require_mirage
 
 
+def _dialog_meta(dialog_id: str) -> dict[str, Any] | None:
+    """Look up live dialog metadata directly from Mirage's open-dialog table."""
+    engine = state._current_engine
+    open_dialogs = getattr(engine, "open_dialogs", None)
+    if callable(open_dialogs):
+        for item in open_dialogs():
+            if item.get("dialogId") == dialog_id:
+                return item
+    return None
+
+
 def _dialog_owner_session(dialog_id: str) -> str | None:
-    """Find the session that opened a dialog; never route by current tab."""
+    """Find the session that opened a dialog; prefer live Mirage state."""
+    meta = _dialog_meta(dialog_id)
+    if isinstance(meta, dict):
+        sid = meta.get("sessionId")
+        if isinstance(sid, str) and sid:
+            return sid
     for event in reversed(state._current_event_log):
         if event.get("event") != "Page.dialogOpened":
             continue
@@ -44,29 +61,18 @@ def _dialog_owner_session(dialog_id: str) -> str | None:
 
 @mcp.tool(name="kahin_mirage_dialog_list", annotations=_RO)
 async def mirage_dialog_list() -> str:
-    """Mirage: dialogs currently open (Page.dialogOpened minus dialogClosed),
-    read from the forwarded event buffer."""
+    """Mirage: interactive dialogs currently open on the active tab."""
     async with _healer_ref.safe("kahin_mirage_dialog_list"):
         err = await _require_mirage()
         if err:
             return err
         engine = _mirage_engine()
-        current_session = engine._sessions.get(engine._current_target or "")
-        open_dialogs: dict[str, dict[str, Any]] = {}
-        for e in state._current_event_log:
-            if e.get("session_id") != current_session:
-                continue
-            if e["event"] == "Page.dialogOpened":
-                params = e.get("params") or {}
-                open_dialogs[params.get("dialogId", "?")] = {
-                    "dialogId": params.get("dialogId"),
-                    "type": params.get("type"),
-                    "message": params.get("message"),
-                    "defaultValue": params.get("defaultValue"),
-                }
-            elif e["event"] == "Page.dialogClosed":
-                open_dialogs.pop((e.get("params") or {}).get("dialogId", "?"), None)
-        return orjson.dumps(list(open_dialogs.values()), option=orjson.OPT_INDENT_2).decode()
+        current_session = engine.current_session_id()
+        dialogs = engine.open_dialogs(current_session) if current_session else []
+        return orjson.dumps(
+            [describe_dialog(item) for item in dialogs],
+            option=orjson.OPT_INDENT_2,
+        ).decode()
 
 
 @mcp.tool(name="kahin_mirage_dialog_accept", annotations=_RW)
@@ -81,13 +87,28 @@ async def mirage_dialog_accept(dialog_id: str, prompt_text: str | None = None) -
         params: dict[str, Any] = {"dialogId": dialog_id, "accept": True}
         if prompt_text is not None:
             params["promptText"] = prompt_text
+        meta = _dialog_meta(dialog_id)
         owner_session = _dialog_owner_session(dialog_id)
         if owner_session is None:
             return orjson.dumps({
                 "error": "dialog_id is not present in the live dialog buffer; refusing to route it to the current tab",
                 "code": "stale_dialog",
             }).decode()
-        return await _mirage_call("Page.handleDialog", params, session_id=owner_session)
+        raw = await _mirage_call("Page.handleDialog", params, session_id=owner_session)
+        try:
+            parsed = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            return raw
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return raw
+        reply: dict[str, Any] = {
+            "handled": "accepted",
+            "dialogId": dialog_id,
+            "type": (meta or {}).get("type") or "dialog",
+        }
+        if prompt_text is not None:
+            reply["promptText"] = prompt_text
+        return orjson.dumps(reply, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_mirage_dialog_dismiss", annotations=_RW)
@@ -96,15 +117,27 @@ async def mirage_dialog_dismiss(dialog_id: str) -> str:
     if not isinstance(dialog_id, str) or not dialog_id:
         return orjson.dumps({"error": "dialog_id must be a non-empty string", "code": "invalid_argument"}).decode()
     async with _healer_ref.safe("kahin_mirage_dialog_dismiss", dialog_id=dialog_id[:80]):
+        meta = _dialog_meta(dialog_id)
         owner_session = _dialog_owner_session(dialog_id)
         if owner_session is None:
             return orjson.dumps({
                 "error": "dialog_id is not present in the live dialog buffer; refusing to route it to the current tab",
                 "code": "stale_dialog",
             }).decode()
-        return await _mirage_call(
+        raw = await _mirage_call(
             "Page.handleDialog", {"dialogId": dialog_id, "accept": False}, session_id=owner_session,
         )
+        try:
+            parsed = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            return raw
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return raw
+        return orjson.dumps({
+            "handled": "dismissed",
+            "dialogId": dialog_id,
+            "type": (meta or {}).get("type") or "dialog",
+        }, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_mirage_download_list", annotations=_RO)

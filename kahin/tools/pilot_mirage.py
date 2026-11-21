@@ -409,6 +409,18 @@ async def _action_ready(
     async def probe(expression: str) -> dict[str, Any]:
         result = await _safe_mirage_eval_result(tool, expression, frame_id, session_id=session_id)
         if isinstance(result, str):
+            try:
+                parsed = orjson.loads(result)
+            except orjson.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                code = str(parsed.get("code") or "")
+                cause = str(parsed.get("cause") or "")
+                if (
+                    code in {"command_stalled", "engine_dead", "connection_lost", "dialog_response_required"}
+                    or cause in {"pending_js_dialog", "webauthn_pending", "dead_pipe"}
+                ):
+                    return {"abort": True, "code": code or cause, "raw": result}
             return {"error": "probe_failed"}
         value = result.get("result") or {}
         probe_value = value.get("value") if isinstance(value, dict) else None
@@ -453,6 +465,8 @@ async def _action_ready(
 
     ready = await wait_for_ready(probe, selector, timeout=timeout)
     if not ready.get("ok"):
+        if ready.get("aborted") and isinstance(ready.get("raw"), str):
+            return ready["raw"]
         return _json_error(
             tool,
             f"element is not actionable: {ready.get('reason') or ready.get('code')}",

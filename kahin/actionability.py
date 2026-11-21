@@ -112,6 +112,16 @@ async def wait_for_ready(
             if stability <= 0 or stable_hits >= stability:
                 return {"ok": True, "x": point[0], "y": point[1], "selector": selector}
         else:
+            if last.get("abort") is True:
+                return {
+                    "ok": False,
+                    "aborted": True,
+                    "raw": last.get("raw"),
+                    "code": str(last.get("code") or "aborted"),
+                    "reason": last.get("reason"),
+                    "selector": selector,
+                    "timeout": timeout,
+                }
             # Actionability can change while the page is settling: a hidden,
             # disabled, or obscured control may become usable on a later tick.
             # Keep polling every non-ok state, but retain the latest useful

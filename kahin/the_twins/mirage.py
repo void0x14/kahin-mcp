@@ -1473,6 +1473,53 @@ class Mirage(BrowserEngine):
         except asyncio.TimeoutError:
             pass
 
+    async def type_into_visible_dialog(
+        self,
+        text: str,
+        *,
+        char_delay_ms: int = 35,
+        settle_ms: int = 250,
+    ) -> bool:
+        """Visibly type ``text`` into an open headed JS prompt via X11 xdotool."""
+        if self._headless or self._process is None or not os.environ.get("DISPLAY") or not text:
+            return False
+        root_pid = self._process.pid
+        delay = max(1, min(int(char_delay_ms), 250))
+
+        def _type_sync() -> bool:
+            windows: list[str] = []
+            for pid in [root_pid, *_browser_descendant_pids(root_pid)]:
+                windows.extend(_x11_windows_for_pid(pid))
+            windows = list(dict.fromkeys(windows))
+            if not windows:
+                return False
+            win = windows[0]
+            try:
+                subprocess.run(
+                    ["xdotool", "windowactivate", "--sync", win],
+                    capture_output=True, text=True, timeout=2.0, check=False,
+                )
+                subprocess.run(
+                    ["xdotool", "key", "--window", win, "--clearmodifiers", "ctrl+a", "BackSpace"],
+                    capture_output=True, text=True, timeout=2.0, check=False,
+                )
+                type_timeout = max(5.0, len(text) * (delay / 1000.0 + 0.05) + 3.0)
+                res = subprocess.run(
+                    [
+                        "xdotool", "type", "--window", win,
+                        "--delay", str(delay), "--clearmodifiers", "--", text,
+                    ],
+                    capture_output=True, text=True, timeout=type_timeout, check=False,
+                )
+                return res.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                return False
+
+        typed = await asyncio.to_thread(_type_sync)
+        if typed and settle_ms > 0:
+            await asyncio.sleep(min(settle_ms, 1000) / 1000.0)
+        return typed
+
     def open_dialogs(self, session_id: str | None = None) -> list[dict[str, Any]]:
         """Open JS dialogs on one session (or every session), oldest first."""
         sessions = [session_id] if session_id is not None else list(self._open_dialogs)

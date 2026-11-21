@@ -20,6 +20,7 @@ The list tools therefore read the forwarded event buffer
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import orjson
@@ -76,13 +77,20 @@ async def mirage_dialog_list() -> str:
 
 
 @mcp.tool(name="kahin_mirage_dialog_accept", annotations=_RW)
-async def mirage_dialog_accept(dialog_id: str, prompt_text: str | None = None) -> str:
+async def mirage_dialog_accept(
+    dialog_id: str,
+    prompt_text: str | None = None,
+    humanize: bool = False,
+) -> str:
     """Mirage: accept a dialog (Page.handleDialog accept=true). prompt_text is
-    used for prompt() dialogs."""
+    used for prompt() dialogs; in headed mode it is visibly typed first, and
+    humanize=true adds human-like timing even in headless mode."""
     if not isinstance(dialog_id, str) or not dialog_id:
         return orjson.dumps({"error": "dialog_id must be a non-empty string", "code": "invalid_argument"}).decode()
     if prompt_text is not None and not isinstance(prompt_text, str):
         return orjson.dumps({"error": "prompt_text must be a string when provided", "code": "invalid_argument"}).decode()
+    if not isinstance(humanize, bool):
+        return orjson.dumps({"error": "humanize must be a boolean", "code": "invalid_argument"}).decode()
     async with _healer_ref.safe("kahin_mirage_dialog_accept", dialog_id=dialog_id[:80]):
         params: dict[str, Any] = {"dialogId": dialog_id, "accept": True}
         if prompt_text is not None:
@@ -94,6 +102,19 @@ async def mirage_dialog_accept(dialog_id: str, prompt_text: str | None = None) -
                 "error": "dialog_id is not present in the live dialog buffer; refusing to route it to the current tab",
                 "code": "stale_dialog",
             }).decode()
+        is_prompt = (meta or {}).get("type") == "prompt"
+        visible_typed = False
+        if prompt_text is not None and is_prompt:
+            engine = state._current_engine
+            type_fn = getattr(engine, "type_into_visible_dialog", None)
+            if callable(type_fn) and not getattr(engine, "_headless", True):
+                visible_typed = await type_fn(
+                    prompt_text,
+                    char_delay_ms=55 if humanize else 35,
+                    settle_ms=300 if humanize else 250,
+                )
+            elif humanize:
+                await asyncio.sleep(min(1.5, 0.12 + 0.04 * len(prompt_text)))
         raw = await _mirage_call("Page.handleDialog", params, session_id=owner_session)
         try:
             parsed = orjson.loads(raw)
@@ -108,6 +129,7 @@ async def mirage_dialog_accept(dialog_id: str, prompt_text: str | None = None) -
         }
         if prompt_text is not None:
             reply["promptText"] = prompt_text
+            reply["visibleTyped"] = visible_typed
         return orjson.dumps(reply, option=orjson.OPT_INDENT_2).decode()
 
 

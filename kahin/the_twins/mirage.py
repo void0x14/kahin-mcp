@@ -2132,10 +2132,15 @@ class Mirage(BrowserEngine):
             if loop.time() > deadline:
                 raise RuntimeError(f"session for target {target_id} never attached")
             await asyncio.sleep(0.05)
+        from kahin.subagent import get_active_subagent_context  # noqa: PLC0415
+
+        cid = get_active_subagent_context().get("caller_id")
         async with self._target_lock:
             if target_id not in self._sessions:
                 raise RuntimeError(f"target {target_id} detached before it became current")
             self._current_target = target_id
+            if cid:
+                self._agent_targets[cid] = target_id
             session_id = self._sessions[target_id]
         await self._wait_for_page_frame(session_id, deadline=min(deadline, loop.time() + 3.0))
         # Reflect runtime user-agent override onto DOM prototype for newly created pages
@@ -2384,9 +2389,15 @@ class Mirage(BrowserEngine):
             for k, v in list(self._agent_targets.items()):
                 if v == target_id:
                     self._agent_targets.pop(k, None)
-                    ctx = self._agent_contexts.pop(k, None)
+                    ctx = self._agent_contexts.get(k)
                     if ctx:
-                        contexts_to_remove.append(ctx)
+                        still_in_ctx = any(
+                            (self._target_infos.get(tid) or {}).get("browserContextId") == ctx
+                            for tid in self._sessions
+                        )
+                        if not still_in_ctx:
+                            self._agent_contexts.pop(k, None)
+                            contexts_to_remove.append(ctx)
             if self._current_target == target_id:
                 self._current_target = next(iter(self._sessions), None)
         for ctx in contexts_to_remove:

@@ -22,6 +22,7 @@ import httpx
 import orjson
 
 from kahin import _state as state
+from kahin import media as _media
 from kahin._mcp import mcp
 from kahin.oracle import _on_cdp_event, _on_console_event, _on_engine_death, _on_network_event
 from kahin.the_twins.capabilities import capabilities_for
@@ -29,6 +30,7 @@ from kahin.the_twins.mirage import (
     STATE_MODE_AGIRBAS,
     STATE_MODE_KES,
     Mirage,
+    MirageCommandTimeout,
     _canonical_state_mode,
     _profile_directory,
 )
@@ -43,6 +45,7 @@ from kahin.tools._common import (
     _MAX_TOOL_PAYLOAD_BYTES,
     _require_mirage,
     _safe_cdp,
+    _stall_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,7 +57,7 @@ _MAX_SELECTOR_LENGTH = 16_384
 _MAX_ATTRIBUTE_LENGTH = 1_024
 _MAX_EXTRACT_LENGTH = 100_000
 _MAX_EVALUATE_LENGTH = 1_000_000
-_MAX_SCREENSHOT_BYTES = 32 * 1024 * 1024
+_MAX_SCREENSHOT_BYTES = _media._MAX_SCREENSHOT_BYTES
 _VISION_API_URL = "https://vision.googleapis.com/v1/images:annotate"
 _MAX_OCR_INPUT_LENGTH = 50 * 1024 * 1024
 _NAVIGATE_WAIT_UNTIL = ("commit", "domcontentloaded", "load", "networkidle")
@@ -447,6 +450,7 @@ async def browser_start(
     passkey_mode: bool = False,
     mode: str | None = None,
     ephemeral_ack: bool = False,
+    media_destination: str | None = None,
 ) -> str:
     """Start or reuse one browser engine.
 
@@ -529,6 +533,14 @@ async def browser_start(
             "ephemeral_ack must be a boolean",
             "invalid_argument",
             field="ephemeral_ack",
+        )
+    validated_media_dest, media_dest_error = _media.validate_destination(media_destination)
+    if media_dest_error:
+        return _json_error(
+            "kahin_browser_start",
+            media_dest_error,
+            "invalid_argument",
+            field="media_destination",
         )
     # Resolve the requested state mode early. ``mode`` has no default (spec
     # §5); passkey_mode is the only implicit agirbas so existing Bitwarden
@@ -866,6 +878,8 @@ async def browser_start(
                         current_port = (
                             getattr(current, "port", None) if current_kind == "shadow" else 0
                         )
+                        if validated_media_dest is not None:
+                            state._media_destination = validated_media_dest
                         reuse_result = {
                             "status": "reused",
                             "engine": current_kind,
@@ -877,6 +891,7 @@ async def browser_start(
                             "message": "Engine already running; reusing the existing browser and tabs.",
                             "port": current_port or 0,
                             "tabs": tabs,
+                            "mediaDestination": _media.sanitize_destination(_media.resolve_destination(None)),
                         }
                         if passkey_mode:
                             reuse_result["passkey_mode"] = True
@@ -1009,6 +1024,7 @@ async def browser_start(
                 )
                 if engine == "shadow":
                     actual_port = candidate.port or actual_port
+                    candidate._state_mode = canonical_mode
             except asyncio.TimeoutError:
                 failed_port = getattr(candidate, "port", None) or actual_port
                 await _stop_engine(candidate)
@@ -1062,6 +1078,8 @@ async def browser_start(
                 state.clear_state()
                 raise
 
+            if validated_media_dest is not None:
+                state._media_destination = validated_media_dest
             start_result = {
                 "status": "started",
                 "engine": "mirage" if engine == "camoufox" else engine,
@@ -1072,6 +1090,7 @@ async def browser_start(
                 "addons": _addons_start_summary(candidate),
                 "port": actual_port,
                 "tabs": tabs,
+                "mediaDestination": _media.sanitize_destination(_media.resolve_destination(None)),
                 "hint": "Reuse this browser; for separate work create/switch a Mirage tab.",
             }
             if bitwarden_state is not None:
@@ -1108,6 +1127,7 @@ async def browser_stop() -> str:
                     hint="Retry kahin_browser_stop; the engine reference was retained for cleanup.",
                 )
             state._current_engine = None
+            state._media_destination = None
             _healer_ref.bind_engine(None)
             state.clear_state()
             state.release_browser_lock()
@@ -1454,44 +1474,71 @@ async def extract(selector: str | None = None, attribute: str | None = None) -> 
 
 
 @mcp.tool(name="kahin_screenshot", annotations=_RO)
-async def screenshot(full_page: bool = False) -> str:
-    """Capture a screenshot through Camoufox, promoting Shadow if needed."""
+async def screenshot(
+    full_page: bool = False,
+    topic: str | None = None,
+    destination: str | None = None,
+    redact: bool = True,
+    vision: str = "auto",
+) -> str:
+    """Capture a redacted topic-named PNG screenshot; deliver locally or remotely without returning base64."""
     if not isinstance(full_page, bool):
         return _json_error(
             "kahin_screenshot", "full_page must be a boolean", "invalid_argument", field="full_page",
         )
+    if not isinstance(redact, bool):
+        return _json_error(
+            "kahin_screenshot", "redact must be a boolean", "invalid_argument", field="redact",
+        )
+    if vision not in ("auto", "always", "never"):
+        return _json_error(
+            "kahin_screenshot",
+            "vision must be 'auto', 'always', or 'never'",
+            "invalid_argument",
+            field="vision",
+        )
+    topic_value, topic_error = _media.validate_topic(topic)
+    if topic_error:
+        return _json_error("kahin_screenshot", topic_error, "invalid_argument", field="topic")
+    dest_value, dest_error = _media.validate_destination(destination)
+    if dest_error:
+        return _json_error("kahin_screenshot", dest_error, "invalid_argument", field="destination")
     try:
         err = await _require_mirage()
         if err:
             return err
-        async with _healer_ref.safe("kahin_screenshot", full_page=full_page):
+        async with _healer_ref.safe("kahin_screenshot", full_page=full_page, topic=topic_value):
             engine = state._current_engine
             if engine is None:
                 return _json_error("kahin_screenshot", "No browser engine is running", "engine_unavailable")
-            data = await engine.screenshot(full_page=full_page)
-            if not isinstance(data, (bytes, bytearray)) or not data:
-                return _json_error(
-                    "kahin_screenshot", "Browser returned no screenshot data", "invalid_engine_response",
-                )
-            if len(data) > _MAX_SCREENSHOT_BYTES:
+            result = await _media.capture_and_deliver(
+                engine,
+                full_page=full_page,
+                topic=topic_value,
+                destination=dest_value,
+                redact=redact,
+                vision=vision,
+            )
+            if result.get("error"):
                 return _json_error(
                     "kahin_screenshot",
-                    "Screenshot exceeds Kahin's bounded response size",
-                    "result_too_large",
-                    payloadBytes=len(data),
-                    maxPayloadBytes=_MAX_SCREENSHOT_BYTES,
-                    hint="Use the mobile viewport or a non-full-page screenshot.",
+                    str(result["error"]),
+                    str(result.get("code") or "tool_failed"),
+                    delivery=result.get("delivery"),
                 )
-            from pathlib import Path as _P
-            import time as _t
-            out_dir = _P("screenshots")
-            out_dir.mkdir(parents=True, exist_ok=True)
-            fname = f"screenshot-{int(_t.time()*1000)}.png"
-            fpath = out_dir / fname
-            fpath.write_bytes(bytes(data))
-            return orjson.dumps({"path": str(fpath.resolve()), "format": "png", "bytes": len(data)}, option=orjson.OPT_INDENT_2).decode()
+            delivery = result.get("delivery") or {}
+            if not delivery.get("ok"):
+                return _json_error(
+                    "kahin_screenshot",
+                    str(delivery.get("error") or "Media delivery failed"),
+                    str(delivery.get("code") or "media_delivery_failed"),
+                    delivery=delivery,
+                )
+            return orjson.dumps(result, option=orjson.OPT_INDENT_2).decode()
+    except MirageCommandTimeout as exc:
+        return _stall_payload("Page.captureScreenshot", exc)
     except Exception as exc:  # noqa: BLE001 - visual tools must never leak exceptions
-        return _json_error("kahin_screenshot", f"Screenshot failed: {exc}", "tool_failed")
+        return _json_error("kahin_screenshot", f"Screenshot failed: {_media.redact_text(str(exc))}", "tool_failed")
 
 
 def _read_ocr_image(value: str) -> bytes:

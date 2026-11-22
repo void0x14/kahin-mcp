@@ -106,7 +106,7 @@ Juggler/Mirage yüzeyinin ajana dönük, uçtan uca sözleşmesi:
 | `kahin_navigate` | URL'e git |
 | `kahin_click` | CSS selector ile element tıkla |
 | `kahin_extract` | Sayfadan metin/attribute çek |
-| `kahin_screenshot` | Ekran görüntüsü al (base64 PNG) |
+| `kahin_screenshot` | Konu adlı redakte edilmiş PNG ekran görüntüsü al (`$KAHIN_HOME/medya/` veya özel `destination`: dizin/HTTP/FTP/Telegram; non-multimodal ajanlar için `modlens` görsel köprüsü, base64 dönmez) |
 | `kahin_evaluate` | JavaScript çalıştır |
 | `kahin_execute_cdp` | Ham CDP komutu gönder (ileri seviye) |
 | `kahin_ocr` | Görüntüyü Google Vision TEXT_DETECTION ile oku |
@@ -306,7 +306,7 @@ Eşikler: `KAHIN_HARNESS_REPEAT_FAILS`, `KAHIN_HARNESS_TIMEOUT_HALT`,
 | Tool | Ne işe yarar? |
 |------|---------------|
 | `kahin_mirage_screencast_start` | Canlı ekran kaydı başlat (Page.startScreencast → screencastId) |
-| `kahin_mirage_screencast_frame` | Bir sonraki frame'i al (base64 JPEG) + otomatik ack; sayfa değişiminden sonra `fresh=true` ile kuyruk temizle |
+| `kahin_mirage_screencast_frame` | Bir sonraki frame'i konu adlı redakte edilmiş PNG olarak kaydet/gönder (`$KAHIN_HOME/medya/` veya özel `destination`) + otomatik ack; `fresh=true` ile kuyruk temizle, base64 dönmez |
 | `kahin_mirage_screencast_stop` | Kaydı durdur, kalan frame'leri temizle |
 | `kahin_mirage_screencast_pending` | Bekleyen (ack'siz) frame sayısı + stream sağlığı |
 | `kahin_mirage_watch_start` | Aktif screencast için localhost-only MJPEG watch başlat |

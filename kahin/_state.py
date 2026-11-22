@@ -30,6 +30,7 @@ _event_seq = 0
 _network_requests: deque[dict[str, Any]] = deque(maxlen=10000)
 _console_messages: deque[dict[str, Any]] = deque(maxlen=5000)
 _browser_lock_file: Any = None
+_media_destination: str | None = None
 
 # --- Crawler registry ----------------------------------------------------
 # Deliberately separate from the event/network/console buffers. Engine
@@ -107,6 +108,8 @@ def clear_state() -> None:
     # Event/network/console buffers only. Crawler state (_crawl_jobs and the
     # active job slot) is intentionally preserved so rotation/recovery can
     # stop and start the engine without losing the crawl.
+    global _media_destination
+    _media_destination = None
     _current_event_log.clear()
     _network_requests.clear()
     _console_messages.clear()

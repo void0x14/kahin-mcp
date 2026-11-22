@@ -32,9 +32,11 @@ the real Page.screencastFrame event.
 
 from __future__ import annotations
 
+import base64
 import orjson
 from numbers import Integral
 
+from kahin import media as _media
 from kahin._mcp import mcp
 from kahin.tools._common import (
     _RO,
@@ -147,24 +149,22 @@ async def mirage_screencast_start(width: int = 1280, height: int = 720, quality:
 
 @mcp.tool(name="kahin_mirage_screencast_frame", annotations=_RW)
 async def mirage_screencast_frame(
-    screencast_id: str | None = None, timeout: float = 10.0, fresh: bool = False
+    screencast_id: str | None = None,
+    timeout: float = 10.0,
+    fresh: bool = False,
+    topic: str | None = None,
+    destination: str | None = None,
+    redact: bool = True,
+    vision: str = "auto",
 ) -> str:
-    """Mirage: wait for and return the next screencast frame
-    (Page.screencastFrame) as base64-JPEG in ``data`` with deviceWidth /
-    deviceHeight. Waits up to ``timeout`` seconds when no frame is queued;
-    frames already queued (unacked) are returned oldest-first unless fresh is
-    true. With fresh=true, queued frames are discarded and ACKed, then the
-    tool waits for a frame arriving after this call. On return the frame is
-    automatically ACKed (Page.screencastFrameAck) with its stream id —
-    Camoufox holds the stream at one unacked frame, so a missing ack would
-    stall it; the ack happens in THIS call (never in the reader loop) and a
-    failed ack is reported without losing the frame. screencast_id defaults
-    to the id from kahin_mirage_screencast_start."""
+    """Mirage: wait for the next screencast frame, convert to redacted topic-named PNG,
+    deliver to destination (default $KAHIN_HOME/medya), and return metadata without base64."""
     async with _healer_ref.safe(
         "kahin_mirage_screencast_frame",
         screencast_id=screencast_id,
         timeout=timeout,
         fresh=fresh,
+        topic=topic,
     ):
         if isinstance(timeout, bool):
             return '{"error": "timeout must be a finite number of seconds", "code": "invalid_argument"}'
@@ -177,6 +177,16 @@ async def mirage_screencast_frame(
         wait = min(wait, 120.0)
         if not isinstance(fresh, bool):
             return '{"error": "fresh must be a boolean", "code": "invalid_argument"}'
+        if not isinstance(redact, bool):
+            return '{"error": "redact must be a boolean", "code": "invalid_argument"}'
+        if vision not in ("auto", "always", "never"):
+            return '{"error": "vision must be \'auto\', \'always\', or \'never\'", "code": "invalid_argument"}'
+        topic_value, topic_error = _media.validate_topic(topic)
+        if topic_error:
+            return orjson.dumps({"error": topic_error, "code": "invalid_argument", "field": "topic"}).decode()
+        dest_value, dest_error = _media.validate_destination(destination)
+        if dest_error:
+            return orjson.dumps({"error": dest_error, "code": "invalid_argument", "field": "destination"}).decode()
         err = await _require_mirage()
         if err:
             return err
@@ -187,7 +197,13 @@ async def mirage_screencast_frame(
             active_sid = engine._screencast_id
             owner_session = engine.screencast_session_id
             generation = engine.screencast_generation
-        if screencast_id is not None and active_sid is not None and screencast_id != active_sid:
+        if screencast_id is not None and screencast_id != active_sid:
+            if active_sid is None:
+                return orjson.dumps({
+                    "error": "screencastId does not match any active stream (screencast is stopped)",
+                    "code": "screencast_not_running",
+                    "activeScreencastId": None,
+                }, option=orjson.OPT_INDENT_2).decode()
             return orjson.dumps({
                 "error": "screencastId does not match the active stream",
                 "activeScreencastId": active_sid,
@@ -222,6 +238,55 @@ async def mirage_screencast_frame(
                 "hint": "Is a screencast running? Start one with "
                 "kahin_mirage_screencast_start; an animating page emits frames.",
             }, option=orjson.OPT_INDENT_2).decode()
+        raw_b64 = frame.get("data", "")
+        try:
+            raw_bytes = base64.b64decode(raw_b64, validate=True)
+            png_bytes, width, height = _media.ensure_png(raw_bytes)
+        except Exception:  # noqa: BLE001
+            return orjson.dumps({
+                "error": "Screencast frame could not be decoded as a valid image",
+                "code": "invalid_engine_response",
+            }, option=orjson.OPT_INDENT_2).decode()
+
+        ctx = await _media.collect_page_visual_context(
+            engine, session_id=owner_session, full_page=False, collect_redact=redact, timeout=2.0,
+        )
+        if redact and not ctx.get("contextComplete"):
+            async with engine._screencast_lock:
+                if engine.screencast_generation == generation:
+                    engine._screencast_frames.appendleft(frame)
+                    engine._screencast_event.set()
+            return orjson.dumps({
+                "error": "Sayfa redaksiyon bağlamı alınamadığı için kare teslim edilmedi (fail-closed).",
+                "code": "redaction_context_unavailable",
+                "requeued": True,
+            }, option=orjson.OPT_INDENT_2).decode()
+
+        redacted_regions = 0
+        if redact and ctx.get("sensitiveRects"):
+            sx, sy = _media.effective_scale(width, height, ctx, full_page=False)
+            png_bytes, redacted_regions = _media.redact_png(png_bytes, ctx["sensitiveRects"], scale_x=sx, scale_y=sy)
+        filename = _media.build_png_filename(
+            url=str(ctx.get("url") or ""),
+            title=str(ctx.get("title") or ""),
+            topic=topic_value,
+            kind="akis",
+        )
+        delivery = await _media.deliver_png(
+            png_bytes, filename, dest_value, topic=topic_value or str(ctx.get("title") or ""),
+        )
+        if not delivery.get("ok"):
+            async with engine._screencast_lock:
+                if engine.screencast_generation == generation:
+                    engine._screencast_frames.appendleft(frame)
+                    engine._screencast_event.set()
+            return orjson.dumps({
+                "error": str(delivery.get("error") or "Media delivery failed"),
+                "code": str(delivery.get("code") or "media_delivery_failed"),
+                "delivery": delivery,
+                "requeued": True,
+            }, option=orjson.OPT_INDENT_2).decode()
+
         ack = {"sent": False, "screencastId": sid, "error": None}
         if sid:
             try:
@@ -234,22 +299,29 @@ async def mirage_screencast_frame(
                 ack["error"] = str(e)
             except Exception as e:
                 ack["error"] = str(e)
-            if ack["error"]:
-                # Keep the frame available for a retry.  Camoufox also keeps
-                # its corresponding frame in-flight until a valid ACK.
-                async with engine._screencast_lock:
-                    if engine.screencast_generation == generation:
-                        engine._screencast_frames.appendleft(frame)
-                        engine._screencast_event.set()
-        data = frame.get("data", "")
+        vision_info = None
+        run_vision, _ = _media.should_run_vision(vision)
+        if run_vision:
+            vision_info = await _media.analyze_with_vision_model(
+                png_bytes, local_path=delivery.get("path"), prompt=topic_value,
+            )
         return orjson.dumps({
-            "data": data,
-            "dataLength": len(data),
-            "frameBytes": int(len(data) * 3 / 4),
+            "path": delivery.get("path"),
+            "filename": filename,
+            "topic": topic_value or (str(ctx.get("title") or "").strip() or None),
+            "format": "png",
+            "sourceFormat": "jpeg",
+            "mimeType": "image/png",
+            "bytes": len(png_bytes),
+            "width": width,
+            "height": height,
             "deviceWidth": frame.get("deviceWidth"),
             "deviceHeight": frame.get("deviceHeight"),
-            "format": "jpeg",
+            "redacted": redacted_regions > 0,
+            "redactedRegions": redacted_regions,
             "droppedFrames": dropped,
+            "delivery": delivery,
+            "vision": vision_info,
             "ack": ack,
         }, option=orjson.OPT_INDENT_2).decode()
 

@@ -188,6 +188,127 @@ def _is_error_response(raw: str) -> bool:
     return isinstance(payload, dict) and bool(payload.get("error"))
 
 
+_EDITABLE_PREPARE_BODY_JS = (
+    "  const tag = String(el.tagName || '').toLowerCase();"
+    "  const inputType = String(el.type || '').toLowerCase();"
+    "  const editable = el.isContentEditable || tag === 'textarea' || (tag === 'input' && !['button','checkbox','file','hidden','image','radio','range','reset','submit'].includes(inputType));"
+    "  if (!editable) return {error: 'element is not editable', code: 'not_editable'};"
+    "  if (el.disabled || el.readOnly || el.getAttribute('aria-disabled') === 'true') return {error: 'element is disabled or read-only', code: 'not_editable'};"
+    "  const doc = el.ownerDocument || document;"
+    "  const win = doc.defaultView || window;"
+    "  const before = el.isContentEditable ? String(el.textContent || '') : String(el.value || '');"
+    "  const hasContent = before.length > 0 || Boolean(!el.isContentEditable && el.validity && el.validity.badInput);"
+    "  el.focus();"
+    "  let needsClear = false;"
+    "  let needsEndKey = false;"
+    "  if (clear && hasContent) {"
+    "    if (el.isContentEditable) {"
+    "      const r = doc.createRange();"
+    "      r.selectNodeContents(el);"
+    "      const s = win.getSelection();"
+    "      if (s) { s.removeAllRanges(); s.addRange(r); }"
+    "      needsClear = true;"
+    "    } else if (typeof el.select === 'function') {"
+    "      el.select();"
+    "      needsClear = true;"
+    "    }"
+    "  } else if (!clear && hasContent) {"
+    "    if (el.isContentEditable) {"
+    "      const r = doc.createRange();"
+    "      r.selectNodeContents(el);"
+    "      r.collapse(false);"
+    "      const s = win.getSelection();"
+    "      if (s) { s.removeAllRanges(); s.addRange(r); }"
+    "    } else if (typeof el.setSelectionRange === 'function') {"
+    "      try { el.setSelectionRange(before.length, before.length); } catch (_) { needsEndKey = true; }"
+    "    } else {"
+    "      needsEndKey = true;"
+    "    }"
+    "  }"
+    "  const root = el.getRootNode ? el.getRootNode() : doc;"
+    "  const ready = doc.activeElement === el || (root && root.activeElement === el);"
+)
+
+
+def _editable_prepare_js(clear: bool) -> str:
+    return f"  const clear = {'true' if clear else 'false'};\n{_EDITABLE_PREPARE_BODY_JS}"
+
+
+async def _dispatch_named_key(tool: str, key: str, session_id: str) -> str | None:
+    """Send a real Juggler keydown+keyup pair (e.g. Backspace or End)."""
+    code, key_code = _key_defaults(key)
+    for event_type in ("keydown", "keyup"):
+        res = await _safe_mirage_call(
+            tool,
+            "Page.dispatchKeyEvent",
+            {
+                "type": event_type,
+                "key": key,
+                "keyCode": key_code,
+                "location": 0,
+                "code": code,
+                "repeat": False,
+            },
+            session_id=session_id,
+        )
+        if _is_error_response(res):
+            return res
+    return None
+
+
+async def _clear_active_element(
+    tool: str,
+    frame_id: str | None,
+    session_id: str,
+) -> tuple[bool, str | None]:
+    """Select and Backspace-clear the currently focused editable element, if any."""
+    expr = (
+        "(() => {"
+        "  let el = document.activeElement;"
+        "  while (el) {"
+        "    if (el.shadowRoot && el.shadowRoot.activeElement) { el = el.shadowRoot.activeElement; continue; }"
+        "    if (el.tagName === 'IFRAME') {"
+        "      try { if (el.contentDocument && el.contentDocument.activeElement) { el = el.contentDocument.activeElement; continue; } } catch (_) {}"
+        "    }"
+        "    break;"
+        "  }"
+        "  if (!el || el === document.body || el === document.documentElement) return {needsClear: false};"
+        "  const tag = String(el.tagName || '').toLowerCase();"
+        "  const inputType = String(el.type || '').toLowerCase();"
+        "  const editable = el.isContentEditable || tag === 'textarea' || (tag === 'input' && !['button','checkbox','file','hidden','image','radio','range','reset','submit'].includes(inputType));"
+        "  if (!editable || el.disabled || el.readOnly || el.getAttribute('aria-disabled') === 'true') return {needsClear: false};"
+        "  const before = el.isContentEditable ? String(el.textContent || '') : String(el.value || '');"
+        "  const hasContent = before.length > 0 || Boolean(!el.isContentEditable && el.validity && el.validity.badInput);"
+        "  if (!hasContent) return {needsClear: false};"
+        "  const doc = el.ownerDocument || document;"
+        "  const win = doc.defaultView || window;"
+        "  if (el.isContentEditable) {"
+        "    const r = doc.createRange();"
+        "    r.selectNodeContents(el);"
+        "    const s = win.getSelection();"
+        "    if (s) { s.removeAllRanges(); s.addRange(r); }"
+        "    return {needsClear: true};"
+        "  }"
+        "  if (typeof el.select === 'function') { el.select(); return {needsClear: true}; }"
+        "  return {needsClear: false};"
+        "})()"
+    )
+    result = await _safe_mirage_eval_result(tool, expr, frame_id, session_id=session_id)
+    if isinstance(result, str):
+        return False, result
+    if result.get("exceptionDetails"):
+        return False, _json_error(
+            tool, "JavaScript evaluation failed", "javascript_error", exception=result["exceptionDetails"],
+        )
+    parsed, has_value = _evaluate_value(result)
+    if not has_value or not isinstance(parsed, dict) or not parsed.get("needsClear"):
+        return False, None
+    err = await _dispatch_named_key(tool, "Backspace", session_id)
+    if err:
+        return False, err
+    return True, None
+
+
 def _ensure_json_response(raw: Any, tool: str) -> str:
     if not isinstance(raw, str):
         try:
@@ -586,11 +707,18 @@ async def mirage_click(selector: str, timeout: float = 10.0, return_snapshot: bo
 
 
 @mcp.tool(name="kahin_mirage_type", annotations=_RW)
-async def mirage_type(selector: str, text: str, return_snapshot: bool = False, frame_id: str | None = None) -> str:
+async def mirage_type(
+    selector: str,
+    text: str,
+    return_snapshot: bool = False,
+    frame_id: str | None = None,
+    clear: bool = True,
+) -> str:
     """Mirage: focus an element and type text via Page.insertText (Juggler's
-    real text-insertion method). ``return_snapshot`` appends a fresh
-    ``kahin_mirage_snapshot`` to the result. frame_id: target an iframe
-    (kahin_mirage_frame_tree); main frame default."""
+    real text-insertion method). By default ``clear=True`` replaces any existing
+    value; ``clear=False`` places the caret at the end and appends.
+    ``return_snapshot`` appends a fresh ``kahin_mirage_snapshot`` to the
+    result. frame_id: target an iframe (kahin_mirage_frame_tree); main frame default."""
     selector_value, error = _text_arg(
         selector, tool="kahin_mirage_type", field="selector", maximum=_MAX_SELECTOR_LENGTH,
     )
@@ -603,8 +731,10 @@ async def mirage_type(selector: str, text: str, return_snapshot: bool = False, f
     )
     if error:
         return error
+    if not isinstance(clear, bool):
+        return _json_error("kahin_mirage_type", "clear must be a boolean", "invalid_argument", field="clear")
     async with _healer_ref.safe(
-        "kahin_mirage_type", selector=selector_value[:80], text_length=len(text_value or ""), frame_id=frame_id,
+        "kahin_mirage_type", selector=selector_value[:80], text_length=len(text_value or ""), frame_id=frame_id, clear=clear,
     ):
         session_id, capture_error = await _capture_page_session("kahin_mirage_type")
         if capture_error:
@@ -614,14 +744,8 @@ async def mirage_type(selector: str, text: str, return_snapshot: bool = False, f
             "(() => {"
             f"  const el = {selector_js(selector_value)};"
             '  if (!el) return {"error": "not found", "code": "element_not_found"};'
-            "  const tag = String(el.tagName || '').toLowerCase();"
-            "  const inputType = String(el.type || '').toLowerCase();"
-            "  const editable = el.isContentEditable || tag === 'textarea' || (tag === 'input' && !['button','checkbox','file','hidden','image','radio','range','reset','submit'].includes(inputType));"
-            '  if (!editable) return {"error": "element is not editable", "code": "not_editable"};'
-            '  if (el.disabled || el.readOnly || el.getAttribute("aria-disabled") === "true") return {"error": "element is disabled or read-only", "code": "not_editable"};'
-            "  const before = el.isContentEditable ? String(el.textContent || '') : String(el.value || '');"
-            "  el.focus();"
-            "  return {ready: document.activeElement === el, beforeLength: before.length, beforePrefix: before.slice(0, 4096), password: inputType === 'password'};"
+            f"{_editable_prepare_js(clear)}"
+            "  return {ready, beforeLength: before.length, beforePrefix: before.slice(0, 4096), password: inputType === 'password', needsClear, needsEndKey};"
             "})()"
         )
         result = await _safe_mirage_eval_result(
@@ -646,12 +770,25 @@ async def mirage_type(selector: str, text: str, return_snapshot: bool = False, f
             )
         if not isinstance(focused, dict) or focused.get("ready") is not True:
             return _json_error("kahin_mirage_type", "element could not be focused", "element_not_actionable")
-        native = await _safe_mirage_call(
-            "kahin_mirage_type", "Page.insertText", {"text": text_value}, session_id=session_id,
-        )
-        if _is_error_response(native):
-            return native
-        native_value = orjson.loads(native)
+        needs_clear = bool(focused.get("needsClear"))
+        needs_end = bool(focused.get("needsEndKey"))
+        if needs_clear:
+            clear_err = await _dispatch_named_key("kahin_mirage_type", "Backspace", session_id)
+            if clear_err:
+                return clear_err
+        elif needs_end:
+            end_err = await _dispatch_named_key("kahin_mirage_type", "End", session_id)
+            if end_err:
+                return end_err
+        if text_value:
+            native = await _safe_mirage_call(
+                "kahin_mirage_type", "Page.insertText", {"text": text_value}, session_id=session_id,
+            )
+            if _is_error_response(native):
+                return native
+            native_value = orjson.loads(native)
+        else:
+            native_value = {}
         verify = await _safe_mirage_eval_result(
             "kahin_mirage_type",
             (
@@ -661,7 +798,10 @@ async def mirage_type(selector: str, text: str, return_snapshot: bool = False, f
                 "  const value = el.isContentEditable ? String(el.textContent || '') : String(el.value || '');"
                 f"  const beforeLength = {focused.get('beforeLength', 0)};"
                 f"  const beforePrefix = {_q(str(focused.get('beforePrefix', '')))};"
-                "  return {afterLength: value.length, changed: value.length !== beforeLength || value.slice(0, 4096) !== beforePrefix};"
+                f"  const expectedText = {_q(text_value or '')};"
+                "  const maxLen = typeof el.maxLength === 'number' && el.maxLength > 0 ? el.maxLength : -1;"
+                "  const matchesText = value === expectedText || (maxLen > 0 && value === expectedText.slice(0, maxLen));"
+                "  return {afterLength: value.length, changed: value.length !== beforeLength || value.slice(0, 4096) !== beforePrefix, matchesText};"
                 "})()"
             ),
             frame_id,
@@ -672,7 +812,15 @@ async def mirage_type(selector: str, text: str, return_snapshot: bool = False, f
         verified, verified_value = _evaluate_value(verify)
         if not verified_value or not isinstance(verified, dict):
             return _json_error("kahin_mirage_type", "could not verify inserted text", "invalid_dom_result")
-        if text_value and verified.get("changed") is not True:
+        if clear and not text_value and verified.get("afterLength", 0) > 0:
+            return _json_error(
+                "kahin_mirage_type", "browser did not clear the editable element", "input_not_changed",
+                selector=selector_value,
+            )
+        if text_value and (
+            verified.get("afterLength", 0) == 0
+            or (verified.get("changed") is not True and verified.get("matchesText") is not True)
+        ):
             return _json_error(
                 "kahin_mirage_type", "browser did not change the editable element", "input_not_changed",
                 selector=selector_value,
@@ -680,6 +828,7 @@ async def mirage_type(selector: str, text: str, return_snapshot: bool = False, f
         payload = {
             "typed": len(text_value),
             "selector": selector_value,
+            "cleared": needs_clear,
             "changed": bool(verified.get("changed")),
             "valueLength": verified.get("afterLength"),
             "result": native_value,
@@ -809,11 +958,53 @@ async def mirage_focus(selector: str, timeout: float = 10.0, frame_id: str | Non
             "(() => {"
             f"  const el = {selector_js(selector_value)};"
             '  if (!el) return {"error": "not found"};'
+            "  const tag = String(el.tagName || '').toLowerCase();"
+            "  const inputType = String(el.type || '').toLowerCase();"
+            "  const editable = el.isContentEditable || tag === 'textarea' || (tag === 'input' && !['button','checkbox','file','hidden','image','radio','range','reset','submit'].includes(inputType));"
             "  el.focus();"
-            '  return "focused";'
+            "  let needsEndKey = false;"
+            "  if (editable && !el.disabled && !el.readOnly && el.getAttribute('aria-disabled') !== 'true') {"
+            "    const doc = el.ownerDocument || document;"
+            "    const win = doc.defaultView || window;"
+            "    const before = el.isContentEditable ? String(el.textContent || '') : String(el.value || '');"
+            "    const hasContent = before.length > 0 || Boolean(!el.isContentEditable && el.validity && el.validity.badInput);"
+            "    if (hasContent) {"
+            "      if (el.isContentEditable) {"
+            "        const r = doc.createRange();"
+            "        r.selectNodeContents(el);"
+            "        r.collapse(false);"
+            "        const s = win.getSelection();"
+            "        if (s) { s.removeAllRanges(); s.addRange(r); }"
+            "      } else if (typeof el.setSelectionRange === 'function') {"
+            "        try { el.setSelectionRange(before.length, before.length); } catch (_) { needsEndKey = true; }"
+            "      } else {"
+            "        needsEndKey = true;"
+            "      }"
+            "    }"
+            "  }"
+            "  return {focused: true, needsEndKey};"
             "})()"
         )
-        return await _safe_mirage_evaluate("kahin_mirage_focus", expr, frame_id, session_id=session_id)
+        result = await _safe_mirage_eval_result("kahin_mirage_focus", expr, frame_id, session_id=session_id)
+        if isinstance(result, str):
+            return result
+        if result.get("exceptionDetails"):
+            return _json_error(
+                "kahin_mirage_focus",
+                "JavaScript evaluation failed",
+                "javascript_error",
+                exception=result["exceptionDetails"],
+            )
+        focused, has_value = _evaluate_value(result)
+        if not has_value or not isinstance(focused, dict):
+            return _json_error("kahin_mirage_focus", "Browser returned an invalid focus result", "invalid_dom_result")
+        if focused.get("error"):
+            return _json_error("kahin_mirage_focus", str(focused["error"]), "element_not_found", selector=selector_value)
+        if focused.get("needsEndKey"):
+            end_err = await _dispatch_named_key("kahin_mirage_focus", "End", session_id)
+            if end_err:
+                return end_err
+        return orjson.dumps("focused").decode()
 
 
 @mcp.tool(name="kahin_mirage_hover", annotations=_RW)
@@ -1219,7 +1410,7 @@ async def mirage_key_press(
         return orjson.dumps({"key": key_value, "keyDown": down, "keyUp": up}, option=orjson.OPT_INDENT_2).decode()
 
 
-async def mirage_key_text_fast(text: str) -> str:
+async def mirage_key_text_fast(text: str, *, clear: bool = False, frame_id: str | None = None) -> str:
     """Internal fast path for ``kahin_mirage_key_text``: type text one
     character at a time via dispatchKeyEvent (keydown with text + keyup per
     char, repeat=False) with no cadence delays. Uses Juggler's accepted
@@ -1230,11 +1421,18 @@ async def mirage_key_text_fast(text: str) -> str:
     )
     if error:
         return error
-    async with _healer_ref.safe("kahin_mirage_key_text_fast", text_length=len(text_value or "")):
+    if not isinstance(clear, bool):
+        return _json_error("kahin_mirage_key_text_fast", "clear must be a boolean", "invalid_argument", field="clear")
+    async with _healer_ref.safe("kahin_mirage_key_text_fast", text_length=len(text_value or ""), clear=clear):
         session_id, capture_error = await _capture_page_session("kahin_mirage_key_text_fast")
         if capture_error:
             return capture_error
         assert session_id is not None
+        cleared = False
+        if clear:
+            cleared, clear_err = await _clear_active_element("kahin_mirage_key_text_fast", frame_id, session_id)
+            if clear_err:
+                return clear_err
         results: list[dict[str, Any]] = []
         for ch in text_value:
             code, key_code = _key_defaults(ch)
@@ -1252,7 +1450,7 @@ async def mirage_key_text_fast(text: str) -> str:
             if _is_error_response(up):
                 return up
             results.append({"char": ch, "keyDown": down, "keyUp": up})
-        return orjson.dumps({"typed": len(text_value), "chars": results}, option=orjson.OPT_INDENT_2).decode()
+        return orjson.dumps({"typed": len(text_value), "cleared": cleared, "chars": results}, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_mirage_scroll", annotations=_RW)

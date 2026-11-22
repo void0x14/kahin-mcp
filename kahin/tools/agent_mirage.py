@@ -311,16 +311,18 @@ async def mirage_fill_form(
     fields: list[dict[str, Any]],
     timeout: float = 10.0,
     frame_id: str | None = None,
+    clear: bool = True,
 ) -> str:
     """Mirage: fill several live fields in one call.
 
-    ``fields`` is a list of ``{ref, text}`` objects; each ``ref`` must be a
-    live nodeId from ``kahin_mirage_snapshot``/``kahin_mirage_dom_snapshot``.
-    Every field is typed through ``kahin_mirage_dom_action(action="type")`` so
-    no stale selector is ever trusted. Returns ``{filled, results[]}`` where
-    each result is the corresponding dom_action payload; a field that went
-    stale returns ``requiresSnapshot: true`` and never pretends the form
-    completed.
+    ``fields`` is a list of ``{ref, text}`` (or ``{ref, text, clear}``)
+    objects; each ``ref`` must be a live nodeId from
+    ``kahin_mirage_snapshot``/``kahin_mirage_dom_snapshot``. Every field is
+    typed through ``kahin_mirage_dom_action(action="type")`` with ``clear``
+    (default ``True``; field-level ``clear`` overrides the top-level setting).
+    Returns ``{filled, results[]}`` where each result is the corresponding
+    dom_action payload; a field that went stale returns ``requiresSnapshot:
+    true`` and never pretends the form completed.
     """
     if not isinstance(fields, list) or not fields or len(fields) > _FILL_FIELDS_MAX:
         return _json_error(
@@ -329,9 +331,11 @@ async def mirage_fill_form(
             "invalid_argument",
             field="fields",
         )
+    if not isinstance(clear, bool):
+        return _json_error("kahin_mirage_fill_form", "clear must be a boolean", "invalid_argument", field="clear")
     timeout_value = _bounded_float(timeout, minimum=0.0, maximum=_MAX_WAIT_TIMEOUT, default=10.0)
     async with _healer_ref.safe(
-        "kahin_mirage_fill_form", count=len(fields), timeout=timeout_value, frame_id=frame_id,
+        "kahin_mirage_fill_form", count=len(fields), timeout=timeout_value, frame_id=frame_id, clear=clear,
     ):
         results: list[dict[str, Any]] = []
         for field in fields:
@@ -349,7 +353,15 @@ async def mirage_fill_form(
                     "each field needs a string ref and a string text",
                     "invalid_argument",
                 )
-            outcome = _loads(await mirage_dom_action(node_id=ref, action="type", text=text, frame_id=frame_id))
+            field_clear = field.get("clear", clear)
+            if not isinstance(field_clear, bool):
+                return _json_error(
+                    "kahin_mirage_fill_form",
+                    "field clear must be a boolean",
+                    "invalid_argument",
+                    field="clear",
+                )
+            outcome = _loads(await mirage_dom_action(node_id=ref, action="type", text=text, frame_id=frame_id, clear=field_clear))
             results.append(outcome)
             if not isinstance(outcome, dict):
                 return _json_error(

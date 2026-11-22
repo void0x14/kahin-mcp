@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import logging
 import os
 import time
@@ -20,6 +21,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import orjson
+
+try:
+    import anyio
+except ImportError:  # pragma: no cover
+    anyio = None  # type: ignore[assignment]
 
 from kahin import _state as state
 from kahin._mcp import mcp
@@ -181,7 +187,9 @@ async def _stop_engine(engine: Any, *, suppress: bool = True) -> None:
         # Cancellation must reach the caller, but an interrupted MCP request
         # must not leave a browser child behind for the next request.
         try:
-            await asyncio.shield(asyncio.wait_for(engine.stop(), timeout=_ENGINE_STOP_TIMEOUT))
+            shield = anyio.CancelScope(shield=True) if anyio is not None else contextlib.nullcontext()
+            with shield:
+                await asyncio.wait_for(engine.stop(), timeout=_ENGINE_STOP_TIMEOUT)
         except BaseException:  # noqa: BLE001 - cleanup is already best effort
             logger.exception("browser cleanup failed after cancellation for %s", type(engine).__name__)
         raise
@@ -1100,6 +1108,13 @@ async def browser_stop() -> str:
             engine = state._current_engine
             try:
                 await _stop_engine(engine, suppress=False)
+            except asyncio.CancelledError:
+                if getattr(engine, "_process", None) is None:
+                    state._current_engine = None
+                    _healer_ref.bind_engine(None)
+                    state.clear_state()
+                    state.release_browser_lock()
+                raise
             except Exception as exc:
                 return _json_error(
                     "kahin_browser_stop",

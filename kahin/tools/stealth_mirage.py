@@ -41,6 +41,10 @@ from kahin.tools.pilot_mirage import (
     _bounded_int,
     _capture_page_session,
     _dispatch_mouse,
+    _frame_alive_live,
+    _frame_context_changed,
+    _frame_context_id,
+    _frame_nav_seq,
     _is_error_response,
     _json_error,
     _key_defaults,
@@ -244,6 +248,8 @@ async def mirage_click_humanized(
         if isinstance(ready, str):
             return ready
         target_x, target_y = ready
+        initial_ctx = _frame_context_id(frame_id, session_id)
+        initial_nav = _frame_nav_seq(frame_id, session_id)
         start_x, start_y = get_last_mouse_position()
         entry_dir = _last_direction
         points = bezier_trajectory(
@@ -255,15 +261,21 @@ async def mirage_click_humanized(
         travel_delays = step_delays(len(points), base_ms=4.0, jitter_ms=2.0, seed=seed)
         for index, (px, py) in enumerate(points):
             if index == len(points) - 1:
+                if not await _frame_alive_live(frame_id, initial_ctx, session_id, initial_nav_seq=initial_nav):
+                    return _json_error("kahin_mirage_click_humanized", "target frame detached or navigated during click", "frame_detached", frame_id=frame_id)
                 down = await _dispatch_mouse("mousedown", px, py, button=0, buttons=1, session_id=session_id)
                 if _is_error_response(down):
                     return down
             else:
+                if _frame_context_changed(frame_id, initial_ctx, session_id) or _frame_nav_seq(frame_id, session_id) != initial_nav:
+                    return _json_error("kahin_mirage_click_humanized", "target frame detached or navigated during click", "frame_detached", frame_id=frame_id)
                 move = await _dispatch_mouse("mousemove", px, py, button=0, buttons=0, session_id=session_id)
                 if _is_error_response(move):
                     return move
                 await asyncio.sleep(travel_delays[index] / 1000.0)
         await asyncio.sleep(jittered_delay(delay_value, delay_jitter, seed=seed) / 1000.0)
+        if not await _frame_alive_live(frame_id, initial_ctx, session_id, initial_nav_seq=initial_nav):
+            return _json_error("kahin_mirage_click_humanized", "target frame detached or navigated during click", "frame_detached", frame_id=frame_id)
         up = await _dispatch_mouse("mouseup", target_x, target_y, button=0, buttons=0, session_id=session_id)
         if _is_error_response(up):
             return up

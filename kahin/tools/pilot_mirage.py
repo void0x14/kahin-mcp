@@ -42,6 +42,7 @@ from kahin.tools._common import (
 
 
 _MAX_SELECTOR_LENGTH = 16_384
+_MAX_FRAME_ID_LENGTH = 512
 _MAX_ATTRIBUTE_LENGTH = 1_024
 _MAX_INPUT_TEXT_LENGTH = 16_384
 _MAX_KEY_TEXT_LENGTH = 4_096
@@ -75,6 +76,23 @@ def _text_arg(
             received=len(value),
         )
     return value, None
+
+
+def _validate_frame_id(frame_id: Any, tool: str) -> str | None:
+    if frame_id is None:
+        return None
+    if not isinstance(frame_id, str) or not frame_id.strip():
+        return _json_error(tool, "frame_id must be a non-empty string", "invalid_argument", field="frame_id")
+    if len(frame_id) > _MAX_FRAME_ID_LENGTH:
+        return _json_error(
+            tool,
+            f"frame_id exceeds the maximum length of {_MAX_FRAME_ID_LENGTH}",
+            "argument_too_large",
+            field="frame_id",
+            maximum=_MAX_FRAME_ID_LENGTH,
+            received=len(frame_id),
+        )
+    return None
 
 
 def _bounded_float(value: Any, *, minimum: float, maximum: float, default: float) -> float:
@@ -299,10 +317,10 @@ async def _dispatch_mouse(
     y = _bounded_float(y, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0)
     # Live-verified: Juggler never completes a dispatchMouseEvent at (0, 0)
     # on this Camoufox build — the call hangs until the 30s timeout and
-    # leaves the input channel wedged. Clamp to (1, 1) so every mouse event
-    # reaches a coordinate the engine actually processes.
-    x = max(x, 1.0)
-    y = max(y, 1.0)
+    # leaves the input channel wedged. Nudge exact (0, 0) to (1, 1) without
+    # shifting positive sub-pixel coordinates like 0.25 on 1px controls.
+    if x == 0.0 and y == 0.0:
+        x, y = 1.0, 1.0
     button = _bounded_int(button, minimum=0, maximum=2, default=0)
     modifiers = _bounded_int(modifiers, minimum=0, maximum=255, default=0)
     click_count = _bounded_int(click_count, minimum=1, maximum=10, default=1)
@@ -319,45 +337,371 @@ async def _dispatch_mouse(
     )
 
 
+_FRAME_OFFSET_JS = """function(el, cx, cy) {
+  if (!el || !el.isConnected) return {error: "iframe is detached", code: "frame_offset_unavailable"};
+  const compute = () => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    if (r.width <= 0 || r.height <= 0 || cs.display === "none" || cs.visibility === "hidden" || cs.pointerEvents === "none") {
+      return {error: "iframe is not actionable", code: "element_not_actionable", reason: "not_visible"};
+    }
+    const bl = parseFloat(cs.borderLeftWidth) || 0;
+    const bt = parseFloat(cs.borderTopWidth) || 0;
+    const br = parseFloat(cs.borderRightWidth) || 0;
+    const bb = parseFloat(cs.borderBottomWidth) || 0;
+    const pl = parseFloat(cs.paddingLeft) || 0;
+    const pt = parseFloat(cs.paddingTop) || 0;
+    const pr = parseFloat(cs.paddingRight) || 0;
+    const pb = parseFloat(cs.paddingBottom) || 0;
+    const ow = el.offsetWidth;
+    const oh = el.offsetHeight;
+    const sx = ow > 0 ? r.width / ow : 1;
+    const sy = oh > 0 ? r.height / oh : 1;
+    const contentW = Math.max(0, (ow > 0 ? ow : r.width) - bl - br - pl - pr);
+    const contentH = Math.max(0, (oh > 0 ? oh : r.height) - bt - bb - pt - pb);
+    if (contentW <= 0 || contentH <= 0) {
+      return {error: "iframe is not actionable", code: "element_not_actionable", reason: "not_visible"};
+    }
+    if (cx < -0.5 || cy < -0.5 || cx > contentW + 0.5 || cy > contentH + 0.5) {
+      return {error: "element is clipped outside iframe bounds", code: "element_not_actionable", reason: "clipped"};
+    }
+    const quads = typeof el.getBoxQuads === "function" ? el.getBoxQuads({box: "content"}) : null;
+    if (quads && quads.length > 0) {
+      const q = quads[0];
+      const u = cx / contentW;
+      const v = cy / contentH;
+      const p00 = q.p1, p10 = q.p2, p11 = q.p3, p01 = q.p4;
+      const dx1 = p10.x - p11.x, dy1 = p10.y - p11.y;
+      const dx2 = p01.x - p11.x, dy2 = p01.y - p11.y;
+      const dx3 = p00.x - p10.x + p11.x - p01.x;
+      const dy3 = p00.y - p10.y + p11.y - p01.y;
+      const det = dx1 * dy2 - dx2 * dy1;
+      if (Math.abs(det) > 1e-9) {
+        const g = (dx3 * dy2 - dx2 * dy3) / det;
+        const h = (dx1 * dy3 - dx3 * dy1) / det;
+        const w = g * u + h * v + 1;
+        if (Math.abs(w) > 1e-9) {
+          return {
+            px: ((p10.x - p00.x + g * p10.x) * u + (p01.x - p00.x + h * p01.x) * v + p00.x) / w,
+            py: ((p10.y - p00.y + g * p10.y) * u + (p01.y - p00.y + h * p01.y) * v + p00.y) / w,
+          };
+        }
+      }
+      return {
+        px: p00.x + (p10.x - p00.x) * u + (p01.x - p00.x) * v,
+        py: p00.y + (p10.y - p00.y) * u + (p01.y - p00.y) * v,
+      };
+    }
+    return {px: r.left + (bl + pl + cx) * sx, py: r.top + (bt + pt + cy) * sy};
+  };
+  let pos = compute();
+  if (pos.error) return pos;
+  if (pos.px < 0 || pos.py < 0 || pos.px > window.innerWidth || pos.py > window.innerHeight) {
+    el.scrollIntoView({block: "center", inline: "center", behavior: "instant"});
+    pos = compute();
+    if (pos.error) return pos;
+    if (pos.px < 0 || pos.py < 0 || pos.px > window.innerWidth || pos.py > window.innerHeight) {
+      window.scrollBy({left: pos.px - window.innerWidth / 2, top: pos.py - window.innerHeight / 2, behavior: "instant"});
+      pos = compute();
+      if (pos.error) return pos;
+    }
+  }
+  const px = pos.px, py = pos.py;
+  if (px < 0 || py < 0 || px > window.innerWidth || py > window.innerHeight) {
+    return {error: "iframe target point is outside viewport", code: "element_not_actionable", reason: "outside_viewport"};
+  }
+  let node = el;
+  while (node) {
+    const root = node.getRootNode ? node.getRootNode() : document;
+    if (root && typeof root.elementFromPoint === "function") {
+      const hit = root.elementFromPoint(px, py);
+      if (hit && hit !== node && !node.contains(hit)) {
+        return {error: "iframe is obscured", code: "element_not_actionable", reason: "obscured", hit: String(hit.tagName || "").toLowerCase()};
+      }
+    }
+    node = root && root.host ? root.host : null;
+  }
+  return {x: px, y: py};
+}"""
+
+
+def _frame_parent_map(frame_tree: Any) -> dict[str, str | None]:
+    parents: dict[str, str | None] = {}
+    stack: list[tuple[Any, str | None]] = [(frame_tree, None)]
+    while stack:
+        node, parent_id = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        frame = node.get("frame")
+        actual_parent = parent_id
+        if isinstance(frame, dict):
+            fid = frame.get("id")
+            actual_parent = frame.get("parentId") if isinstance(frame.get("parentId"), str) else parent_id
+            if isinstance(fid, str) and fid:
+                parents[fid] = actual_parent
+            next_parent = fid if isinstance(fid, str) and fid else actual_parent
+        else:
+            next_parent = actual_parent
+        children = node.get("childFrames")
+        if isinstance(children, list):
+            stack.extend((child, next_parent) for child in children)
+    return parents
+
+
+def _frame_context_id(frame_id: str | None, session_id: str) -> str | None:
+    if not frame_id:
+        return None
+    try:
+        return _mirage_engine().resolve_context(frame_id, session_id=session_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _frame_nav_seq(frame_id: str | None, session_id: str) -> int:
+    if not frame_id:
+        return 0
+    try:
+        return _mirage_engine().frame_nav_seq(session_id, frame_id)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _frame_context_changed(frame_id: str | None, initial_ctx: str | None, session_id: str) -> bool:
+    if not frame_id:
+        return False
+    current = _frame_context_id(frame_id, session_id)
+    return current is None or (initial_ctx is not None and current != initial_ctx)
+
+
+async def _frame_alive_live(
+    frame_id: str | None,
+    initial_ctx: str | None,
+    session_id: str,
+    *,
+    initial_nav_seq: int | None = None,
+    flush: bool = True,
+) -> bool:
+    """Live roundtrip check that flushes browser event queue (catches async postMessage detach/nav)."""
+    if not frame_id:
+        return True
+    if flush:
+        await asyncio.sleep(0.02)
+    if initial_nav_seq is not None and _frame_nav_seq(frame_id, session_id) != initial_nav_seq:
+        return False
+    if _frame_context_changed(frame_id, initial_ctx, session_id):
+        return False
+    if not initial_ctx:
+        return False
+    try:
+        res = await asyncio.wait_for(
+            _mirage_engine().call(
+                "Runtime.evaluate",
+                {"executionContextId": initial_ctx, "expression": "1", "returnByValue": True},
+                session_id=session_id,
+            ),
+            timeout=1.5,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(res, dict) or res.get("exceptionDetails"):
+        return False
+    if initial_nav_seq is not None and _frame_nav_seq(frame_id, session_id) != initial_nav_seq:
+        return False
+    if _frame_context_changed(frame_id, initial_ctx, session_id):
+        return False
+    try:
+        tree_res = await asyncio.wait_for(
+            _mirage_engine().call("Page.getFrameTree", session_id=session_id),
+            timeout=1.5,
+        )
+        parents = _frame_parent_map(tree_res.get("frameTree") if isinstance(tree_res, dict) else None)
+        if frame_id not in parents:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+async def _probe_result_or_abort(
+    tool: str,
+    result: Any,
+    frame_id: str | None,
+    session_id: str | None,
+) -> dict[str, Any]:
+    if isinstance(result, str):
+        try:
+            payload = orjson.loads(result)
+        except orjson.JSONDecodeError:
+            payload = None
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if code in {"engine_unavailable", "engine_dead", "connection_lost", "session_unavailable"} or any(
+            marker in result
+            for marker in ("Mirage is dead", "Mirage not started", "Mirage stopped", "Connection lost")
+        ):
+            return {"abort": True, "code": str(code or "engine_unavailable"), "raw": result}
+        if frame_id is not None and "no execution context for frame" in result:
+            try:
+                tree_res = await _mirage_engine().call("Page.getFrameTree", session_id=session_id)
+                parents = _frame_parent_map(tree_res.get("frameTree") if isinstance(tree_res, dict) else None)
+            except Exception:  # noqa: BLE001
+                parents = {}
+            if frame_id not in parents:
+                return {
+                    "abort": True,
+                    "code": "frame_not_found",
+                    "raw": _json_error(tool, f"frame {frame_id!r} not found in frame tree", "frame_not_found", frame_id=frame_id),
+                }
+        return {"error": "probe_failed"}
+    if isinstance(result, dict):
+        inner = result.get("result")
+        probe_value = inner.get("value") if isinstance(inner, dict) else None
+        return probe_value if isinstance(probe_value, dict) else {"error": "probe_failed"}
+    return {"error": "probe_failed"}
+
+
+async def _resolve_frame_point(
+    local_x: float,
+    local_y: float,
+    frame_id: str | None,
+    *,
+    session_id: str | None = None,
+    tool: str = "kahin_mirage_click",
+) -> tuple[float, float] | str:
+    """Translate frame-local (x, y) through all parent iframes via Juggler Page.adoptNode."""
+    if isinstance(local_x, bool) or isinstance(local_y, bool) or not isinstance(local_x, Real) or not isinstance(local_y, Real):
+        return _json_error(tool, "element returned invalid coordinates", "invalid_dom_result")
+    x, y = float(local_x), float(local_y)
+    if not math.isfinite(x) or not math.isfinite(y):
+        return _json_error(tool, "element returned non-finite coordinates", "invalid_dom_result")
+    if frame_id is None:
+        return (
+            _bounded_float(x, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0),
+            _bounded_float(y, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0),
+        )
+    if err := _validate_frame_id(frame_id, tool):
+        return err
+
+    engine = _mirage_engine()
+    sid = session_id
+    if not sid:
+        try:
+            page = await engine.ensure_page()
+            sid = page.get("sessionId") if isinstance(page, dict) else None
+        except Exception as exc:  # noqa: BLE001
+            return _json_error(tool, f"could not select a live page: {exc}", "session_unavailable")
+    if not isinstance(sid, str) or not sid:
+        return _json_error(tool, "selected page has no live session", "session_unavailable")
+
+    try:
+        tree_res = await engine.call("Page.getFrameTree", session_id=sid)
+    except Exception as exc:  # noqa: BLE001
+        return _json_error(tool, f"Page.getFrameTree failed: {exc}", "frame_offset_unavailable", frame_id=frame_id)
+    parents = _frame_parent_map(tree_res.get("frameTree") if isinstance(tree_res, dict) else None)
+    if frame_id not in parents:
+        return _json_error(tool, f"frame {frame_id!r} not found in frame tree", "frame_not_found", frame_id=frame_id)
+    if parents[frame_id] is None:
+        return (
+            _bounded_float(x, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0),
+            _bounded_float(y, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0),
+        )
+
+    cur = frame_id
+    seen: set[str] = set()
+    while True:
+        parent_id = parents.get(cur)
+        if parent_id is None:
+            break
+        if cur in seen or len(seen) >= 20:
+            return _json_error(tool, "frame hierarchy cycle or depth limit exceeded", "frame_offset_unavailable", frame_id=frame_id)
+        seen.add(cur)
+        parent_ctx = engine.resolve_context(parent_id, session_id=sid)
+        if parent_ctx is None:
+            return _json_error(tool, f"no execution context for parent frame {parent_id}", "frame_offset_unavailable", frame_id=frame_id)
+        try:
+            adopted = await engine.call("Page.adoptNode", {"frameId": cur, "executionContextId": parent_ctx}, session_id=sid)
+        except Exception as exc:  # noqa: BLE001
+            return _json_error(tool, f"Page.adoptNode failed: {exc}", "frame_offset_unavailable", frame_id=frame_id)
+        object_id = (adopted.get("remoteObject") or {}).get("objectId") if isinstance(adopted, dict) else None
+        if not isinstance(object_id, str) or not object_id:
+            return _json_error(tool, f"could not adopt iframe owner for {cur}", "frame_offset_unavailable", frame_id=frame_id)
+        try:
+            cf = await engine.call(
+                "Runtime.callFunction",
+                {
+                    "executionContextId": parent_ctx,
+                    "functionDeclaration": _FRAME_OFFSET_JS,
+                    "returnByValue": True,
+                    "args": [{"objectId": object_id}, {"value": x}, {"value": y}],
+                },
+                session_id=sid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json_error(tool, f"iframe offset evaluation failed: {exc}", "frame_offset_unavailable", frame_id=frame_id)
+        finally:
+            try:
+                await engine.call("Runtime.disposeObject", {"executionContextId": parent_ctx, "objectId": object_id}, session_id=sid)
+            except Exception:  # noqa: BLE001
+                pass
+        if not isinstance(cf, dict) or cf.get("exceptionDetails"):
+            return _json_error(tool, "iframe offset callFunction failed", "frame_offset_unavailable", frame_id=frame_id)
+        val = (cf.get("result") or {}).get("value") if isinstance(cf.get("result"), dict) else None
+        if not isinstance(val, dict):
+            return _json_error(tool, "iframe offset returned invalid payload", "frame_offset_unavailable", frame_id=frame_id)
+        if "error" in val:
+            details: dict[str, Any] = {"frame_id": frame_id}
+            if val.get("reason") is not None:
+                details["reason"] = val.get("reason")
+            if val.get("hit") is not None:
+                details["hit"] = val.get("hit")
+            return _json_error(tool, str(val["error"]), str(val.get("code") or "element_not_actionable"), **details)
+        try:
+            x = float(val["x"])
+            y = float(val["y"])
+        except (KeyError, TypeError, ValueError):
+            return _json_error(tool, "iframe offset returned invalid coordinates", "invalid_dom_result", frame_id=frame_id)
+        if not math.isfinite(x) or not math.isfinite(y):
+            return _json_error(tool, "iframe offset returned non-finite coordinates", "invalid_dom_result", frame_id=frame_id)
+        cur = parent_id
+
+    return (
+        _bounded_float(x, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0),
+        _bounded_float(y, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0),
+    )
+
+
 async def _element_point(
     selector: str,
     frame_id: str | None = None,
     session_id: str | None = None,
+    tool: str = "kahin_mirage_click",
 ) -> tuple[float, float] | str:
-    """Center point of the element's bounding rect via Runtime.evaluate.
-    With frame_id the rect is measured in that frame's world and offset by
-    the hosting <iframe>'s position (window.frameElement), so the returned
-    coordinates are always parent-viewport absolute — same as the main frame.
-    Returns ("error", msg) tuple marker or coordinates."""
+    """Center point of the element's bounding rect in root-viewport coordinates."""
+    if err := _validate_frame_id(frame_id, tool):
+        return err
     expr = (
         "(() => {"
         f"  const el = {selector_js(selector)};"
         '  if (!el) return {"error": "not found", "code": "element_not_found"};'
-        '  el.scrollIntoView({block: "center", inline: "center"});'
+        '  el.scrollIntoView({block: "center", inline: "center", behavior: "instant"});'
         "  const r = el.getBoundingClientRect();"
         "  const style = getComputedStyle(el);"
         '  if (r.width <= 0 || r.height <= 0 || style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") return {"error": "element is not actionable", "code": "element_not_actionable", "reason": "not_visible"};'
-        '  if (el.disabled === true || el.getAttribute("aria-disabled") === "true") return {"error": "element is disabled", "code": "element_not_actionable", "reason": "disabled"};'
-        "  const localX = r.left + r.width / 2;"
-        "  const localY = r.top + r.height / 2;"
+        '  if (el.disabled === true || (el.matches && el.matches(":disabled")) || el.getAttribute("aria-disabled") === "true") return {"error": "element is disabled", "code": "element_not_actionable", "reason": "disabled"};'
+        "  const localX = r.left + (r.width <= 1 ? r.width * 0.25 : r.width / 2);"
+        "  const localY = r.top + (r.height <= 1 ? r.height * 0.25 : r.height / 2);"
         "  const hit = document.elementFromPoint(localX, localY);"
         '  if (hit && hit !== el && !el.contains(hit)) return {"error": "element is obscured", "code": "element_not_actionable", "reason": "obscured", "hit": String(hit.tagName || "").toLowerCase()};'
-        "  let x = localX, y = localY, owner = window;"
-        "  for (let depth = 0; depth < 20 && owner.frameElement; depth++) {"
-        "    const fr = owner.frameElement.getBoundingClientRect();"
-        "    x += fr.left; y += fr.top; owner = owner.parent;"
-        "  }"
-        "  return {x, y};"
+        "  return {x: localX, y: localY};"
         "})()"
     )
     result = await _safe_mirage_eval_result(
-        "kahin_mirage_click", expr, frame_id, session_id=session_id,
+        tool, expr, frame_id, session_id=session_id,
     )
     if isinstance(result, str):
         return result
     if result.get("exceptionDetails"):
         return _json_error(
-            "kahin_mirage_click",
+            tool,
             "JavaScript evaluation failed",
             "javascript_error",
             exception=result["exceptionDetails"],
@@ -365,10 +709,10 @@ async def _element_point(
     result_value = result.get("result") or {}
     point = result_value.get("value") if isinstance(result_value, dict) else None
     if not isinstance(point, dict):
-        return _json_error("kahin_mirage_click", "element not found", "element_not_found")
+        return _json_error(tool, "element not found", "element_not_found")
     if "error" in point:
         return _json_error(
-            "kahin_mirage_click",
+            tool,
             str(point["error"]),
             str(point.get("code") or "element_not_actionable"),
             selector=selector,
@@ -378,13 +722,10 @@ async def _element_point(
         x = float(point["x"])
         y = float(point["y"])
     except (KeyError, TypeError, ValueError):
-        return _json_error("kahin_mirage_click", "element returned invalid coordinates", "invalid_dom_result")
+        return _json_error(tool, "element returned invalid coordinates", "invalid_dom_result")
     if not math.isfinite(x) or not math.isfinite(y):
-        return _json_error("kahin_mirage_click", "element returned non-finite coordinates", "invalid_dom_result")
-    return (
-        _bounded_float(x, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0),
-        _bounded_float(y, minimum=0.0, maximum=_MAX_COORDINATE, default=0.0),
-    )
+        return _json_error(tool, "element returned non-finite coordinates", "invalid_dom_result")
+    return await _resolve_frame_point(x, y, frame_id, session_id=session_id, tool=tool)
 
 
 async def _action_ready(
@@ -405,14 +746,12 @@ async def _action_ready(
     actionability can change while a page settles (e.g. a disabled button
     becomes enabled) — so the last failure is only returned on timeout.
     """
+    if err := _validate_frame_id(frame_id, tool):
+        return err
 
     async def probe(expression: str) -> dict[str, Any]:
         result = await _safe_mirage_eval_result(tool, expression, frame_id, session_id=session_id)
-        if isinstance(result, str):
-            return {"error": "probe_failed"}
-        value = result.get("result") or {}
-        probe_value = value.get("value") if isinstance(value, dict) else None
-        return probe_value if isinstance(probe_value, dict) else {"error": "probe_failed"}
+        return await _probe_result_or_abort(tool, result, frame_id, session_id)
 
     if state == "attached":
         # Focus may legitimately target a hidden element. Use a presence-only
@@ -453,6 +792,8 @@ async def _action_ready(
 
     ready = await wait_for_ready(probe, selector, timeout=timeout)
     if not ready.get("ok"):
+        if ready.get("aborted") and isinstance(ready.get("raw"), str):
+            return ready["raw"]
         return _json_error(
             tool,
             f"element is not actionable: {ready.get('reason') or ready.get('code')}",
@@ -460,11 +801,7 @@ async def _action_ready(
             selector=selector,
             timeout=timeout,
         )
-    # The actionability probe measures rects in the frame's own viewport; for
-    # an iframe those coordinates must be offset by the hosting <iframe>
-    # position before Page.dispatchMouseEvent. _element_point applies that
-    # mapping, so the final dispatch point is always parent-viewport absolute.
-    point = await _element_point(selector, frame_id, session_id=session_id)
+    point = await _element_point(selector, frame_id, session_id=session_id, tool=tool)
     if not isinstance(point, tuple):
         return point
     return point
@@ -569,9 +906,13 @@ async def mirage_click(selector: str, timeout: float = 10.0, return_snapshot: bo
         if isinstance(ready, str):
             return ready
         x, y = ready
+        initial_ctx = _frame_context_id(frame_id, session_id)
+        initial_nav = _frame_nav_seq(frame_id, session_id)
         down = await _dispatch_mouse("mousedown", x, y, button=0, buttons=1, session_id=session_id)
         if _is_error_response(down):
             return down
+        if not await _frame_alive_live(frame_id, initial_ctx, session_id, initial_nav_seq=initial_nav):
+            return _json_error("kahin_mirage_click", "target frame detached or navigated during click", "frame_detached", frame_id=frame_id)
         up = await _dispatch_mouse("mouseup", x, y, button=0, buttons=0, session_id=session_id)
         if _is_error_response(up):
             return up
@@ -580,8 +921,8 @@ async def mirage_click(selector: str, timeout: float = 10.0, return_snapshot: bo
             "mousedown": down, "mouseup": up,
         }
         if return_snapshot:
-            from kahin.tools.agent_mirage import mirage_snapshot  # noqa: PLC0415
-            result["snapshot"] = orjson.loads(await mirage_snapshot(max_tokens=1500, frame_id=frame_id))
+            from kahin.tools.agent_mirage import _snapshot_for_session  # noqa: PLC0415
+            result["snapshot"] = orjson.loads(await _snapshot_for_session(session_id, max_tokens=1500, frame_id=frame_id))
         return orjson.dumps(result, option=orjson.OPT_INDENT_2).decode()
 
 
@@ -618,7 +959,7 @@ async def mirage_type(selector: str, text: str, return_snapshot: bool = False, f
             "  const inputType = String(el.type || '').toLowerCase();"
             "  const editable = el.isContentEditable || tag === 'textarea' || (tag === 'input' && !['button','checkbox','file','hidden','image','radio','range','reset','submit'].includes(inputType));"
             '  if (!editable) return {"error": "element is not editable", "code": "not_editable"};'
-            '  if (el.disabled || el.readOnly || el.getAttribute("aria-disabled") === "true") return {"error": "element is disabled or read-only", "code": "not_editable"};'
+            '  if (el.disabled || (el.matches && el.matches(":disabled")) || el.readOnly || el.getAttribute("aria-disabled") === "true") return {"error": "element is disabled or read-only", "code": "not_editable"};'
             "  const before = el.isContentEditable ? String(el.textContent || '') : String(el.value || '');"
             "  el.focus();"
             "  return {ready: document.activeElement === el, beforeLength: before.length, beforePrefix: before.slice(0, 4096), password: inputType === 'password'};"
@@ -685,8 +1026,8 @@ async def mirage_type(selector: str, text: str, return_snapshot: bool = False, f
             "result": native_value,
         }
         if return_snapshot:
-            from kahin.tools.agent_mirage import mirage_snapshot  # noqa: PLC0415
-            payload["snapshot"] = orjson.loads(await mirage_snapshot(max_tokens=1500, frame_id=frame_id))
+            from kahin.tools.agent_mirage import _snapshot_for_session  # noqa: PLC0415
+            payload["snapshot"] = orjson.loads(await _snapshot_for_session(session_id, max_tokens=1500, frame_id=frame_id))
         return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
 
 
@@ -913,7 +1254,7 @@ _WAIT_STATE_JS: dict[str, str] = {
     "enabled": """(() => {
         const el = ${ELEMENT_JS};
         if (!el) return {code: "element_not_found"};
-        if (el.disabled === true || el.getAttribute("aria-disabled") === "true")
+        if (el.disabled === true || (el.matches && el.matches(":disabled")) || el.getAttribute("aria-disabled") === "true")
             return {code: "element_not_actionable", reason: "disabled"};
         return {ok: true};
     })()""",

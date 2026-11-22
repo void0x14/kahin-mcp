@@ -47,7 +47,7 @@ ACTIONABILITY_CHECK_JS = r"""
   const style = window.getComputedStyle(el);
   if (r.width <= 0 || r.height <= 0 || style.display === "none" || style.visibility === "hidden")
     return {code: "element_not_actionable", reason: "not_visible"};
-  if (el.disabled === true || el.getAttribute("aria-disabled") === "true")
+  if (el.disabled === true || (el.matches && el.matches(":disabled")) || el.getAttribute("aria-disabled") === "true")
     return {code: "element_not_actionable", reason: "disabled"};
   el.scrollIntoView({block: "center", inline: "center"});
   const r2 = el.getBoundingClientRect();
@@ -112,6 +112,16 @@ async def wait_for_ready(
             if stability <= 0 or stable_hits >= stability:
                 return {"ok": True, "x": point[0], "y": point[1], "selector": selector}
         else:
+            if last.get("abort") is True:
+                return {
+                    "ok": False,
+                    "aborted": True,
+                    "raw": last.get("raw"),
+                    "code": str(last.get("code") or "aborted"),
+                    "reason": last.get("reason"),
+                    "selector": selector,
+                    "timeout": timeout,
+                }
             # Actionability can change while the page is settling: a hidden,
             # disabled, or obscured control may become usable on a later tick.
             # Keep polling every non-ok state, but retain the latest useful

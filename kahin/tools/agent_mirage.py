@@ -39,6 +39,7 @@ from kahin.tools._common import (
     _require_engine,
 )
 from kahin.tools.dom_stream_mirage import (
+    _dom_snapshot_for_session,
     _dom_stream_record,
     _dom_stream_status,
     mirage_dom_action,
@@ -376,6 +377,103 @@ async def mirage_fill_form(
         return orjson.dumps({"filled": len(results), "results": results}, option=orjson.OPT_INDENT_2).decode()
 
 
+def _validate_snapshot_args(
+    selector: str | None,
+    max_tokens: int,
+) -> tuple[str | None, str | None]:
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or not 1 <= max_tokens <= _MAX_TOKEN_BUDGET
+    ):
+        return None, _json_error(
+            "kahin_mirage_snapshot",
+            f"max_tokens must be an integer in 1..{_MAX_TOKEN_BUDGET}",
+            "invalid_argument",
+            field="max_tokens",
+        )
+    if selector is None:
+        return None, None
+    return _text_arg(
+        selector,
+        tool="kahin_mirage_snapshot",
+        field="selector",
+        maximum=_MAX_SELECTOR_LENGTH,
+    )
+
+
+async def _snapshot_impl(
+    *,
+    selector_value: str | None,
+    max_tokens: int = 1500,
+    include_hidden: bool = False,
+    frame_id: str | None = None,
+    session_id: str | None = None,
+) -> str:
+    max_nodes = _bounded_int(2000, minimum=1, maximum=5000, default=2000)
+    max_depth = _bounded_int(24, minimum=1, maximum=32, default=24)
+    if session_id is None:
+        raw_text = await mirage_dom_snapshot(
+            selector=selector_value,
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+            include_hidden=include_hidden,
+            frame_id=frame_id,
+        )
+    else:
+        raw_text = await _dom_snapshot_for_session(
+            session_id,
+            selector=selector_value,
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+            include_hidden=include_hidden,
+            frame_id=frame_id,
+        )
+    raw = _loads(raw_text)
+    if not isinstance(raw, dict):
+        return _json_error(
+            "kahin_mirage_snapshot",
+            "DOM snapshot returned an invalid payload",
+            "invalid_engine_response",
+        )
+    if raw.get("error"):
+        return orjson.dumps(raw, option=orjson.OPT_INDENT_2).decode()
+    tree = raw.get("root") or {}
+    if not isinstance(tree, dict):
+        return _json_error(
+            "kahin_mirage_snapshot",
+            "DOM snapshot returned no root tree",
+            "invalid_engine_response",
+        )
+    formatted = format_snapshot(tree, max_tokens=max_tokens)
+    payload: dict[str, Any] = dict(formatted)
+    for key in ("streamId", "cursor", "revision", "url", "title", "readyState", "focused"):
+        if key in raw:
+            payload[key] = raw[key]
+    payload["include_hidden"] = bool(include_hidden)
+    return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
+
+
+async def _snapshot_for_session(
+    session_id: str,
+    max_tokens: int = 1500,
+    frame_id: str | None = None,
+    selector: str | None = None,
+    include_hidden: bool = False,
+) -> str:
+    """Capture an agent-formatted snapshot for a pinned page session."""
+    selector_value, error = _validate_snapshot_args(selector, max_tokens)
+    if error:
+        return error
+    return await _snapshot_impl(
+        selector_value=selector_value,
+        max_tokens=max_tokens,
+        include_hidden=include_hidden,
+        frame_id=frame_id,
+        session_id=session_id,
+    )
+
+
 @mcp.tool(name="kahin_mirage_snapshot", annotations=_RO)
 async def mirage_snapshot(
     selector: str | None = None,
@@ -393,27 +491,9 @@ async def mirage_snapshot(
     ``url``/``title``/``readyState``/``focused``) is passed through when the
     live DOM stream provides it.
     """
-    if (
-        isinstance(max_tokens, bool)
-        or not isinstance(max_tokens, int)
-        or not 1 <= max_tokens <= _MAX_TOKEN_BUDGET
-    ):
-        return _json_error(
-            "kahin_mirage_snapshot",
-            f"max_tokens must be an integer in 1..{_MAX_TOKEN_BUDGET}",
-            "invalid_argument",
-            field="max_tokens",
-        )
-    selector_value: str | None = None
-    if selector is not None:
-        selector_value, error = _text_arg(
-            selector,
-            tool="kahin_mirage_snapshot",
-            field="selector",
-            maximum=_MAX_SELECTOR_LENGTH,
-        )
-        if error:
-            return error
+    selector_value, error = _validate_snapshot_args(selector, max_tokens)
+    if error:
+        return error
     async with _healer_ref.safe(
         "kahin_mirage_snapshot",
         selector=selector_value[:80] if selector_value else None,
@@ -421,36 +501,12 @@ async def mirage_snapshot(
         include_hidden=include_hidden,
         frame_id=frame_id,
     ):
-        raw_text = await mirage_dom_snapshot(
-            selector=selector_value,
-            max_nodes=_bounded_int(2000, minimum=1, maximum=5000, default=2000),
-            max_depth=_bounded_int(24, minimum=1, maximum=32, default=24),
+        return await _snapshot_impl(
+            selector_value=selector_value,
+            max_tokens=max_tokens,
             include_hidden=include_hidden,
             frame_id=frame_id,
         )
-        raw = _loads(raw_text)
-        if not isinstance(raw, dict):
-            return _json_error(
-                "kahin_mirage_snapshot",
-                "DOM snapshot returned an invalid payload",
-                "invalid_engine_response",
-            )
-        if raw.get("error"):
-            return orjson.dumps(raw, option=orjson.OPT_INDENT_2).decode()
-        tree = raw.get("root") or {}
-        if not isinstance(tree, dict):
-            return _json_error(
-                "kahin_mirage_snapshot",
-                "DOM snapshot returned no root tree",
-                "invalid_engine_response",
-            )
-        formatted = format_snapshot(tree, max_tokens=max_tokens)
-        payload: dict[str, Any] = dict(formatted)
-        for key in ("streamId", "cursor", "revision", "url", "title", "readyState", "focused"):
-            if key in raw:
-                payload[key] = raw[key]
-        payload["include_hidden"] = bool(include_hidden)
-        return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_mirage_state_save", annotations=_RO)

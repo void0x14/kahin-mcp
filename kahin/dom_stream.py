@@ -189,7 +189,7 @@ DOM_STREAM_INIT_SCRIPT = r"""
       if (["input", "textarea", "select"].includes(tag) || el.isContentEditable) {
         item.value = type === "password" ? "[redacted]" : String(el.value ?? el.textContent ?? "").slice(0, 500);
       }
-      if ("disabled" in el) item.disabled = Boolean(el.disabled);
+      if ("disabled" in el) item.disabled = Boolean(el.disabled || (el.matches && el.matches(":disabled")));
       if ("checked" in el) item.checked = Boolean(el.checked);
       if ("selected" in el) item.selected = Boolean(el.selected);
       if (roleOf(el) === "button" || tag === "a") item.actions.push("click");
@@ -394,7 +394,10 @@ DOM_STREAM_INIT_SCRIPT = r"""
       if (action === "type" && roleOf(el) !== "textbox") {
         return {error: "not_text_input", nodeId, role: roleOf(el)};
       }
-      el.scrollIntoView({block: "center", inline: "center"});
+      el.scrollIntoView({block: "center", inline: "center", behavior: "instant"});
+      if ((action === "select" || action === "type") && (el.disabled === true || (el.matches && el.matches(":disabled")) || el.getAttribute("aria-disabled") === "true" || (action === "type" && el.readOnly === true))) {
+        return {error: "element is disabled", code: "element_not_actionable", reason: "disabled", nodeId};
+      }
       if (action === "select") {
         if (!(el instanceof HTMLSelectElement)) return {error: "not_select", nodeId};
         const wanted = String(options.text ?? "");
@@ -407,16 +410,22 @@ DOM_STREAM_INIT_SCRIPT = r"""
       }
       if (action === "focus" || action === "type") el.focus();
       const rect = el.getBoundingClientRect();
-      let x = rect.x + rect.width / 2;
-      let y = rect.y + rect.height / 2;
-      let owner = window;
-      while (owner !== owner.top) {
-        const frame = owner.frameElement;
-        if (!frame) break;
-        const frameRect = frame.getBoundingClientRect();
-        x += frameRect.x;
-        y += frameRect.y;
-        owner = owner.parent;
+      if (action === "click" || action === "hover") {
+        const style = window.getComputedStyle(el);
+        if (rect.width <= 0 || rect.height <= 0 || style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") {
+          return {error: "element is not actionable", code: "element_not_actionable", reason: "not_visible", nodeId};
+        }
+        if (action === "click" && (el.disabled === true || (el.matches && el.matches(":disabled")) || el.getAttribute("aria-disabled") === "true")) {
+          return {error: "element is disabled", code: "element_not_actionable", reason: "disabled", nodeId};
+        }
+      }
+      const x = rect.x + (rect.width <= 1 ? rect.width * 0.25 : rect.width / 2);
+      const y = rect.y + (rect.height <= 1 ? rect.height * 0.25 : rect.height / 2);
+      if (action === "click" || action === "hover") {
+        const hit = document.elementFromPoint(x, y);
+        if (hit && hit !== el && !el.contains(hit)) {
+          return {error: "element is obscured", code: "element_not_actionable", reason: "obscured", hit: String(hit.tagName || "").toLowerCase(), nodeId};
+        }
       }
       return {ready: true, nodeId, action, tag: el.tagName.toLowerCase(),
         role: roleOf(el), x, y, scrolled: action === "scroll"};

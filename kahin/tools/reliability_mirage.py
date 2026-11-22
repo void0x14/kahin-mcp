@@ -39,10 +39,17 @@ from kahin.tools.pilot_mirage import (
     _capture_page_session,
     _dispatch_mouse,
     _element_point,
+    _frame_alive_live,
+    _frame_context_changed,
+    _frame_context_id,
+    _frame_nav_seq,
+    _frame_parent_map,
     _is_error_response,
     _json_error,
+    _probe_result_or_abort,
     _safe_mirage_eval_result,
     _text_arg,
+    _validate_frame_id,
 )
 
 
@@ -54,6 +61,21 @@ def _parsed_value(result: Any) -> dict[str, Any]:
     value = result.get("result") or {}
     parsed = value.get("value") if isinstance(value, dict) else None
     return parsed if isinstance(parsed, dict) else {"error": "probe_failed"}
+
+
+async def _ensure_frame_exists(tool: str, frame_id: str | None, session_id: str) -> str | None:
+    if frame_id is None:
+        return None
+    if _mirage_engine().resolve_context(frame_id, session_id=session_id) is not None:
+        return None
+    try:
+        tree_res = await _mirage_engine().call("Page.getFrameTree", session_id=session_id)
+        parents = _frame_parent_map(tree_res.get("frameTree") if isinstance(tree_res, dict) else None)
+    except Exception:  # noqa: BLE001
+        parents = {}
+    if frame_id not in parents:
+        return _json_error(tool, f"frame {frame_id!r} not found in frame tree", "frame_not_found", frame_id=frame_id)
+    return None
 
 
 async def _probe_for(tool: str, frame_id: str | None, session_id: str):
@@ -78,7 +100,7 @@ def _state_js(selector: str, state: str) -> str:
         "(() => { const el = "
         + element
         + "; if (!el) return {ok:false, code:'element_not_found'}; "
-        + "return {ok: !(el.disabled === true || el.getAttribute('aria-disabled') === 'true')}; })()"
+        + "return {ok: !(el.disabled === true || (el.matches && el.matches(':disabled')) || el.getAttribute('aria-disabled') === 'true')}; })()"
     )
 
 
@@ -122,6 +144,8 @@ async def mirage_expect(
     assert selector_value is not None
     if not selector_value:
         return _json_error("kahin_mirage_expect", "selector must not be empty", "invalid_argument", field="selector")
+    if frame_error := _validate_frame_id(frame_id, "kahin_mirage_expect"):
+        return frame_error
     if state is not None and state not in {"visible", "enabled"}:
         return _json_error("kahin_mirage_expect", "state must be visible or enabled", "invalid_argument", field="state", received=state)
     if attribute_value is not None and attribute is None:
@@ -151,6 +175,8 @@ async def mirage_expect(
         if capture_error:
             return capture_error
         assert session_id is not None
+        if missing_frame := await _ensure_frame_exists("kahin_mirage_expect", frame_id, session_id):
+            return missing_frame
         expression = _expect_expression(
             selector_value,
             state=state,
@@ -204,7 +230,7 @@ _CHECKABLE_JS = """
   const tag = String(el.tagName || "").toLowerCase();
   const type = String(el.getAttribute && el.getAttribute("type") || "").toLowerCase();
   if (tag !== "input" || (type !== "checkbox" && type !== "radio")) return {code: "not_checkable", tag, type};
-  if (el.disabled === true) return {code: "element_not_actionable", reason: "disabled"};
+  if (el.disabled === true || (el.matches && el.matches(":disabled")) || el.getAttribute("aria-disabled") === "true") return {code: "element_not_actionable", reason: "disabled"};
   return {ok: true, type, checked: Boolean(el.checked)};
 })()
 """
@@ -220,10 +246,13 @@ async def _check_flow(
     session_id: str,
 ) -> dict[str, Any]:
     async def probe(expression: str) -> dict[str, Any]:
-        return _parsed_value(await _safe_mirage_eval_result(tool, expression, frame_id, session_id=session_id))
+        result = await _safe_mirage_eval_result(tool, expression, frame_id, session_id=session_id)
+        return await _probe_result_or_abort(tool, result, frame_id, session_id)
 
     ready = await wait_for_ready(probe, selector, timeout=timeout)
     if not ready.get("ok"):
+        if ready.get("aborted") and isinstance(ready.get("raw"), str):
+            return orjson.loads(ready["raw"])
         return {"error": "element is not actionable", "code": ready.get("code") or "timeout", "reason": ready.get("reason")}
     check_js = _CHECKABLE_JS.replace("${ELEMENT_JS}", selector_js(selector))
     kind = await probe(check_js)
@@ -233,13 +262,23 @@ async def _check_flow(
         return {"error": str(kind.get("code")), "code": str(kind.get("code")), "selector": selector}
     if not want and kind.get("type") == "radio":
         return {"error": "radio inputs cannot be unchecked", "code": "not_checkable", "selector": selector}
-    point = await _element_point(selector, frame_id, session_id=session_id)
+    point = await _element_point(selector, frame_id, session_id=session_id, tool=tool)
     if not isinstance(point, tuple):
+        try:
+            err_payload = orjson.loads(point)
+        except orjson.JSONDecodeError:
+            err_payload = None
+        if isinstance(err_payload, dict) and err_payload.get("error"):
+            return err_payload
         return {"error": "element point failed", "code": "element_not_found", "selector": selector}
     x, y = point
+    initial_ctx = _frame_context_id(frame_id, session_id)
+    initial_nav = _frame_nav_seq(frame_id, session_id)
     down = await _dispatch_mouse("mousedown", x, y, button=0, buttons=1, session_id=session_id)
     if _is_error_response(down):
         return {"error": "mousedown failed", "code": "tool_failed"}
+    if not await _frame_alive_live(frame_id, initial_ctx, session_id, initial_nav_seq=initial_nav):
+        return {"error": "target frame detached or navigated during check", "code": "frame_detached", "frame_id": frame_id}
     up = await _dispatch_mouse("mouseup", x, y, button=0, buttons=0, session_id=session_id)
     if _is_error_response(up):
         return {"error": "mouseup failed", "code": "tool_failed"}
@@ -269,6 +308,8 @@ async def _session_tool(tool: str, selector: str, timeout: float, frame_id: str 
     assert selector_value is not None
     if not selector_value:
         return None, _json_error(tool, "selector must not be empty", "invalid_argument", field="selector"), None, timeout
+    if frame_error := _validate_frame_id(frame_id, tool):
+        return None, frame_error, None, timeout
     timeout_value = _bounded_float(timeout, minimum=0.0, maximum=_MAX_WAIT_TIMEOUT, default=10.0)
     session_id, capture_error = await _capture_page_session(tool)
     return selector_value, capture_error, session_id, timeout_value
@@ -287,8 +328,8 @@ async def mirage_check(selector: str, timeout: float = 10.0, return_snapshot: bo
         if not isinstance(payload, dict) or payload.get("error"):
             return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
         if return_snapshot:
-            from kahin.tools.agent_mirage import mirage_snapshot  # noqa: PLC0415
-            payload["snapshot"] = orjson.loads(await mirage_snapshot(max_tokens=1500, frame_id=frame_id))
+            from kahin.tools.agent_mirage import _snapshot_for_session  # noqa: PLC0415
+            payload["snapshot"] = orjson.loads(await _snapshot_for_session(session_id, max_tokens=1500, frame_id=frame_id))
         return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
 
 
@@ -305,8 +346,8 @@ async def mirage_uncheck(selector: str, timeout: float = 10.0, return_snapshot: 
         if not isinstance(payload, dict) or payload.get("error"):
             return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
         if return_snapshot:
-            from kahin.tools.agent_mirage import mirage_snapshot  # noqa: PLC0415
-            payload["snapshot"] = orjson.loads(await mirage_snapshot(max_tokens=1500, frame_id=frame_id))
+            from kahin.tools.agent_mirage import _snapshot_for_session  # noqa: PLC0415
+            payload["snapshot"] = orjson.loads(await _snapshot_for_session(session_id, max_tokens=1500, frame_id=frame_id))
         return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
 
 
@@ -336,6 +377,8 @@ async def mirage_select_option(
                 return error
     if index is not None and (isinstance(index, bool) or not isinstance(index, int) or index < 0):
         return _json_error("kahin_mirage_select_option", "index must be a non-negative integer", "invalid_argument", field="index")
+    if frame_error := _validate_frame_id(frame_id, "kahin_mirage_select_option"):
+        return frame_error
     timeout_value = _bounded_float(timeout, minimum=0.0, maximum=_MAX_WAIT_TIMEOUT, default=10.0)
     async with _healer_ref.safe("kahin_mirage_select_option", selector=selector_value[:80], timeout=timeout_value, frame_id=frame_id):
         session_id, capture_error = await _capture_page_session("kahin_mirage_select_option")
@@ -344,10 +387,13 @@ async def mirage_select_option(
         assert session_id is not None
 
         async def probe(expression: str) -> dict[str, Any]:
-            return _parsed_value(await _safe_mirage_eval_result("kahin_mirage_select_option", expression, frame_id, session_id=session_id))
+            result = await _safe_mirage_eval_result("kahin_mirage_select_option", expression, frame_id, session_id=session_id)
+            return await _probe_result_or_abort("kahin_mirage_select_option", result, frame_id, session_id)
 
         ready = await wait_for_ready(probe, selector_value, timeout=timeout_value)
         if not ready.get("ok"):
+            if ready.get("aborted") and isinstance(ready.get("raw"), str):
+                return ready["raw"]
             return _json_error("kahin_mirage_select_option", "element is not actionable", str(ready.get("code") or "timeout"), selector=selector_value)
         criterion = "value" if value is not None else "label" if label is not None else "index"
         wanted: Any = value if value is not None else label if label is not None else index
@@ -371,8 +417,8 @@ async def mirage_select_option(
             return _json_error("kahin_mirage_select_option", code, code, selector=selector_value, wanted=parsed.get("wanted"))
         payload = {"selected": parsed.get("selected"), "label": parsed.get("label"), "selector": selector_value}
         if return_snapshot:
-            from kahin.tools.agent_mirage import mirage_snapshot  # noqa: PLC0415
-            payload["snapshot"] = orjson.loads(await mirage_snapshot(max_tokens=1500, frame_id=frame_id))
+            from kahin.tools.agent_mirage import _snapshot_for_session  # noqa: PLC0415
+            payload["snapshot"] = orjson.loads(await _snapshot_for_session(session_id, max_tokens=1500, frame_id=frame_id))
         return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
 
 
@@ -386,26 +432,35 @@ async def mirage_dblclick(selector: str, timeout: float = 10.0, return_snapshot:
     assert selector_value is not None and session_id is not None
     async with _healer_ref.safe("kahin_mirage_dblclick", selector=selector_value[:80], timeout=timeout_value, frame_id=frame_id):
         async def probe(expression: str) -> dict[str, Any]:
-            return _parsed_value(await _safe_mirage_eval_result("kahin_mirage_dblclick", expression, frame_id, session_id=session_id))
+            result = await _safe_mirage_eval_result("kahin_mirage_dblclick", expression, frame_id, session_id=session_id)
+            return await _probe_result_or_abort("kahin_mirage_dblclick", result, frame_id, session_id)
 
         ready = await wait_for_ready(probe, selector_value, timeout=timeout_value)
         if not ready.get("ok"):
+            if ready.get("aborted") and isinstance(ready.get("raw"), str):
+                return ready["raw"]
             return _json_error("kahin_mirage_dblclick", "element is not actionable", str(ready.get("code") or "timeout"), selector=selector_value)
-        point = await _element_point(selector_value, frame_id, session_id=session_id)
+        point = await _element_point(selector_value, frame_id, session_id=session_id, tool="kahin_mirage_dblclick")
         if not isinstance(point, tuple):
             return point
         x, y = point
+        initial_ctx = _frame_context_id(frame_id, session_id)
+        initial_nav = _frame_nav_seq(frame_id, session_id)
         for click_count in (1, 2):
+            if click_count == 2 and not await _frame_alive_live(frame_id, initial_ctx, session_id, initial_nav_seq=initial_nav):
+                return _json_error("kahin_mirage_dblclick", "target frame detached or navigated during dblclick", "frame_detached", frame_id=frame_id)
             down = await _dispatch_mouse("mousedown", x, y, button=0, buttons=1, click_count=click_count, session_id=session_id)
             if _is_error_response(down):
                 return down
+            if not await _frame_alive_live(frame_id, initial_ctx, session_id, initial_nav_seq=initial_nav):
+                return _json_error("kahin_mirage_dblclick", "target frame detached or navigated during dblclick", "frame_detached", frame_id=frame_id)
             up = await _dispatch_mouse("mouseup", x, y, button=0, buttons=0, click_count=click_count, session_id=session_id)
             if _is_error_response(up):
                 return up
         payload = {"dblclicked": selector_value, "x": x, "y": y}
         if return_snapshot:
-            from kahin.tools.agent_mirage import mirage_snapshot  # noqa: PLC0415
-            payload["snapshot"] = orjson.loads(await mirage_snapshot(max_tokens=1500, frame_id=frame_id))
+            from kahin.tools.agent_mirage import _snapshot_for_session  # noqa: PLC0415
+            payload["snapshot"] = orjson.loads(await _snapshot_for_session(session_id, max_tokens=1500, frame_id=frame_id))
         return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
 
 
@@ -420,6 +475,8 @@ async def mirage_drag(selector_from: str, selector_to: str, timeout: float = 10.
     if error:
         return error
     assert source is not None and target is not None
+    if frame_error := _validate_frame_id(frame_id, "kahin_mirage_drag"):
+        return frame_error
     steps_value = _bounded_int(steps, minimum=2, maximum=50, default=10)
     timeout_value = _bounded_float(timeout, minimum=0.0, maximum=_MAX_WAIT_TIMEOUT, default=10.0)
     async with _healer_ref.safe("kahin_mirage_drag", selector_from=source[:80], selector_to=target[:80], steps=steps_value, timeout=timeout_value, frame_id=frame_id):
@@ -429,23 +486,36 @@ async def mirage_drag(selector_from: str, selector_to: str, timeout: float = 10.
         assert session_id is not None
 
         async def probe(expression: str) -> dict[str, Any]:
-            return _parsed_value(await _safe_mirage_eval_result("kahin_mirage_drag", expression, frame_id, session_id=session_id))
+            result = await _safe_mirage_eval_result("kahin_mirage_drag", expression, frame_id, session_id=session_id)
+            return await _probe_result_or_abort("kahin_mirage_drag", result, frame_id, session_id)
 
         for selector in (source, target):
             ready = await wait_for_ready(probe, selector, timeout=timeout_value)
             if not ready.get("ok"):
+                if ready.get("aborted") and isinstance(ready.get("raw"), str):
+                    return ready["raw"]
                 return _json_error("kahin_mirage_drag", "element is not actionable", str(ready.get("code") or "timeout"), selector=selector)
-        source_point = await _element_point(source, frame_id, session_id=session_id)
-        target_point = await _element_point(target, frame_id, session_id=session_id)
-        if not isinstance(source_point, tuple) or not isinstance(target_point, tuple):
-            return _json_error("kahin_mirage_drag", "drag point could not be resolved", "element_not_found")
+        source_point = await _element_point(source, frame_id, session_id=session_id, tool="kahin_mirage_drag")
+        if not isinstance(source_point, tuple):
+            return source_point
         x0, y0 = source_point
-        x1, y1 = target_point
+        initial_ctx = _frame_context_id(frame_id, session_id)
+        initial_nav = _frame_nav_seq(frame_id, session_id)
         down = await _dispatch_mouse("mousedown", x0, y0, button=0, buttons=1, session_id=session_id)
         if _is_error_response(down):
             return down
+        if not await _frame_alive_live(frame_id, initial_ctx, session_id, initial_nav_seq=initial_nav):
+            return _json_error("kahin_mirage_drag", "target frame detached or navigated during drag", "frame_detached", frame_id=frame_id)
+        target_point = await _element_point(target, frame_id, session_id=session_id, tool="kahin_mirage_drag")
+        if _frame_context_changed(frame_id, initial_ctx, session_id) or _frame_nav_seq(frame_id, session_id) != initial_nav:
+            return _json_error("kahin_mirage_drag", "target frame detached or navigated during drag", "frame_detached", frame_id=frame_id)
+        if not isinstance(target_point, tuple):
+            return target_point
+        x1, y1 = target_point
         last_x, last_y = x0, y0
         for step in range(1, steps_value + 1):
+            if _frame_context_changed(frame_id, initial_ctx, session_id) or _frame_nav_seq(frame_id, session_id) != initial_nav:
+                return _json_error("kahin_mirage_drag", "target frame detached or navigated during drag", "frame_detached", frame_id=frame_id)
             ratio = step / steps_value
             last_x = x0 + (x1 - x0) * ratio
             last_y = y0 + (y1 - y0) * ratio
@@ -453,13 +523,15 @@ async def mirage_drag(selector_from: str, selector_to: str, timeout: float = 10.
             if _is_error_response(move):
                 return move
             await asyncio.sleep(0.01)
+        if not await _frame_alive_live(frame_id, initial_ctx, session_id, initial_nav_seq=initial_nav):
+            return _json_error("kahin_mirage_drag", "target frame detached or navigated during drag", "frame_detached", frame_id=frame_id)
         up = await _dispatch_mouse("mouseup", last_x, last_y, button=0, buttons=0, session_id=session_id)
         if _is_error_response(up):
             return up
         payload = {"dragged": source, "to": target, "steps": steps_value, "x": last_x, "y": last_y}
         if return_snapshot:
-            from kahin.tools.agent_mirage import mirage_snapshot  # noqa: PLC0415
-            payload["snapshot"] = orjson.loads(await mirage_snapshot(max_tokens=1500, frame_id=frame_id))
+            from kahin.tools.agent_mirage import _snapshot_for_session  # noqa: PLC0415
+            payload["snapshot"] = orjson.loads(await _snapshot_for_session(session_id, max_tokens=1500, frame_id=frame_id))
         return orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
 
 
@@ -472,19 +544,26 @@ async def mirage_wait_for_text(text: str, timeout: float = 10.0, frame_id: str |
     assert text_value is not None
     if not text_value:
         return _json_error("kahin_mirage_wait_for_text", "text must not be empty", "invalid_argument", field="text")
+    if frame_error := _validate_frame_id(frame_id, "kahin_mirage_wait_for_text"):
+        return frame_error
     timeout_value = _bounded_float(timeout, minimum=0.0, maximum=_MAX_WAIT_TIMEOUT, default=10.0)
     async with _healer_ref.safe("kahin_mirage_wait_for_text", text=text_value[:80], timeout=timeout_value, frame_id=frame_id):
         session_id, capture_error = await _capture_page_session("kahin_mirage_wait_for_text")
         if capture_error:
             return capture_error
         assert session_id is not None
+        if missing_frame := await _ensure_frame_exists("kahin_mirage_wait_for_text", frame_id, session_id):
+            return missing_frame
         expression = (
             "(() => { const t = (document.body ? document.body.innerText : '') || ''; "
             f"return {{present: t.includes({orjson.dumps(text_value).decode()})}}; }})()"
         )
         deadline = asyncio.get_running_loop().time() + timeout_value
         while True:
-            parsed = _parsed_value(await _safe_mirage_eval_result("kahin_mirage_wait_for_text", expression, frame_id, session_id=session_id))
+            raw_result = await _safe_mirage_eval_result("kahin_mirage_wait_for_text", expression, frame_id, session_id=session_id)
+            parsed = await _probe_result_or_abort("kahin_mirage_wait_for_text", raw_result, frame_id, session_id)
+            if parsed.get("abort") and isinstance(parsed.get("raw"), str):
+                return parsed["raw"]
             if parsed.get("present"):
                 return orjson.dumps({"found": True, "text": text_value, "timeout": timeout_value}, option=orjson.OPT_INDENT_2).decode()
             if asyncio.get_running_loop().time() >= deadline:

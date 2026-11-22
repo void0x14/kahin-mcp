@@ -126,6 +126,8 @@ def _optional_text(
         return None, _argument_error(
             tool, field, f"{field} exceeds the {maximum}-character limit",
         )
+    if field == "frame_id" and not value.strip():
+        return None, _argument_error(tool, field, f"{field} must be a non-empty string")
     return value, None
 
 
@@ -159,22 +161,39 @@ def _unwrap(raw: dict[str, Any] | str) -> tuple[Any | None, str | None]:
 async def _prepare(
     frame_id: str | None,
     max_events: int | None = None,
+    session_id: str | None = None,
 ) -> tuple[Any | None, str | None, str | None]:
     err = await _require_mirage()
     if err:
         return None, None, err
     engine = _mirage_engine()
-    try:
-        page = await engine.ensure_page()
-        session_id = page.get("sessionId")
-    except Exception as exc:  # noqa: BLE001 - tool returns structured failure
-        return None, None, _dump({"error": "DOM stream page setup failed", "detail": str(exc)})
+    if session_id is None:
+        try:
+            page = await engine.ensure_page()
+            session_id = page.get("sessionId")
+        except Exception as exc:  # noqa: BLE001 - tool returns structured failure
+            return None, None, _dump({"error": "DOM stream page setup failed", "detail": str(exc)})
     if not isinstance(session_id, str) or not session_id:
         return None, None, _dump({"error": "DOM stream has no live page session", "code": "session_unavailable"})
     try:
         await engine.install_dom_stream(DOM_STREAM_INIT_SCRIPT)
         raw = await _mirage_eval_result(DOM_STREAM_INIT_SCRIPT, frame_id, session_id=session_id)
         if isinstance(raw, str):
+            if frame_id is not None and "no execution context for frame" in raw:
+                from kahin.tools.pilot_mirage import _frame_parent_map, _json_error  # noqa: PLC0415
+
+                try:
+                    tree_res = await engine.call("Page.getFrameTree", session_id=session_id)
+                    parents = _frame_parent_map(tree_res.get("frameTree") if isinstance(tree_res, dict) else None)
+                except Exception:  # noqa: BLE001
+                    parents = {}
+                if frame_id not in parents:
+                    return None, None, _json_error(
+                        "kahin_mirage_dom_action",
+                        f"frame {frame_id!r} not found in frame tree",
+                        "frame_not_found",
+                        frame_id=frame_id,
+                    )
             return None, None, raw
         if raw.get("exceptionDetails"):
             return None, None, _dump({"error": "DOM stream setup threw", "exception": raw["exceptionDetails"]})
@@ -236,22 +255,16 @@ async def mirage_dom_start(
         return _dump({"status": "started", "stream": value, "frame_id": checked_frame})
 
 
-@mcp.tool(name="kahin_mirage_dom_snapshot", annotations=_RO)
-async def mirage_dom_snapshot(
+async def _dom_snapshot_impl(
     selector: str | None = None,
     max_nodes: int = 800,
     max_depth: int = 12,
     include_hidden: bool = False,
     text_limit: int = 240,
     frame_id: str | None = None,
+    *,
+    session_id: str | None = None,
 ) -> str:
-    """Return a bounded live semantic DOM snapshot.
-
-    Nodes include stable-per-document ``nodeId`` values, role/name/text,
-    visibility/geometry, safe identifying attributes and action hints. A
-    ``truncated`` result is an instruction to narrow with ``selector`` or
-    increase caps; it is never silently presented as a complete page.
-    """
     checked_selector, error = _optional_text(selector, "selector", _MAX_SELECTOR, "kahin_mirage_dom_snapshot")
     if error:
         return error
@@ -269,32 +282,82 @@ async def mirage_dom_snapshot(
         return error
     if not isinstance(include_hidden, bool):
         return _argument_error("kahin_mirage_dom_snapshot", "include_hidden", "include_hidden must be a boolean")
+    _, resolved_session_id, error = await _prepare(checked_frame, session_id=session_id)
+    if error:
+        return error
+    assert resolved_session_id is not None
+    value, error = await _call_page("snapshot", {
+        "selector": checked_selector or "",
+        "maxNodes": checked_nodes,
+        "maxDepth": checked_depth,
+        "includeHidden": include_hidden,
+        "textLimit": checked_text,
+    }, checked_frame, resolved_session_id)
+    if error:
+        return error
+    if isinstance(value, dict) and not value.get("error"):
+        cursor = value.get("cursor")
+        _dom_stream_record(
+            resolved_session_id,
+            stream_id=value.get("streamId"),
+            cursor=cursor if isinstance(cursor, int) else None,
+            next_seq=value.get("nextSeq") if isinstance(value.get("nextSeq"), int) else None,
+            refs_live=True,
+        )
+    return _dump(value)
+
+
+async def _dom_snapshot_for_session(
+    session_id: str,
+    *,
+    selector: str | None = None,
+    max_nodes: int = 800,
+    max_depth: int = 12,
+    include_hidden: bool = False,
+    text_limit: int = 240,
+    frame_id: str | None = None,
+) -> str:
+    """Capture a live semantic DOM snapshot for a pinned page session."""
+    return await _dom_snapshot_impl(
+        selector=selector,
+        max_nodes=max_nodes,
+        max_depth=max_depth,
+        include_hidden=include_hidden,
+        text_limit=text_limit,
+        frame_id=frame_id,
+        session_id=session_id,
+    )
+
+
+@mcp.tool(name="kahin_mirage_dom_snapshot", annotations=_RO)
+async def mirage_dom_snapshot(
+    selector: str | None = None,
+    max_nodes: int = 800,
+    max_depth: int = 12,
+    include_hidden: bool = False,
+    text_limit: int = 240,
+    frame_id: str | None = None,
+) -> str:
+    """Return a bounded live semantic DOM snapshot.
+
+    Nodes include stable-per-document ``nodeId`` values, role/name/text,
+    visibility/geometry, safe identifying attributes and action hints. A
+    ``truncated`` result is an instruction to narrow with ``selector`` or
+    increase caps; it is never silently presented as a complete page.
+    """
     async with _healer_ref.safe(
-        "kahin_mirage_dom_snapshot", selector=checked_selector or "", frame_id=checked_frame
+        "kahin_mirage_dom_snapshot",
+        selector=selector[:80] if isinstance(selector, str) else "",
+        frame_id=frame_id if isinstance(frame_id, str) else None,
     ):
-        _, session_id, error = await _prepare(checked_frame)
-        if error:
-            return error
-        assert session_id is not None
-        value, error = await _call_page("snapshot", {
-            "selector": checked_selector or "",
-            "maxNodes": checked_nodes,
-            "maxDepth": checked_depth,
-            "includeHidden": include_hidden,
-            "textLimit": checked_text,
-        }, checked_frame, session_id)
-        if error:
-            return error
-        if isinstance(value, dict) and not value.get("error"):
-            cursor = value.get("cursor")
-            _dom_stream_record(
-                session_id,
-                stream_id=value.get("streamId"),
-                cursor=cursor if isinstance(cursor, int) else None,
-                next_seq=value.get("nextSeq") if isinstance(value.get("nextSeq"), int) else None,
-                refs_live=True,
-            )
-        return _dump(value)
+        return await _dom_snapshot_impl(
+            selector=selector,
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+            include_hidden=include_hidden,
+            text_limit=text_limit,
+            frame_id=frame_id,
+        )
 
 
 @mcp.tool(name="kahin_mirage_dom_events", annotations=_RO)
@@ -429,29 +492,54 @@ async def mirage_dom_action(
 
         result: dict[str, Any] = {"target": value, "action": checked_action}
         if checked_action in {"click", "hover"}:
-            try:
-                event_type = "mousemove" if checked_action == "hover" else "mousedown"
-                result["down"] = await engine.call("Page.dispatchMouseEvent", {
-                    "type": event_type,
-                    "button": 0,
-                    "x": value["x"],
-                    "y": value["y"],
-                    "modifiers": 0,
-                    "clickCount": 1,
-                    "buttons": 1 if checked_action == "click" else 0,
-                }, session_id=session_id)
-                if checked_action == "click":
-                    result["up"] = await engine.call("Page.dispatchMouseEvent", {
-                        "type": "mouseup",
-                        "button": 0,
-                        "x": value["x"],
-                        "y": value["y"],
-                        "modifiers": 0,
-                        "clickCount": 1,
-                        "buttons": 0,
-                    }, session_id=session_id)
-            except Exception as exc:  # noqa: BLE001 - return tool-level error
-                return _dump({"error": "DOM action dispatch failed", "detail": str(exc)})
+            from kahin.tools.pilot_mirage import (  # noqa: PLC0415
+                _dispatch_mouse,
+                _frame_alive_live,
+                _frame_context_id,
+                _frame_nav_seq,
+                _is_error_response,
+                _json_error,
+                _resolve_frame_point,
+            )
+
+            resolved = await _resolve_frame_point(
+                value["x"],
+                value["y"],
+                checked_frame,
+                session_id=session_id,
+                tool="kahin_mirage_dom_action",
+            )
+            if isinstance(resolved, str):
+                return resolved
+            x, y = resolved
+            value["x"] = x
+            value["y"] = y
+            initial_ctx = _frame_context_id(checked_frame, session_id)
+            initial_nav = _frame_nav_seq(checked_frame, session_id)
+            event_type = "mousemove" if checked_action == "hover" else "mousedown"
+            down = await _dispatch_mouse(
+                event_type,
+                x,
+                y,
+                button=0,
+                buttons=1 if checked_action == "click" else 0,
+                session_id=session_id,
+            )
+            if _is_error_response(down):
+                return down
+            result["down"] = orjson.loads(down)
+            if checked_action == "click":
+                if not await _frame_alive_live(checked_frame, initial_ctx, session_id, initial_nav_seq=initial_nav):
+                    return _json_error(
+                        "kahin_mirage_dom_action",
+                        "target frame detached or navigated during click",
+                        "frame_detached",
+                        frame_id=checked_frame,
+                    )
+                up = await _dispatch_mouse("mouseup", x, y, button=0, buttons=0, session_id=session_id)
+                if _is_error_response(up):
+                    return up
+                result["up"] = orjson.loads(up)
         elif checked_action == "type":
             assert text is not None  # required-text validation ran before dispatch
             try:

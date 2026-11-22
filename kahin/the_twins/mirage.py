@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -37,6 +38,11 @@ import orjson
 
 from kahin.dom_stream import DOM_STREAM_BINDING_NAME
 from kahin.the_twins.chassis import BrowserEngine, EngineContext, EventData
+
+try:
+    import anyio
+except ImportError:  # pragma: no cover
+    anyio = None  # type: ignore[assignment]
 
 try:
     from camoufox.utils import launch_options
@@ -763,6 +769,8 @@ class Mirage(BrowserEngine):
         # events the sidecar forwards verbatim. DOM tools resolve a frame_id
         # to the main-world context of that frame.
         self._frame_contexts: dict[str, dict[str, str]] = {}
+        self._main_frame_ids: dict[str, str] = {}
+        self._frame_nav_seq: dict[tuple[str, str], int] = {}
         # Page.fileChooserOpened (file-input click while interception is on):
         # bounded per-session queue, consumed by wait_for_chooser (Gap C
         # upload). A single global slot lets a second tab steal the first
@@ -823,6 +831,8 @@ class Mirage(BrowserEngine):
         self._network_events.clear()
         self._network_routed_ids.clear()
         self._open_dialogs.clear()
+        self._main_frame_ids.clear()
+        self._frame_nav_seq.clear()
         self._notify_dialog_change()
         self._last_stall = None
         if wake_waiters:
@@ -853,6 +863,8 @@ class Mirage(BrowserEngine):
         self._sessions.clear()
         self._target_infos.clear()
         self._frame_contexts.clear()
+        self._main_frame_ids.clear()
+        self._frame_nav_seq.clear()
         self._current_target = None
         self._agent_targets.clear()
         self._agent_contexts.clear()
@@ -1861,6 +1873,9 @@ class Mirage(BrowserEngine):
         value = info.get("browserContextId")
         return value if isinstance(value, str) and value else None
 
+    def frame_nav_seq(self, session_id: str, frame_id: str) -> int:
+        return self._frame_nav_seq.get((session_id, frame_id), 0)
+
     def frame_id_for_execution_context(self, session_id: str, context_id: Any) -> str | None:
         """Resolve a file-chooser execution context to its live frame id."""
         for frame_id, known_context in self._frame_contexts.get(session_id, {}).items():
@@ -1883,7 +1898,11 @@ class Mirage(BrowserEngine):
                 old_session_id = self._sessions.get(target_id)
                 if old_session_id:
                     self._frame_contexts.pop(old_session_id, None)
+                    self._main_frame_ids.pop(old_session_id, None)
+                    self._frame_nav_seq = {k: v for k, v in self._frame_nav_seq.items() if k[0] != old_session_id}
                 self._frame_contexts.pop(session_id, None)
+                self._main_frame_ids.pop(session_id, None)
+                self._frame_nav_seq = {k: v for k, v in self._frame_nav_seq.items() if k[0] != session_id}
                 self._sessions[target_id] = session_id
                 self._target_infos[target_id] = dict(target_info)
         elif method == "Browser.detachedFromTarget":
@@ -1901,6 +1920,8 @@ class Mirage(BrowserEngine):
                 if current_session is not None and current_session != session_id:
                     return
             self._frame_contexts.pop(session_id, None)
+            self._main_frame_ids.pop(session_id, None)
+            self._frame_nav_seq = {k: v for k, v in self._frame_nav_seq.items() if k[0] != session_id}
             if not target_id:
                 target_id = next(
                     (tid for tid, sid in self._sessions.items() if sid == session_id),
@@ -1914,11 +1935,31 @@ class Mirage(BrowserEngine):
 
     def _track_target_url(self, data: dict[str, Any]) -> None:
         """Keep CDP-shaped Target.getTargets URL data current."""
-        if data.get("method") not in {"Page.navigationCommitted", "Page.sameDocumentNavigation"}:
-            return
+        method = data.get("method")
         session_id = data.get("sessionId")
-        url = (data.get("params") or {}).get("url")
-        if not isinstance(session_id, str) or not isinstance(url, str):
+        params = data.get("params") or {}
+        if not isinstance(session_id, str):
+            return
+        if method in {"Page.navigationStarted", "Page.navigationCommitted", "Page.frameDetached"}:
+            fid = params.get("frameId")
+            if isinstance(session_id, str) and isinstance(fid, str) and fid:
+                key = (session_id, fid)
+                self._frame_nav_seq[key] = self._frame_nav_seq.get(key, 0) + 1
+            if method != "Page.navigationCommitted":
+                return
+        if method == "Page.frameAttached":
+            frame_id = params.get("frameId")
+            if isinstance(frame_id, str) and frame_id and not params.get("parentFrameId"):
+                self._main_frame_ids[session_id] = frame_id
+            return
+        if method not in {"Page.navigationCommitted", "Page.sameDocumentNavigation"}:
+            return
+        url = params.get("url")
+        if not isinstance(url, str) or url == "about:srcdoc":
+            return
+        frame_id = params.get("frameId")
+        main_frame_id = self._main_frame_ids.get(session_id)
+        if main_frame_id is not None and isinstance(frame_id, str) and frame_id != main_frame_id:
             return
         target_id = next(
             (tid for tid, sid in self._sessions.items() if sid == session_id),
@@ -2136,6 +2177,10 @@ class Mirage(BrowserEngine):
             if target_id not in self._sessions:
                 raise RuntimeError(f"target {target_id} detached before it became current")
             self._current_target = target_id
+            from kahin.subagent import get_active_subagent_context
+            cid = get_active_subagent_context().get("caller_id")
+            if cid:
+                self._agent_targets[cid] = target_id
             session_id = self._sessions[target_id]
         await self._wait_for_page_frame(session_id, deadline=min(deadline, loop.time() + 3.0))
         # Reflect runtime user-agent override onto DOM prototype for newly created pages
@@ -3007,6 +3052,7 @@ class Mirage(BrowserEngine):
         self._stopping = True
         self._dom_signal.set()
         self._reset_capture_state(wake_waiters=True)
+        self._frame_nav_seq.clear()
         self._identity_config = None
         self._identity_name = None
         self._proxy_url = None
@@ -3021,7 +3067,7 @@ class Mirage(BrowserEngine):
         self._passkey_mode = False
         for fut in self._pending.values():
             if not fut.done():
-                fut.cancel()
+                fut.set_exception(RuntimeError("Mirage stopped"))
         self._pending.clear()
         proc, self._process = self._process, None
         try:
@@ -3065,7 +3111,16 @@ class Mirage(BrowserEngine):
                         proc.kill()
                     except ProcessLookupError:
                         pass
-                    await asyncio.shield(wait_task)
+                    shield = anyio.CancelScope(shield=True) if anyio is not None else contextlib.nullcontext()
+                    with shield:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(wait_task), timeout=_SIDECAR_KILL_TIMEOUT)
+                        except BaseException:  # noqa: BLE001
+                            wait_task.cancel()
+                            try:
+                                await wait_task
+                            except BaseException:  # noqa: BLE001
+                                pass
                     raise
         finally:
             # The reader must keep draining stdout until the sidecar is gone:
@@ -3093,6 +3148,7 @@ class Mirage(BrowserEngine):
             self._sessions.clear()
             self._target_infos.clear()
             self._frame_contexts.clear()
+            self._main_frame_ids.clear()
             self._current_target = None
             self._remove_profile()
 

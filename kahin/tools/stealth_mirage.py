@@ -40,6 +40,7 @@ from kahin.tools.pilot_mirage import (
     _bounded_float,
     _bounded_int,
     _capture_page_session,
+    _clear_active_element,
     _dispatch_mouse,
     _frame_alive_live,
     _frame_context_changed,
@@ -424,30 +425,39 @@ async def mirage_key_text(
     jitter_ms: float = 25.0,
     seed: int | None = None,
     frame_id: str | None = None,
+    clear: bool = False,
 ) -> str:
     """Mirage: type text with a humanized per-character cadence. Each char
     is dispatched as real keydown/keyup pairs (Juggler lowercase types,
     browser-native codes via _key_defaults) separated by jittered delays.
     delay_ms=0 disables the cadence and falls back to the fast path; the
-    text lands in the currently focused element (use mirage_focus/
-    mirage_type for selector-driven typing). Returns {typed, cadence}."""
+    text lands in the currently focused element (``clear=True`` clears an
+    already-focused editable element first; use mirage_focus/mirage_type for
+    selector-driven typing). Returns {typed, cleared, cadence}."""
     text_value, error = _text_arg(
         text, tool="kahin_mirage_key_text", field="text", maximum=_MAX_KEY_TEXT_LENGTH,
     )
     if error:
         return error
+    if not isinstance(clear, bool):
+        return _json_error("kahin_mirage_key_text", "clear must be a boolean", "invalid_argument", field="clear")
     base = _bounded_float(delay_ms, minimum=0.0, maximum=500.0, default=45.0)
     jitter = _bounded_float(jitter_ms, minimum=0.0, maximum=200.0, default=25.0)
     async with _healer_ref.safe(
         "kahin_mirage_key_text", text=text_value[:80],
-        delay_ms=base, jitter_ms=jitter, seed=seed, frame_id=frame_id,
+        delay_ms=base, jitter_ms=jitter, seed=seed, frame_id=frame_id, clear=clear,
     ):
         if base == 0.0:
-            return await mirage_key_text_fast(text_value)
+            return await mirage_key_text_fast(text_value, clear=clear, frame_id=frame_id)
         session_id, capture_error = await _capture_page_session("kahin_mirage_key_text")
         if capture_error:
             return capture_error
         assert session_id is not None
+        cleared = False
+        if clear:
+            cleared, clear_err = await _clear_active_element("kahin_mirage_key_text", frame_id, session_id)
+            if clear_err:
+                return clear_err
         cadence = typing_cadence(len(text_value), base_ms=base, jitter_ms=jitter, seed=seed)
         for index, char in enumerate(text_value):
             code, key_code = _key_defaults(char)
@@ -466,7 +476,7 @@ async def mirage_key_text(
                 return up
             if cadence[index] > 0:
                 await asyncio.sleep(cadence[index] / 1000.0)
-        return orjson.dumps({"typed": text_value, "cadence": cadence}, option=orjson.OPT_INDENT_2).decode()
+        return orjson.dumps({"typed": text_value, "cleared": cleared, "cadence": cadence}, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_identity_pin", annotations=_RW)

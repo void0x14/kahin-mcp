@@ -436,12 +436,14 @@ async def mirage_dom_action(
     action: str,
     text: str | None = None,
     frame_id: str | None = None,
+    clear: bool = True,
 ) -> str:
     """Act on a live snapshot node without trusting a stale selector.
 
     Allowed actions are ``click``, ``hover``, ``focus``, ``type``, ``scroll``
     and ``select``. Click/hover use real Juggler mouse dispatch; type focuses the
-    live element and uses the real Juggler ``Page.insertText`` command; select
+    live element, clears existing text by default (``clear=True``; pass
+    ``clear=False`` to append at the end), and uses ``Page.insertText``; select
     matches an option by value or visible text and fires real input/change
     events. ``text`` is required for ``type`` and ``select`` and is validated
     before any page side effect. A removed or navigated node returns
@@ -468,18 +470,20 @@ async def mirage_dom_action(
         return _argument_error("kahin_mirage_dom_action", "text", "text must be a string of at most 1000000 characters")
     if checked_action in {"type", "select"} and text is None:
         return _argument_error("kahin_mirage_dom_action", "text", f"text is required for action={checked_action}")
+    if not isinstance(clear, bool):
+        return _argument_error("kahin_mirage_dom_action", "clear", "clear must be a boolean")
     checked_frame, error = _optional_text(frame_id, "frame_id", _MAX_FRAME_ID, "kahin_mirage_dom_action")
     if error:
         return error
     async with _healer_ref.safe(
-        "kahin_mirage_dom_action", node_id=checked_node, action=checked_action, frame_id=checked_frame
+        "kahin_mirage_dom_action", node_id=checked_node, action=checked_action, frame_id=checked_frame, clear=clear
     ):
         engine, session_id, error = await _prepare(checked_frame)
         if error:
             return error
         assert engine is not None and session_id is not None
         value, error = await _call_page(
-            "action", {"nodeId": checked_node, "action": checked_action, "text": text}, checked_frame, session_id
+            "action", {"nodeId": checked_node, "action": checked_action, "text": text, "clear": clear}, checked_frame, session_id
         )
         if error:
             return error
@@ -490,6 +494,8 @@ async def mirage_dom_action(
                 _dom_stream_record(session_id, refs_live=False)
             return _dump(value)
 
+        needs_clear = bool(value.pop("needsClear", False))
+        needs_end_key = bool(value.pop("needsEndKey", False))
         result: dict[str, Any] = {"target": value, "action": checked_action}
         if checked_action in {"click", "hover"}:
             from kahin.tools.pilot_mirage import (  # noqa: PLC0415
@@ -540,10 +546,48 @@ async def mirage_dom_action(
                 if _is_error_response(up):
                     return up
                 result["up"] = orjson.loads(up)
+            try:
+                event_type = "mousemove" if checked_action == "hover" else "mousedown"
+                result["down"] = await engine.call("Page.dispatchMouseEvent", {
+                    "type": event_type,
+                    "button": 0,
+                    "x": value["x"],
+                    "y": value["y"],
+                    "modifiers": 0,
+                    "clickCount": 1,
+                    "buttons": 1 if checked_action == "click" else 0,
+                }, session_id=session_id)
+                if checked_action == "click":
+                    result["up"] = await engine.call("Page.dispatchMouseEvent", {
+                        "type": "mouseup",
+                        "button": 0,
+                        "x": value["x"],
+                        "y": value["y"],
+                        "modifiers": 0,
+                        "clickCount": 1,
+                        "buttons": 0,
+                    }, session_id=session_id)
+            except Exception as exc:  # noqa: BLE001 - return tool-level error
+                return _dump({"error": "DOM action dispatch failed", "detail": str(exc)})
+        elif checked_action == "focus" and needs_end_key:
+            from kahin.tools.pilot_mirage import _dispatch_named_key  # noqa: PLC0415
+            end_err = await _dispatch_named_key("kahin_mirage_dom_action", "End", session_id)
+            if end_err:
+                return end_err
         elif checked_action == "type":
             assert text is not None  # required-text validation ran before dispatch
+            from kahin.tools.pilot_mirage import _dispatch_named_key  # noqa: PLC0415
+            if needs_clear:
+                clear_err = await _dispatch_named_key("kahin_mirage_dom_action", "Backspace", session_id)
+                if clear_err:
+                    return clear_err
+            elif needs_end_key:
+                end_err = await _dispatch_named_key("kahin_mirage_dom_action", "End", session_id)
+                if end_err:
+                    return end_err
             try:
-                result["typed"] = await engine.call("Page.insertText", {"text": text}, session_id=session_id)
+                result["typed"] = await engine.call("Page.insertText", {"text": text}, session_id=session_id) if text else {}
+                result["cleared"] = needs_clear
             except Exception as exc:  # noqa: BLE001 - return tool-level error
                 return _dump({"error": "DOM action typing failed", "detail": str(exc)})
         return _dump(result)

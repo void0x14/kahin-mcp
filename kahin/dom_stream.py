@@ -391,8 +391,14 @@ DOM_STREAM_INIT_SCRIPT = r"""
       }
       const allowed = ["click", "focus", "hover", "type", "scroll", "select"];
       if (!allowed.includes(action)) return {error: "unsupported_action", action, allowed};
-      if (action === "type" && roleOf(el) !== "textbox") {
-        return {error: "not_text_input", nodeId, role: roleOf(el)};
+      const tag = el.tagName.toLowerCase();
+      const inputType = String(el.type || "").toLowerCase();
+      const editable = el.isContentEditable || tag === "textarea" || (tag === "input" && !["button","checkbox","file","hidden","image","radio","range","reset","submit"].includes(inputType));
+      if (action === "type" && (roleOf(el) !== "textbox" || !editable)) {
+        return {error: "not_text_input", nodeId, role: roleOf(el) || inputType};
+      }
+      if (action === "type" && (el.disabled || el.readOnly || el.getAttribute("aria-disabled") === "true")) {
+        return {error: "element is disabled or read-only", code: "not_editable", nodeId};
       }
       el.scrollIntoView({block: "center", inline: "center", behavior: "instant"});
       if ((action === "select" || action === "type") && (el.disabled === true || (el.matches && el.matches(":disabled")) || el.getAttribute("aria-disabled") === "true" || (action === "type" && el.readOnly === true))) {
@@ -408,7 +414,42 @@ DOM_STREAM_INIT_SCRIPT = r"""
         el.dispatchEvent(new Event("input", {bubbles: true}));
         el.dispatchEvent(new Event("change", {bubbles: true}));
       }
-      if (action === "focus" || action === "type") el.focus();
+      let needsClear = false;
+      let needsEndKey = false;
+      if (action === "focus" || action === "type") {
+        el.focus();
+        if (editable && !el.disabled && !el.readOnly && el.getAttribute("aria-disabled") !== "true") {
+          const doc = el.ownerDocument || document;
+          const win = doc.defaultView || window;
+          const before = el.isContentEditable ? String(el.textContent || "") : String(el.value || "");
+          const hasContent = before.length > 0 || Boolean(!el.isContentEditable && el.validity && el.validity.badInput);
+          const clear = action === "type" && options.clear === true;
+          if (clear && hasContent) {
+            if (el.isContentEditable) {
+              const r = doc.createRange();
+              r.selectNodeContents(el);
+              const s = win.getSelection();
+              if (s) { s.removeAllRanges(); s.addRange(r); }
+              needsClear = true;
+            } else if (typeof el.select === "function") {
+              el.select();
+              needsClear = true;
+            }
+          } else if (!clear && hasContent) {
+            if (el.isContentEditable) {
+              const r = doc.createRange();
+              r.selectNodeContents(el);
+              r.collapse(false);
+              const s = win.getSelection();
+              if (s) { s.removeAllRanges(); s.addRange(r); }
+            } else if (typeof el.setSelectionRange === "function") {
+              try { el.setSelectionRange(before.length, before.length); } catch (_) { needsEndKey = true; }
+            } else {
+              needsEndKey = true;
+            }
+          }
+        }
+      }
       const rect = el.getBoundingClientRect();
       if (action === "click" || action === "hover") {
         const style = window.getComputedStyle(el);
@@ -427,8 +468,8 @@ DOM_STREAM_INIT_SCRIPT = r"""
           return {error: "element is obscured", code: "element_not_actionable", reason: "obscured", hit: String(hit.tagName || "").toLowerCase(), nodeId};
         }
       }
-      return {ready: true, nodeId, action, tag: el.tagName.toLowerCase(),
-        role: roleOf(el), x, y, scrolled: action === "scroll"};
+      return {ready: true, nodeId, action, tag,
+        role: roleOf(el), x, y, scrolled: action === "scroll", needsClear, needsEndKey};
     };
     state.stop = () => {
       state.active = false;

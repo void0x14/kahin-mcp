@@ -444,10 +444,16 @@ async def _promote_shadow_to_mirage() -> Mirage | str:
                 "hint": "The Shadow browser is still active; retry the capability or inspect its health.",
             }, option=orjson.OPT_INDENT_2).decode()
 
+        shadow_mode = getattr(current, "_state_mode", None)
+        promote_kwargs: dict[str, Any] = (
+            {"mode": shadow_mode, "persistent_profile": shadow_mode != "keş"}
+            if isinstance(shadow_mode, str) and shadow_mode
+            else {}
+        )
         candidate = Mirage()
         try:
             await asyncio.wait_for(
-                candidate.start(headless=True, port=0),
+                candidate.start(headless=True, port=0, **promote_kwargs),
                 timeout=_MIRAGE_PROMOTE_TIMEOUT,
             )
             # Import lazily: oracle imports the tool modules during bootstrap,

@@ -2206,9 +2206,6 @@ class Mirage(BrowserEngine):
                 self._frame_contexts.pop(session_id, None)
                 self._main_frame_ids.pop(session_id, None)
                 self._frame_nav_seq = {k: v for k, v in self._frame_nav_seq.items() if k[0] != session_id}
-                    self._nav_seq.pop(old_session_id, None)
-                self._frame_contexts.pop(session_id, None)
-                self._main_frame_ids.pop(session_id, None)
                 self._nav_seq.pop(session_id, None)
                 self._sessions[target_id] = session_id
                 self._target_infos[target_id] = dict(target_info)
@@ -2259,9 +2256,6 @@ class Mirage(BrowserEngine):
         if method == "Page.frameAttached":
             frame_id = params.get("frameId")
             if isinstance(frame_id, str) and frame_id and not params.get("parentFrameId"):
-        if method == "Page.frameAttached":
-            frame_id = params.get("frameId")
-            if isinstance(session_id, str) and isinstance(frame_id, str) and not params.get("parentFrameId"):
                 self._main_frame_ids[session_id] = frame_id
             return
         if method not in {"Page.navigationCommitted", "Page.sameDocumentNavigation"}:
@@ -2272,13 +2266,6 @@ class Mirage(BrowserEngine):
         frame_id = params.get("frameId")
         main_frame_id = self._main_frame_ids.get(session_id)
         if main_frame_id is not None and isinstance(frame_id, str) and frame_id != main_frame_id:
-        if not isinstance(session_id, str) or not isinstance(url, str):
-            return
-        if url == "about:srcdoc":
-            return
-        frame_id = params.get("frameId")
-        main_frame_id = self._main_frame_ids.get(session_id)
-        if frame_id and main_frame_id and frame_id != main_frame_id:
             return
         target_id = next(
             (tid for tid, sid in self._sessions.items() if sid == session_id),
@@ -2495,18 +2482,15 @@ class Mirage(BrowserEngine):
             if loop.time() > deadline:
                 raise RuntimeError(f"session for target {target_id} never attached")
             await asyncio.sleep(0.05)
+        from kahin.subagent import get_active_subagent_context  # noqa: PLC0415
+
+        cid = get_active_subagent_context().get("caller_id")
         async with self._target_lock:
             if target_id not in self._sessions:
                 raise RuntimeError(f"target {target_id} detached before it became current")
-            from kahin.subagent import get_active_subagent_context
-            cid = get_active_subagent_context().get("caller_id")
             if cid:
                 self._agent_targets[cid] = target_id
             self._current_target = target_id
-            from kahin.subagent import get_active_subagent_context
-            cid = get_active_subagent_context().get("caller_id")
-            if cid:
-                self._agent_targets[cid] = target_id
             session_id = self._sessions[target_id]
         await self._wait_for_page_frame(session_id, deadline=min(deadline, loop.time() + 3.0))
         # Reflect runtime user-agent override onto DOM prototype for newly created pages

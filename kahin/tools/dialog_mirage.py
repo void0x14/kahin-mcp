@@ -20,74 +20,148 @@ The list tools therefore read the forwarded event buffer
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import orjson
 
 from kahin import _state as state
 from kahin._mcp import mcp
+from kahin.the_twins.mirage import describe_dialog
 from kahin.tools._common import _RO, _RW, _healer_ref, _mirage_call, _mirage_engine, _require_mirage
 
 
+def _dialog_meta(dialog_id: str) -> dict[str, Any] | None:
+    """Look up live dialog metadata directly from Mirage's open-dialog table."""
+    engine = state._current_engine
+    open_dialogs = getattr(engine, "open_dialogs", None)
+    if callable(open_dialogs):
+        for item in open_dialogs():
+            if item.get("dialogId") == dialog_id:
+                return item
+    return None
+
+
 def _dialog_owner_session(dialog_id: str) -> str | None:
-    """Find the session that opened a dialog; never route by current tab."""
+    """Find the session that opened a dialog; prefer live Mirage state."""
+    meta = _dialog_meta(dialog_id)
+    if isinstance(meta, dict):
+        sid = meta.get("sessionId")
+        if isinstance(sid, str) and sid:
+            return sid
     for event in reversed(state._current_event_log):
-        if event.get("event") != "Page.dialogOpened":
-            continue
+        ev_name = event.get("event")
         params = event.get("params") or {}
         if params.get("dialogId") != dialog_id:
             continue
-        session_id = event.get("session_id")
-        return session_id if isinstance(session_id, str) and session_id else None
+        if ev_name in {"Page.dialogClosed", "Page.javascriptDialogClosed"}:
+            return None
+        if ev_name in {"Page.dialogOpened", "Page.javascriptDialogOpening"}:
+            session_id = event.get("session_id")
+            return session_id if isinstance(session_id, str) and session_id else None
     return None
 
 
 @mcp.tool(name="kahin_mirage_dialog_list", annotations=_RO)
 async def mirage_dialog_list() -> str:
-    """Mirage: dialogs currently open (Page.dialogOpened minus dialogClosed),
-    read from the forwarded event buffer."""
+    """Mirage: interactive dialogs currently open on the active tab."""
     async with _healer_ref.safe("kahin_mirage_dialog_list"):
         err = await _require_mirage()
         if err:
             return err
         engine = _mirage_engine()
-        current_session = engine._sessions.get(engine._current_target or "")
-        open_dialogs: dict[str, dict[str, Any]] = {}
-        for e in state._current_event_log:
-            if e.get("session_id") != current_session:
-                continue
-            if e["event"] == "Page.dialogOpened":
-                params = e.get("params") or {}
-                open_dialogs[params.get("dialogId", "?")] = {
-                    "dialogId": params.get("dialogId"),
-                    "type": params.get("type"),
-                    "message": params.get("message"),
-                    "defaultValue": params.get("defaultValue"),
-                }
-            elif e["event"] == "Page.dialogClosed":
-                open_dialogs.pop((e.get("params") or {}).get("dialogId", "?"), None)
-        return orjson.dumps(list(open_dialogs.values()), option=orjson.OPT_INDENT_2).decode()
+        current_session = engine.current_session_id()
+        dialogs = engine.open_dialogs(current_session) if current_session else []
+        return orjson.dumps(
+            [describe_dialog(item) for item in dialogs],
+            option=orjson.OPT_INDENT_2,
+        ).decode()
 
 
 @mcp.tool(name="kahin_mirage_dialog_accept", annotations=_RW)
-async def mirage_dialog_accept(dialog_id: str, prompt_text: str | None = None) -> str:
+async def mirage_dialog_accept(
+    dialog_id: str,
+    prompt_text: str | None = None,
+    humanize: bool = False,
+) -> str:
     """Mirage: accept a dialog (Page.handleDialog accept=true). prompt_text is
-    used for prompt() dialogs."""
+    used for prompt() dialogs; in headed mode it is visibly typed first, and
+    humanize=true adds human-like timing even in headless mode."""
     if not isinstance(dialog_id, str) or not dialog_id:
         return orjson.dumps({"error": "dialog_id must be a non-empty string", "code": "invalid_argument"}).decode()
     if prompt_text is not None and not isinstance(prompt_text, str):
         return orjson.dumps({"error": "prompt_text must be a string when provided", "code": "invalid_argument"}).decode()
+    if not isinstance(humanize, bool):
+        return orjson.dumps({"error": "humanize must be a boolean", "code": "invalid_argument"}).decode()
     async with _healer_ref.safe("kahin_mirage_dialog_accept", dialog_id=dialog_id[:80]):
         params: dict[str, Any] = {"dialogId": dialog_id, "accept": True}
         if prompt_text is not None:
             params["promptText"] = prompt_text
+        meta = _dialog_meta(dialog_id)
         owner_session = _dialog_owner_session(dialog_id)
         if owner_session is None:
             return orjson.dumps({
                 "error": "dialog_id is not present in the live dialog buffer; refusing to route it to the current tab",
                 "code": "stale_dialog",
             }).decode()
-        return await _mirage_call("Page.handleDialog", params, session_id=owner_session)
+        is_prompt = (meta or {}).get("type") == "prompt"
+        engine = state._current_engine
+        nav_seq_map = getattr(engine, "_nav_seq", None)
+        nav_seq_before = int(nav_seq_map.get(owner_session, 0)) if isinstance(nav_seq_map, dict) else 0
+        visible_typed = False
+        if prompt_text is not None and is_prompt:
+            type_fn = getattr(engine, "type_into_visible_dialog", None)
+            if callable(type_fn) and not getattr(engine, "_headless", True):
+                visible_typed = await type_fn(
+                    prompt_text,
+                    char_delay_ms=55 if humanize else 35,
+                    settle_ms=300 if humanize else 250,
+                    allow_empty_clear=bool((meta or {}).get("defaultValue")),
+                    humanize=humanize,
+                )
+            elif humanize:
+                await asyncio.sleep(min(1.5, 0.12 + 0.04 * len(prompt_text)))
+        raw = await _mirage_call("Page.handleDialog", params, session_id=owner_session)
+        try:
+            parsed = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            return raw
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return raw
+        settle_fn = getattr(engine, "settle_after_dialog", None)
+        if callable(settle_fn):
+            await settle_fn(
+                owner_session,
+                dialog_id,
+                dialog_type=(meta or {}).get("type"),
+                accepted=True,
+                nav_seq_before=nav_seq_before,
+            )
+        reply: dict[str, Any] = {
+            "handled": "accepted",
+            "dialogId": dialog_id,
+            "type": (meta or {}).get("type") or "dialog",
+        }
+        if prompt_text is not None:
+            reply["promptText"] = prompt_text
+            reply["visibleTyped"] = visible_typed
+        peek_fn = getattr(engine, "peek_unreported_auto_dialogs", None)
+        mark_fn = getattr(engine, "mark_auto_dialogs_delivered", None)
+        if callable(peek_fn):
+            unreported_auto, max_seq = peek_fn(owner_session)
+            if unreported_auto:
+                reply["dialogs"] = unreported_auto
+                if callable(mark_fn):
+                    mark_fn(owner_session, max_seq)
+        open_fn = getattr(engine, "open_dialogs", None)
+        if callable(open_fn):
+            next_open = open_fn(owner_session)
+            if next_open:
+                described_next = [describe_dialog(item) for item in next_open]
+                reply["nextDialog"] = described_next[0]
+                if len(described_next) > 1:
+                    reply["openDialogs"] = described_next
+        return orjson.dumps(reply, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_mirage_dialog_dismiss", annotations=_RW)
@@ -96,15 +170,56 @@ async def mirage_dialog_dismiss(dialog_id: str) -> str:
     if not isinstance(dialog_id, str) or not dialog_id:
         return orjson.dumps({"error": "dialog_id must be a non-empty string", "code": "invalid_argument"}).decode()
     async with _healer_ref.safe("kahin_mirage_dialog_dismiss", dialog_id=dialog_id[:80]):
+        meta = _dialog_meta(dialog_id)
         owner_session = _dialog_owner_session(dialog_id)
         if owner_session is None:
             return orjson.dumps({
                 "error": "dialog_id is not present in the live dialog buffer; refusing to route it to the current tab",
                 "code": "stale_dialog",
             }).decode()
-        return await _mirage_call(
+        engine = state._current_engine
+        nav_seq_map = getattr(engine, "_nav_seq", None)
+        nav_seq_before = int(nav_seq_map.get(owner_session, 0)) if isinstance(nav_seq_map, dict) else 0
+        raw = await _mirage_call(
             "Page.handleDialog", {"dialogId": dialog_id, "accept": False}, session_id=owner_session,
         )
+        try:
+            parsed = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            return raw
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return raw
+        settle_fn = getattr(engine, "settle_after_dialog", None)
+        if callable(settle_fn):
+            await settle_fn(
+                owner_session,
+                dialog_id,
+                dialog_type=(meta or {}).get("type"),
+                accepted=False,
+                nav_seq_before=nav_seq_before,
+            )
+        reply: dict[str, Any] = {
+            "handled": "dismissed",
+            "dialogId": dialog_id,
+            "type": (meta or {}).get("type") or "dialog",
+        }
+        peek_fn = getattr(engine, "peek_unreported_auto_dialogs", None)
+        mark_fn = getattr(engine, "mark_auto_dialogs_delivered", None)
+        if callable(peek_fn):
+            unreported_auto, max_seq = peek_fn(owner_session)
+            if unreported_auto:
+                reply["dialogs"] = unreported_auto
+                if callable(mark_fn):
+                    mark_fn(owner_session, max_seq)
+        open_fn = getattr(engine, "open_dialogs", None)
+        if callable(open_fn):
+            next_open = open_fn(owner_session)
+            if next_open:
+                described_next = [describe_dialog(item) for item in next_open]
+                reply["nextDialog"] = described_next[0]
+                if len(described_next) > 1:
+                    reply["openDialogs"] = described_next
+        return orjson.dumps(reply, option=orjson.OPT_INDENT_2).decode()
 
 
 @mcp.tool(name="kahin_mirage_download_list", annotations=_RO)

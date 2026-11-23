@@ -92,6 +92,95 @@ _DIAGNOSTIC_TOOLS = frozenset({
 _PAGE_LOCK_CAUSES = frozenset({"pending_js_dialog", "webauthn_pending", "page_busy"})
 _STALL_CODES = frozenset({"command_stalled", "engine_health_timeout"})
 _ERROR_TEXT_LIMIT = 300
+_DIALOG_ALLOWED_TOOLS = frozenset({
+    "kahin_mirage_dialog_accept",
+    "kahin_mirage_dialog_dismiss",
+    "kahin_mirage_dialog_list",
+    "kahin_agent_status",
+    "kahin_engine_health",
+    "kahin_engine_stats",
+    "kahin_healer_stats",
+    "kahin_mirage_tab_list",
+    "kahin_mirage_tab_switch",
+    "kahin_mirage_tab_new",
+    "kahin_mirage_tab_close",
+    "kahin_browser_stop",
+    "kahin_operator_reset",
+    "kahin_list_sessions",
+    "kahin_get_session",
+    "kahin_kill_session",
+    "kahin_list_domains",
+    "kahin_get_domain",
+    "kahin_get_command",
+    "kahin_get_event",
+    "kahin_find_concept",
+    "kahin_list_types",
+    "kahin_get_type",
+    "kahin_validate_command",
+    "kahin_error_decode",
+    "kahin_get_dependencies",
+    "kahin_pattern_learn",
+    "kahin_pattern_query",
+    "kahin_pattern_suggest",
+    "kahin_pattern_forget",
+    "kahin_pattern_stats",
+    "kahin_waf_cookie_mint",
+    "kahin_waf_cookie_status",
+    "kahin_waf_cookie_header",
+    "kahin_cf_clear",
+    "kahin_cf_status",
+    "kahin_visualize_data",
+    "kahin_extension_prepare",
+    "kahin_identity_new",
+    "kahin_identity_save",
+    "kahin_identity_list",
+    "kahin_identity_delete",
+    "kahin_identity_pin",
+    "kahin_identity_unpin",
+    "kahin_identity_pins",
+    "kahin_identity_for_domain",
+    "kahin_proxy_resolve",
+})
+
+
+def _active_mirage() -> Any | None:
+    from kahin import _state as state  # noqa: PLC0415
+    from kahin.the_twins.mirage import Mirage  # noqa: PLC0415
+
+    engine = state._current_engine
+    return engine if isinstance(engine, Mirage) else None
+
+
+def _is_dialog_stall_raw(raw: Any) -> bool:
+    if not isinstance(raw, str):
+        return False
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("cause") == "pending_js_dialog"
+        or payload.get("code") == "pending_js_dialog"
+    )
+
+
+def _inject_auto_dialogs(raw: Any, auto_dialogs: list[dict[str, Any]]) -> tuple[Any, bool]:
+    if not auto_dialogs or not isinstance(raw, str):
+        return raw, False
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw, False
+    if not isinstance(payload, dict):
+        return raw, False
+    existing = payload.get("dialogs")
+    if isinstance(existing, list):
+        payload["dialogs"] = [*existing, *auto_dialogs]
+    else:
+        payload["dialogs"] = auto_dialogs
+    return json.dumps(payload, indent=2, ensure_ascii=False, default=str), True
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -412,13 +501,7 @@ def install(mcp: Any) -> None:
         tool = manager.get_tool(name)
         if tool is None:
             return await original(name, arguments, context=context, convert_result=convert_result)
-        annotations = getattr(tool, "annotations", None)
-        read_only = bool(getattr(annotations, "readOnlyHint", False))
-        refusal = _harness.precheck(name, arguments, read_only)
-        if refusal is not None:
-            raw: Any = json.dumps({**refusal, "tool": name}, indent=2, default=str)
-            return tool.fn_metadata.convert_result(raw) if convert_result else raw
-        started = time.monotonic()
+
         from kahin.subagent import (  # noqa: PLC0415
             extract_caller_identity,
             set_active_subagent_context,
@@ -428,16 +511,108 @@ def install(mcp: Any) -> None:
         caller_id, target_id = extract_caller_identity(arguments, context)
         token = set_active_subagent_context(caller_id=caller_id, target_id=target_id)
         try:
-            raw = await original(name, arguments, context=context, convert_result=False)
-        except BaseException as exc:
-            if isinstance(exc, Exception):
-                await _harness.record(name, arguments, None, exc)
-            raise
+            engine = _active_mirage()
+            open_before: list[dict[str, Any]] = []
+            if engine is not None:
+                sid = engine.current_session_id()
+                open_before = engine.open_dialogs(sid) if sid else []
+                if open_before and name not in _DIALOG_ALLOWED_TOOLS:
+                    from kahin.the_twins.mirage import describe_dialog  # noqa: PLC0415
+
+                    described = [describe_dialog(item) for item in open_before]
+                    raw = json.dumps(
+                        {
+                            "error": (
+                                "Bu sekmede karar veya girdi bekleyen etkileşimli bir JS dialog açık; "
+                                f"{name} çalıştırılamaz."
+                            ),
+                            "code": "dialog_response_required",
+                            "tool": name,
+                            "dialog": described[0],
+                            "openDialogs": described,
+                            "hint": (
+                                "Takla atmadan dialog.howToResolve içindeki "
+                                "kahin_mirage_dialog_accept veya kahin_mirage_dialog_dismiss çağrısını kullan."
+                            ),
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    return tool.fn_metadata.convert_result(raw) if convert_result else raw
+            before_open_ids = {item.get("dialogId") for item in open_before}
+
+            annotations = getattr(tool, "annotations", None)
+            read_only = bool(getattr(annotations, "readOnlyHint", False))
+            refusal = _harness.precheck(name, arguments, read_only)
+            if refusal is not None:
+                raw = json.dumps({**refusal, "tool": name}, indent=2, default=str)
+                return tool.fn_metadata.convert_result(raw) if convert_result else raw
+            started = time.monotonic()
+            try:
+                raw = await original(name, arguments, context=context, convert_result=False)
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    await _harness.record(name, arguments, None, exc)
+                raise
+            raw = _attach_stall(raw, started)
+
+            post_engine = _active_mirage()
+            if post_engine is not None:
+                await post_engine.flush_auto_dialogs()
+                sid_after = post_engine.current_session_id()
+                auto_dialogs, max_auto_seq = post_engine.peek_unreported_auto_dialogs(sid_after)
+                open_after = post_engine.open_dialogs(sid_after) if sid_after else []
+                new_interactive = [
+                    item for item in open_after if item.get("dialogId") not in before_open_ids
+                ]
+                if new_interactive and _is_dialog_stall_raw(raw):
+                    from kahin.the_twins.mirage import describe_dialog  # noqa: PLC0415
+
+                    described_open = [describe_dialog(item) for item in new_interactive]
+                    raw = json.dumps(
+                        {
+                            "status": "dialog_opened",
+                            "tool": name,
+                            "dialog": described_open[0],
+                            "dialogs": [*auto_dialogs, *described_open],
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    if auto_dialogs:
+                        post_engine.mark_auto_dialogs_delivered(sid_after, max_auto_seq)
+                elif new_interactive:
+                    if isinstance(raw, str):
+                        try:
+                            payload = json.loads(raw)
+                        except (TypeError, ValueError):
+                            payload = None
+                        if isinstance(payload, dict):
+                            from kahin.the_twins.mirage import describe_dialog  # noqa: PLC0415
+
+                            described_open = [describe_dialog(item) for item in new_interactive]
+                            if (
+                                "nextDialog" not in payload
+                                and "dialog" not in payload
+                                and "dialogOpened" not in payload
+                            ):
+                                payload["dialogOpened"] = described_open[0]
+                            raw = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+                    if auto_dialogs:
+                        raw, injected = _inject_auto_dialogs(raw, auto_dialogs)
+                        if injected:
+                            post_engine.mark_auto_dialogs_delivered(sid_after, max_auto_seq)
+                elif auto_dialogs:
+                    raw, injected = _inject_auto_dialogs(raw, auto_dialogs)
+                    if injected:
+                        post_engine.mark_auto_dialogs_delivered(sid_after, max_auto_seq)
+
+            await _harness.record(name, arguments, raw, None)
+            return tool.fn_metadata.convert_result(raw) if convert_result else raw
         finally:
             reset_active_subagent_context(token)
-        raw = _attach_stall(raw, started)
-        await _harness.record(name, arguments, raw, None)
-        return tool.fn_metadata.convert_result(raw) if convert_result else raw
 
     manager.call_tool = call_tool
     manager._kahin_harness_installed = True

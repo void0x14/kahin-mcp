@@ -33,6 +33,7 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import orjson
 
@@ -60,12 +61,60 @@ _PAGE_NAVIGATE_RESPONSE_TIMEOUT = 5.0
 # answering. A command on a dialog-blocked session gets this short grace to
 # answer on its own, then fails fast as ``pending_js_dialog`` instead of
 # holding the agent for the full request timeout.
-_DIALOG_BLOCK_GRACE = 1.5
+_DIALOG_BLOCK_GRACE = 0.4
 # Bounded probes used only to classify a stalled command (never to retry it).
 _STALL_PROBE_TIMEOUT = 2.0
 _STALL_CAUSES = ("pending_js_dialog", "webauthn_pending", "page_busy", "dead_pipe")
 _DIALOG_OPEN_EVENTS = frozenset({"Page.dialogOpened", "Page.javascriptDialogOpening"})
 _DIALOG_CLOSE_EVENTS = frozenset({"Page.dialogClosed", "Page.javascriptDialogClosed"})
+_DIALOG_BUTTONS = {
+    "alert": ["OK"],
+    "confirm": ["OK", "Cancel"],
+    "prompt": ["OK", "Cancel"],
+    "beforeunload": ["Leave", "Stay"],
+}
+_CROSS_TAB_MODAL_SENSITIVE = frozenset({
+    "Page.dispatchMouseEvent",
+    "Page.dispatchKeyEvent",
+    "Page.dispatchWheelEvent",
+    "Page.bringToFront",
+    "Page.captureScreenshot",
+})
+
+
+def describe_dialog(info: dict[str, Any], *, action_taken: str | None = None) -> dict[str, Any]:
+    """Build a uniform, agent-clear descriptor for any JS dialog."""
+    dtype = str(info.get("type") or "alert")
+    is_static = dtype == "alert"
+    dialog_id = info.get("dialogId")
+    entry: dict[str, Any] = {
+        "dialogId": dialog_id,
+        "kind": "static" if is_static else "interactive",
+        "type": dtype,
+        "title": info.get("title"),
+        "message": info.get("message"),
+        "buttons": list(_DIALOG_BUTTONS.get(dtype, ["OK", "Cancel"])),
+        "input": (
+            {"type": "text", "defaultValue": str(info.get("defaultValue") or "")}
+            if dtype == "prompt"
+            else None
+        ),
+        "actionTaken": action_taken or ("auto_accepted" if is_static else "awaiting_agent"),
+        "sessionId": info.get("sessionId"),
+        "targetId": info.get("targetId"),
+    }
+    if not is_static and isinstance(dialog_id, str) and dialog_id:
+        if dtype == "prompt":
+            entry["howToResolve"] = {
+                "accept": f"kahin_mirage_dialog_accept(dialog_id={dialog_id!r}, prompt_text='<cevap>')",
+                "dismiss": f"kahin_mirage_dialog_dismiss(dialog_id={dialog_id!r})",
+            }
+        else:
+            entry["howToResolve"] = {
+                "accept": f"kahin_mirage_dialog_accept(dialog_id={dialog_id!r})",
+                "dismiss": f"kahin_mirage_dialog_dismiss(dialog_id={dialog_id!r})",
+            }
+    return entry
 _IPC_WRITE_TIMEOUT = 5.0
 _RESPONSE_BODY_RETRY_TIMEOUT = 5.0
 _RESPONSE_BODY_RETRY_INTERVAL = 0.1
@@ -809,6 +858,14 @@ class Mirage(BrowserEngine):
         # dialog opening mid-flight releases the waiter immediately.
         self._open_dialogs: dict[str, dict[str, dict[str, Any]]] = {}
         self._dialog_changed = asyncio.Event()
+        self._auto_handled_dialogs: deque[dict[str, Any]] = deque(maxlen=256)
+        self._auto_dialog_seq = 0
+        self._auto_dialog_delivered: dict[str, int] = {}
+        self._auto_dialog_tasks: set[asyncio.Task[Any]] = set()
+        self._closed_dialog_ids: deque[str] = deque(maxlen=512)
+        self._main_frame_ids: dict[str, str] = {}
+        self._nav_seq: dict[str, int] = {}
+        self._nav_changed = asyncio.Event()
         # (monotonic time, diagnosis) of the latest classified stall; the MCP
         # harness re-attaches it to tool answers that flattened the error.
         self._last_stall: tuple[float, dict[str, Any]] | None = None
@@ -833,7 +890,18 @@ class Mirage(BrowserEngine):
         self._open_dialogs.clear()
         self._main_frame_ids.clear()
         self._frame_nav_seq.clear()
+        for task in list(self._auto_dialog_tasks):
+            task.cancel()
+        self._auto_dialog_tasks.clear()
+        self._auto_handled_dialogs.clear()
+        self._auto_dialog_seq = 0
+        self._auto_dialog_delivered.clear()
+        self._closed_dialog_ids.clear()
+        self._main_frame_ids.clear()
+        self._nav_seq.clear()
         self._notify_dialog_change()
+        nav_changed, self._nav_changed = self._nav_changed, asyncio.Event()
+        nav_changed.set()
         self._last_stall = None
         if wake_waiters:
             self._chooser_event.set()
@@ -843,6 +911,7 @@ class Mirage(BrowserEngine):
             self._chooser_event.clear()
             self._screencast_event.clear()
             self._network_signal.clear()
+            self._nav_changed.clear()
 
     async def start(
         self,
@@ -1335,6 +1404,36 @@ class Mirage(BrowserEngine):
         changed, self._dialog_changed = self._dialog_changed, asyncio.Event()
         changed.set()
 
+    def _dialog_title(self, sid: str) -> str | None:
+        target_id = next((tid for tid, s in self._sessions.items() if s == sid), None)
+        if not target_id:
+            return None
+        url = (self._target_infos.get(target_id) or {}).get("url")
+        if not isinstance(url, str) or not url:
+            return None
+        parsed = urlsplit(url)
+        if parsed.netloc:
+            return parsed.netloc
+        return url[:120]
+
+    async def _auto_accept_alert(self, sid: str, dialog_id: str, meta: dict[str, Any] | None = None) -> None:
+        """Accept static alert() dialogs immediately so automation proceeds without stalls."""
+        try:
+            await asyncio.wait_for(
+                self._raw_call("Page.handleDialog", {"dialogId": dialog_id, "accept": True}, session_id=sid),
+                timeout=3.0,
+            )
+        except Exception:  # noqa: BLE001 - never crash background dialog helper
+            logger.debug("auto-accept alert failed for %s", dialog_id, exc_info=True)
+            if dialog_id not in self._closed_dialog_ids and isinstance(meta, dict):
+                try:
+                    self._auto_handled_dialogs.remove(meta)
+                except ValueError:
+                    pass
+                fallback = {k: v for k, v in meta.items() if k != "seq"}
+                self._open_dialogs.setdefault(sid, {})[dialog_id] = fallback
+                self._notify_dialog_change()
+
     def _track_dialog(self, data: dict[str, Any]) -> None:
         """Keep sessionId -> open JS dialogs current from Juggler events."""
         method = data.get("method")
@@ -1344,16 +1443,48 @@ class Mirage(BrowserEngine):
             dialog_id = params.get("dialogId")
             if not isinstance(sid, str) or not sid or not isinstance(dialog_id, str):
                 return
-            message = params.get("message")
+            dtype = str(params.get("type") or "alert")
+            raw_message = params.get("message")
+            message = raw_message[:2000] if isinstance(raw_message, str) else None
+            default_value = params.get("defaultValue")
+            target_id = next((tid for tid, s in self._sessions.items() if s == sid), None)
+            title = self._dialog_title(sid)
+            if dtype == "alert":
+                self._auto_dialog_seq += 1
+                meta = {
+                    "seq": self._auto_dialog_seq,
+                    "dialogId": dialog_id,
+                    "type": "alert",
+                    "title": title,
+                    "message": message,
+                    "defaultValue": None,
+                    "openedAt": time.time(),
+                    "sessionId": sid,
+                    "targetId": target_id,
+                }
+                self._auto_handled_dialogs.append(meta)
+                try:
+                    task = asyncio.create_task(self._auto_accept_alert(sid, dialog_id, meta))
+                    self._auto_dialog_tasks.add(task)
+                    task.add_done_callback(self._auto_dialog_tasks.discard)
+                except RuntimeError:
+                    pass
+                return
             self._open_dialogs.setdefault(sid, {})[dialog_id] = {
                 "dialogId": dialog_id,
-                "type": params.get("type"),
-                "message": message[:200] if isinstance(message, str) else None,
+                "type": dtype,
+                "title": title,
+                "message": message,
+                "defaultValue": default_value if isinstance(default_value, str) else "",
                 "openedAt": time.time(),
+                "sessionId": sid,
+                "targetId": target_id,
             }
             self._notify_dialog_change()
         elif method in _DIALOG_CLOSE_EVENTS:
             dialog_id = params.get("dialogId")
+            if isinstance(dialog_id, str):
+                self._closed_dialog_ids.append(dialog_id)
             dialogs = self._open_dialogs.get(sid or "")
             if dialogs is not None and isinstance(dialog_id, str):
                 dialogs.pop(dialog_id, None)
@@ -1365,6 +1496,156 @@ class Mirage(BrowserEngine):
             if isinstance(session_id, str) and self._open_dialogs.pop(session_id, None):
                 self._notify_dialog_change()
 
+    def auto_dialog_seq(self) -> int:
+        return self._auto_dialog_seq
+
+    def auto_dialogs_since(self, seq: int, session_id: str | None = None) -> list[dict[str, Any]]:
+        return [
+            describe_dialog(item, action_taken="auto_accepted")
+            for item in self._auto_handled_dialogs
+            if int(item.get("seq") or 0) > seq
+            and (session_id is None or item.get("sessionId") == session_id)
+        ]
+
+    def peek_unreported_auto_dialogs(self, session_id: str | None = None) -> tuple[list[dict[str, Any]], int]:
+        key = session_id or "*"
+        cursor = self._auto_dialog_delivered.get(key, 0)
+        items = [
+            item
+            for item in self._auto_handled_dialogs
+            if int(item.get("seq") or 0) > cursor
+            and (session_id is None or item.get("sessionId") == session_id)
+        ]
+        if not items:
+            return [], cursor
+        max_seq = max(int(item.get("seq") or 0) for item in items)
+        return [describe_dialog(item, action_taken="auto_accepted") for item in items], max_seq
+
+    def mark_auto_dialogs_delivered(self, session_id: str | None, max_seq: int) -> None:
+        key = session_id or "*"
+        if max_seq > self._auto_dialog_delivered.get(key, 0):
+            self._auto_dialog_delivered[key] = max_seq
+
+    async def flush_auto_dialogs(self, timeout: float = 1.5) -> None:
+        tasks = [t for t in self._auto_dialog_tasks if not t.done()]
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    async def settle_after_dialog(
+        self,
+        session_id: str,
+        dialog_id: str,
+        *,
+        dialog_type: str | None = None,
+        accepted: bool = True,
+        nav_seq_before: int = 0,
+    ) -> None:
+        """Wait briefly for Juggler close/chain events and beforeunload navigation commit."""
+        loop = asyncio.get_running_loop()
+        close_deadline = loop.time() + 0.4
+        while dialog_id in (self._open_dialogs.get(session_id) or {}):
+            remaining = close_deadline - loop.time()
+            if remaining <= 0:
+                break
+            changed = self._dialog_changed
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=remaining)
+            except TimeoutError:
+                break
+        dialogs = self._open_dialogs.get(session_id)
+        if dialogs is not None and dialog_id in dialogs:
+            dialogs.pop(dialog_id, None)
+            if not dialogs:
+                self._open_dialogs.pop(session_id, None)
+            self._notify_dialog_change()
+
+        await asyncio.sleep(0.08)
+        for _ in range(5):
+            if not any(not t.done() for t in self._auto_dialog_tasks):
+                break
+            await self.flush_auto_dialogs(timeout=1.0)
+            await asyncio.sleep(0.04)
+
+        if dialog_type == "beforeunload" and accepted:
+            nav_deadline = loop.time() + 1.5
+            while (
+                self._nav_seq.get(session_id, 0) <= nav_seq_before
+                and not self._open_dialogs.get(session_id)
+                and self.is_alive()
+            ):
+                remaining = nav_deadline - loop.time()
+                if remaining <= 0:
+                    break
+                nav_waiter = asyncio.ensure_future(self._nav_changed.wait())
+                dlg_waiter = asyncio.ensure_future(self._dialog_changed.wait())
+                try:
+                    await asyncio.wait(
+                        {nav_waiter, dlg_waiter},
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    nav_waiter.cancel()
+                    dlg_waiter.cancel()
+
+    async def type_into_visible_dialog(
+        self,
+        text: str,
+        *,
+        char_delay_ms: int = 35,
+        settle_ms: int = 250,
+        allow_empty_clear: bool = False,
+        humanize: bool = False,
+    ) -> bool:
+        """Visibly type ``text`` into an open headed JS prompt via X11 xdotool."""
+        if self._headless or self._process is None or not os.environ.get("DISPLAY"):
+            return False
+        if not text and not allow_empty_clear:
+            return False
+        base_delay = max(1, min(int(char_delay_ms), 250))
+        delay = base_delay if humanize else max(8, min(base_delay, int(1200 / max(1, len(text)))))
+
+        def _type_sync() -> bool:
+            windows: list[str] = []
+            for pid in [root_pid, *_browser_descendant_pids(root_pid)]:
+                windows.extend(_x11_windows_for_pid(pid))
+            windows = list(dict.fromkeys(windows))
+            if not windows:
+                return False
+            win = windows[0]
+            try:
+                subprocess.run(
+                    ["xdotool", "windowactivate", "--sync", win],
+                    capture_output=True, text=True, timeout=2.0, check=False,
+                )
+                subprocess.run(
+                    ["xdotool", "key", "--window", win, "--clearmodifiers", "ctrl+a", "BackSpace"],
+                    capture_output=True, text=True, timeout=2.0, check=False,
+                )
+                if not text:
+                    return True
+                type_timeout = max(5.0, len(text) * (delay / 1000.0 + 0.05) + 3.0)
+                res = subprocess.run(
+                    [
+                        "xdotool", "type", "--window", win,
+                        "--delay", str(delay), "--clearmodifiers", "--", text,
+                    ],
+                    capture_output=True, text=True, timeout=type_timeout, check=False,
+                )
+                return res.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                return False
+
+        root_pid = self._process.pid
+        typed = await asyncio.to_thread(_type_sync)
+        if typed and settle_ms > 0:
+            await asyncio.sleep(min(settle_ms, 1000) / 1000.0)
+        return typed
+
     def open_dialogs(self, session_id: str | None = None) -> list[dict[str, Any]]:
         """Open JS dialogs on one session (or every session), oldest first."""
         sessions = [session_id] if session_id is not None else list(self._open_dialogs)
@@ -1372,7 +1653,7 @@ class Mirage(BrowserEngine):
         found: list[dict[str, Any]] = []
         for sid in sessions:
             for info in (self._open_dialogs.get(sid) or {}).values():
-                found.append({**info, "sessionId": sid, "targetId": target_by_session.get(sid)})
+                found.append({**info, "sessionId": sid, "targetId": info.get("targetId") or target_by_session.get(sid)})
         found.sort(key=lambda item: item.get("openedAt") or 0.0)
         return found
 
@@ -1388,7 +1669,7 @@ class Mirage(BrowserEngine):
         Returns the reply, raises ``TimeoutError`` after ``timeout`` or
         ``_DialogBlocked`` once a dialog on ``sid`` has kept the command
         unanswered past ``_DIALOG_BLOCK_GRACE`` (P2-2: non-blocking dialog
-        handling). Browser.* calls carry no session and are never gated.
+        handling). Browser.* and Page.handleDialog calls are never gated.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -1396,7 +1677,7 @@ class Mirage(BrowserEngine):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise TimeoutError
-            if sid and self._open_dialogs.get(sid):
+            if method != "Page.handleDialog" and sid and self._open_dialogs.get(sid):
                 try:
                     return await asyncio.wait_for(
                         asyncio.shield(fut), timeout=min(_DIALOG_BLOCK_GRACE, remaining),
@@ -1405,6 +1686,15 @@ class Mirage(BrowserEngine):
                     if self._open_dialogs.get(sid):
                         raise _DialogBlocked from None
                     continue  # the dialog closed during the grace window
+            if method in _CROSS_TAB_MODAL_SENSITIVE and self._open_dialogs:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(fut), timeout=min(1.5, remaining),
+                    )
+                except TimeoutError:
+                    if self._open_dialogs:
+                        raise _DialogBlocked from None
+                    continue
             changed = self._dialog_changed
             waiter = asyncio.ensure_future(changed.wait())
             try:
@@ -1475,6 +1765,18 @@ class Mirage(BrowserEngine):
                 ),
             })
             return diagnosis
+        if session_id and method in _CROSS_TAB_MODAL_SENSITIVE:
+            other_dialogs = self.open_dialogs()
+            if other_dialogs:
+                diagnosis.update({
+                    "cause": "pending_js_dialog",
+                    "evidence": {"otherTabDialogs": [describe_dialog(d) for d in other_dialogs]},
+                    "hint": (
+                        "Başka bir sekmede açık JS dialog tarayıcı girdi/odak komutlarını kilitliyor; "
+                        "önce o dialogu kahin_mirage_dialog_accept/dismiss ile kapat."
+                    ),
+                })
+                return diagnosis
 
         try:
             from kahin import window_inventory  # noqa: PLC0415 - optional Marionette layer
@@ -1903,6 +2205,10 @@ class Mirage(BrowserEngine):
                 self._frame_contexts.pop(session_id, None)
                 self._main_frame_ids.pop(session_id, None)
                 self._frame_nav_seq = {k: v for k, v in self._frame_nav_seq.items() if k[0] != session_id}
+                    self._nav_seq.pop(old_session_id, None)
+                self._frame_contexts.pop(session_id, None)
+                self._main_frame_ids.pop(session_id, None)
+                self._nav_seq.pop(session_id, None)
                 self._sessions[target_id] = session_id
                 self._target_infos[target_id] = dict(target_info)
         elif method == "Browser.detachedFromTarget":
@@ -1922,6 +2228,8 @@ class Mirage(BrowserEngine):
             self._frame_contexts.pop(session_id, None)
             self._main_frame_ids.pop(session_id, None)
             self._frame_nav_seq = {k: v for k, v in self._frame_nav_seq.items() if k[0] != session_id}
+            self._nav_seq.pop(session_id, None)
+            self._auto_dialog_delivered.pop(session_id, None)
             if not target_id:
                 target_id = next(
                     (tid for tid, sid in self._sessions.items() if sid == session_id),
@@ -1950,6 +2258,9 @@ class Mirage(BrowserEngine):
         if method == "Page.frameAttached":
             frame_id = params.get("frameId")
             if isinstance(frame_id, str) and frame_id and not params.get("parentFrameId"):
+        if method == "Page.frameAttached":
+            frame_id = params.get("frameId")
+            if isinstance(session_id, str) and isinstance(frame_id, str) and not params.get("parentFrameId"):
                 self._main_frame_ids[session_id] = frame_id
             return
         if method not in {"Page.navigationCommitted", "Page.sameDocumentNavigation"}:
@@ -1960,6 +2271,13 @@ class Mirage(BrowserEngine):
         frame_id = params.get("frameId")
         main_frame_id = self._main_frame_ids.get(session_id)
         if main_frame_id is not None and isinstance(frame_id, str) and frame_id != main_frame_id:
+        if not isinstance(session_id, str) or not isinstance(url, str):
+            return
+        if url == "about:srcdoc":
+            return
+        frame_id = params.get("frameId")
+        main_frame_id = self._main_frame_ids.get(session_id)
+        if frame_id and main_frame_id and frame_id != main_frame_id:
             return
         target_id = next(
             (tid for tid, sid in self._sessions.items() if sid == session_id),
@@ -1967,6 +2285,9 @@ class Mirage(BrowserEngine):
         )
         if target_id is not None:
             self._target_infos.setdefault(target_id, {}).update({"url": url})
+        self._nav_seq[session_id] = self._nav_seq.get(session_id, 0) + 1
+        changed, self._nav_changed = self._nav_changed, asyncio.Event()
+        changed.set()
 
     async def call(
         self, method: str, params: dict[str, Any] | None = None, session_id: str | None = None
@@ -2176,6 +2497,10 @@ class Mirage(BrowserEngine):
         async with self._target_lock:
             if target_id not in self._sessions:
                 raise RuntimeError(f"target {target_id} detached before it became current")
+            from kahin.subagent import get_active_subagent_context
+            cid = get_active_subagent_context().get("caller_id")
+            if cid:
+                self._agent_targets[cid] = target_id
             self._current_target = target_id
             from kahin.subagent import get_active_subagent_context
             cid = get_active_subagent_context().get("caller_id")
@@ -2428,11 +2753,30 @@ class Mirage(BrowserEngine):
                 raise RuntimeError(f"target {target_id} did not detach after Page.close")
             for k, v in list(self._agent_targets.items()):
                 if v == target_id:
-                    self._agent_targets.pop(k, None)
-                    ctx = self._agent_contexts.pop(k, None)
+                    ctx = self._agent_contexts.get(k)
+                    replacement = None
                     if ctx:
+                        replacement = next(
+                            (
+                                tid
+                                for tid in self._sessions
+                                if (self._target_infos.get(tid) or {}).get("browserContextId") == ctx
+                            ),
+                            None,
+                        )
+                    if replacement is None:
+                        replacement = next(iter(self._sessions), None)
+                    if replacement is not None:
+                        self._agent_targets[k] = replacement
+                    else:
+                        self._agent_targets.pop(k, None)
+                    if ctx and not any(
+                        (self._target_infos.get(tid) or {}).get("browserContextId") == ctx
+                        for tid in self._sessions
+                    ):
+                        self._agent_contexts.pop(k, None)
                         contexts_to_remove.append(ctx)
-            if self._current_target == target_id:
+            if self._current_target == target_id or self._current_target not in self._sessions:
                 self._current_target = next(iter(self._sessions), None)
         for ctx in contexts_to_remove:
             try:
@@ -3051,6 +3395,24 @@ class Mirage(BrowserEngine):
     async def stop(self) -> None:
         self._stopping = True
         self._dom_signal.set()
+        for task in list(self._auto_dialog_tasks):
+            task.cancel()
+        self._auto_dialog_tasks.clear()
+        if self._open_dialogs and self._process is not None and not self._dead:
+            dismiss_calls = [
+                self._raw_call("Page.handleDialog", {"dialogId": did, "accept": False}, session_id=sid)
+                for sid, dialogs in list(self._open_dialogs.items())
+                for did in list(dialogs.keys())
+            ]
+            self._open_dialogs.clear()
+            if dismiss_calls:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*dismiss_calls, return_exceptions=True),
+                        timeout=0.6,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         self._reset_capture_state(wake_waiters=True)
         self._frame_nav_seq.clear()
         self._identity_config = None

@@ -972,7 +972,7 @@ async def agent_status() -> str:
     """
     async with _healer_ref.safe("kahin_agent_status"):
         from kahin import _state as state  # noqa: PLC0415
-        from kahin.the_twins.mirage import Mirage  # noqa: PLC0415
+        from kahin.the_twins.mirage import Mirage, describe_dialog  # noqa: PLC0415
         from kahin.the_twins.shadow import Obscura  # noqa: PLC0415
 
         engine = state._current_engine
@@ -980,6 +980,7 @@ async def agent_status() -> str:
             return orjson.dumps({
                 "engine": None,
                 "alive": False,
+                "pageState": None,
                 "url": None,
                 "title": None,
                 "readyState": None,
@@ -989,6 +990,7 @@ async def agent_status() -> str:
                 "domCursor": None,
                 "domNextSeq": None,
                 "pendingDialogs": 0,
+                "activeDialogs": [],
                 "networkEvents": 0,
                 "consoleMessages": 0,
                 "identity": None,
@@ -1005,6 +1007,7 @@ async def agent_status() -> str:
                 "shadow" if isinstance(engine, Obscura) else type(engine).__name__.lower()
             ),
             "alive": False,
+            "pageState": None,
             "url": None,
             "title": None,
             "readyState": None,
@@ -1014,6 +1017,7 @@ async def agent_status() -> str:
             "domCursor": None,
             "domNextSeq": None,
             "pendingDialogs": 0,
+            "activeDialogs": [],
             "networkEvents": len(state._network_requests),
             "consoleMessages": len(state._console_messages),
             "identity": None,
@@ -1057,7 +1061,7 @@ async def agent_status() -> str:
             except Exception:  # noqa: BLE001
                 pages = []
 
-            current_target = engine._current_target
+            current_target = engine.get_current_target()
             if current_target not in engine._sessions:
                 current_target = next(
                     (
@@ -1069,6 +1073,10 @@ async def agent_status() -> str:
                     None,
                 )
             payload["currentTab"] = current_target
+            cached_info = engine._target_infos.get(current_target or "") or {}
+            cached_url = cached_info.get("url")
+            if isinstance(cached_url, str) and cached_url:
+                payload["url"] = cached_url
 
             # Status is observational. It must never call ensure_page(),
             # because that silently creates an about:blank tab merely because
@@ -1076,15 +1084,23 @@ async def agent_status() -> str:
             session_id = engine._sessions.get(current_target or "")
             # A JS dialog parks the page: an evaluate would only stall. The
             # dialog itself is the page state worth reporting.
-            dialog_blocked = isinstance(session_id, str) and bool(engine.open_dialogs(session_id))
-            if isinstance(session_id, str) and not dialog_blocked:
+            open_dialogs = engine.open_dialogs(session_id) if isinstance(session_id, str) else []
+            dialog_blocked = bool(open_dialogs)
+            payload["pendingDialogs"] = len(open_dialogs)
+            payload["activeDialogs"] = [describe_dialog(item) for item in open_dialogs]
+            if dialog_blocked:
+                payload["pageState"] = "blocked_by_dialog"
+            elif isinstance(session_id, str):
                 try:
-                    raw = _loads(await _mirage_evaluate(
-                        "JSON.stringify({url: location.href, title: document.title,"
-                        " readyState: document.readyState,"
-                        f" stream:(() => {{ const s = window[Symbol.for({DOM_STREAM_GLOBAL!r})];"
-                        " return s && s.status ? s.status() : null; })()})",
-                        session_id=session_id,
+                    raw = _loads(await asyncio.wait_for(
+                        _mirage_evaluate(
+                            "JSON.stringify({url: location.href, title: document.title,"
+                            " readyState: document.readyState,"
+                            f" stream:(() => {{ const s = window[Symbol.for({DOM_STREAM_GLOBAL!r})];"
+                            " return s && s.status ? s.status() : null; })()})",
+                            session_id=session_id,
+                        ),
+                        timeout=1.5,
                     ))
                     if isinstance(raw, str):
                         page_state = _loads(raw)
@@ -1102,8 +1118,19 @@ async def agent_status() -> str:
                                     stream_id=live_stream_id if isinstance(live_stream_id, str) else None,
                                     next_seq=live_next_seq if isinstance(live_next_seq, int) else None,
                                 )
+                            payload["pageState"] = "ok"
+                        else:
+                            payload["pageState"] = "unresponsive"
+                    else:
+                        payload["pageState"] = "unresponsive"
                 except Exception:  # noqa: BLE001
-                    pass
+                    payload["pageState"] = "unresponsive"
+                if payload.get("pageState") == "unresponsive":
+                    recheck = engine.open_dialogs(session_id)
+                    if recheck:
+                        payload["pendingDialogs"] = len(recheck)
+                        payload["activeDialogs"] = [describe_dialog(item) for item in recheck]
+                        payload["pageState"] = "blocked_by_dialog"
                 stream = _dom_stream_status(session_id)
                 if stream is not None:
                     payload["refsLive"] = bool(stream.get("refsLive"))
@@ -1115,7 +1142,6 @@ async def agent_status() -> str:
             # same one that fails dialog-blocked commands fast). Do not call
             # the public dialog tool from a status probe: that hidden nested
             # MCP operation added latency and could race a page session.
-            payload["pendingDialogs"] = len(engine.open_dialogs(session_id)) if isinstance(session_id, str) else 0
             # P0-2: every window in one list — Juggler tabs, Marionette
             # windows (Bitwarden popup/FIDO2 popout included) and native
             # dialogs — from the scanner kahin_vault_login itself uses.

@@ -48,9 +48,14 @@ def extract_caller_identity(
 ) -> tuple[str | None, str | None]:
     """Resolve caller identity and explicit target_id across harnesses.
 
+    Note: at the MCP boundary unknown tool arguments are strictly rejected, so
+    un-declared routing keys in ``arguments`` only apply for internal callers
+    that bypass MCP dispatch, while ``target_id`` works on tools whose schema
+    declares it (such as ``kahin_mirage_tab_switch`` / ``tab_close``).
+
     Priority order:
-    1. Explicit tool arguments (agent_id, subagent_id, target_id, tab_id)
-    2. Harness request metadata (_meta: claudecode/toolUseId, agent_id, sessionId, taskId)
+    1. Declared/internal tool arguments (target_id; or internal caller keys)
+    2. Harness request metadata (_meta: agent_id, sessionId, taskId)
     3. MCP session / client identity (FastMCP ServerSession or client_id)
     4. Harness process environment (KAHIN_AGENT_ID, CLAUDE_CODE_AGENT, CODEX_SESSION_ID, etc.)
     """

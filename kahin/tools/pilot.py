@@ -16,11 +16,12 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import orjson
+from pydantic import Field
 
 try:
     import anyio
@@ -28,8 +29,8 @@ except ImportError:  # pragma: no cover
     anyio = None  # type: ignore[assignment]
 
 from kahin import _state as state
+from kahin._events import _on_cdp_event, _on_console_event, _on_engine_death, _on_network_event
 from kahin._mcp import mcp
-from kahin.oracle import _on_cdp_event, _on_console_event, _on_engine_death, _on_network_event
 from kahin.the_twins.capabilities import capabilities_for
 from kahin.the_twins.mirage import (
     STATE_MODE_AGIRBAS,
@@ -449,17 +450,37 @@ async def browser_start(
     port: int = 0,
     identity: str | dict[str, Any] | None = None,
     proxy: str | None = None,
-    persistent_profile: bool = True,
+    persistent_profile: Annotated[
+        bool,
+        Field(description="Eski uyumluluk bayrağı; mode açıkça verilirse mode kazanır."),
+    ] = True,
     profile_dir: str | None = None,
     addons: list[str] | None = None,
     passkey_mode: bool = False,
-    mode: str | None = None,
-    ephemeral_ack: bool = False,
+    mode: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Zorunlu durum modu: 'ağırbaş' (kalıcı) veya 'keş' (geçici, unut beni). "
+                "ASCII 'agirbas'/'kes' kabul edilir. Verilmezse tarayıcı açılmaz (mode_required)."
+            )
+        ),
+    ] = None,
+    ephemeral_ack: Annotated[
+        bool,
+        Field(
+            description=(
+                "mode='keş' için zorunlu açık onay (true): kahin_browser_stop sonrası "
+                "geçici profilin ve içindeki tüm verilerin silineceğini onaylar."
+            )
+        ),
+    ] = False,
 ) -> str:
     """Start or reuse one browser engine.
 
-    DURUM MODU ZORUNLUDUR. Varsayılan yoktur: ``mode`` açıkça verilmelidir,
-    yoksa tarayıcı açılmaz ve mod sözleşmesi döner. Her iki mod da istenildiği
+    DURUM MODU ZORUNLUDUR. Varsayılan yoktur: ``mode`` açıkça verilmelidir
+    (yalnız ``passkey_mode=true`` örtük olarak ``ağırbaş`` seçer), yoksa
+    tarayıcı açılmaz ve mod sözleşmesi döner. Her iki mod da istenildiği
     gibi çalıştırılır; seçim kullanıcınındır:
       - ``mode="ağırbaş"`` — kalıcı. Giriş, kayıtlı oturum, tekrar dönülecek
         iş, uzantı durumu (Bitwarden) veya kalıcı çerez için. Tek sabit ev;
@@ -471,9 +492,8 @@ async def browser_start(
         olmayacağının açık onayı). Hesap otomasyonu (Bitwarden hesap havuzu)
         için ``keş`` de Bitwarden taşır; bunun dışında taşımaz.
     Aynı anda tek motor çalışır; mod değiştirmek ``kahin_browser_stop``
-    gerektirir. ASCII yazımlar ``agirbas``/``kes`` de kabul edilir. Eski
-    ``persistent_profile`` bayrağı modlara eşlenir (``true`` -> ``ağırbaş``,
-    ``false`` -> ``keş``) ama ``mode`` verilirse ``mode`` kazanır.
+    gerektirir. ASCII yazımlar ``agirbas``/``kes`` de kabul edilir. ``mode``
+    verilirse eski ``persistent_profile`` bayrağına üstün gelir.
 
     Camoufox/Mirage is the default because it is the complete visual browser
     surface: screenshots, mobile viewport, input, accessibility and
@@ -563,10 +583,10 @@ async def browser_start(
         )
         if profile_error:
             return profile_error
-        if not persistent_profile:
+        if not persistent_profile and canonical_mode != STATE_MODE_AGIRBAS:
             return _json_error(
                 "kahin_browser_start",
-                "profile_dir requires persistent_profile=true",
+                "profile_dir requires persistent_profile=true or mode='ağırbaş'",
                 "invalid_argument",
                 field="profile_dir",
             )

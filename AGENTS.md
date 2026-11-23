@@ -12,6 +12,8 @@ Bu MCP server, Chrome DevTools Protocol (CDP) bilgisi, doğrulaması ve browser 
 
 ASCII `agirbas`/`kes` de kabul edilir. Sözleşme: [docs/state-modes.md](docs/state-modes.md).
 
+> **Katı Argüman Doğrulaması (TercihSaygı):** Tüm 165 aracın JSON şemasında `additionalProperties: false` bulunur. Bilinmeyen veya hatalı yazılmış parametreler (ör. `ephemeral_ak`, `incognito`) asla sessizce yutulmaz; `code: "unknown_argument"` ve yazım önerisiyle reddedilir.
+
 ## Tool İsimlendirme
 
 OpenCode'da tool isimleri `kahin_` prefix'i ile başlar. AGENTS.md'deki isimler aynen kullanılır:
@@ -325,7 +327,7 @@ Eşikler: `KAHIN_HARNESS_REPEAT_FAILS`, `KAHIN_HARNESS_TIMEOUT_HALT`,
 | `kahin_mirage_state_save` / `kahin_mirage_state_load` | Oturumu (url + cookie + local/sessionStorage) mutlak yola kaydeder/geri yükler |
 | `kahin_identity_new` / `kahin_identity_save` / `kahin_identity_list` / `kahin_identity_delete` | Camoufox fingerprint kimliklerini oluştur/kaydet/listele/sil |
 | `kahin_identity_report` | Aktif engine'in kimlik özetini ve sayfa-içi canlı `navigator.userAgent`'ı raporlar |
-| `kahin_agent_status` | Agent döngüsü özeti: engine liveness, sayfa durumu, sekme sayısı, refsLive/domCursor, dialog/network/console sayaçları, tek liste `windows` envanteri (sekmeler + Marionette pencereleri + dialoglar, `webauthnPending`) ve operatör disiplini (`harness`) durumu |
+| `kahin_agent_status` | Agent döngüsü özeti: engine liveness, `stateMode`, sayfa durumu, sekme sayısı, refsLive/domCursor/`domNextSeq`, dialog/network/console sayaçları, tek liste `windows` envanteri (sekmeler + Marionette pencereleri + dialoglar, `webauthnPending`) ve operatör disiplini (`harness`) durumu |
 | `kahin_challenge_status` | CAPTCHA/access-denied/rate-limit algılar; `retryAfterSeconds` ve güvenli pause/backoff kararını döndürür; bypass etmez |
 
 #### Stealth (10) — anti-detect denetimi, insansı girdi, kimlik rotasyonu, proxy/geo ve kalıntı overlay temizliği
@@ -445,7 +447,7 @@ Bitwarden kasasından **kod güdümlü** hesap girişi. Sıra sabittir ve ajan s
 
 ### 2. Browser Aç + Sayfaya Git + İçerik Çek
 ```
-→ kahin_browser_start(headless=true)
+→ kahin_browser_start(mode="keş", ephemeral_ack=true, headless=true)
 → kahin_navigate(url="https://github.com/void0x14/doggystyle")
 → kahin_extract()                              -> tüm sayfa metni
 → kahin_screenshot()                           -> ekran görüntüsü
@@ -467,7 +469,9 @@ Bitwarden kasasından **kod güdümlü** hesap girişi. Sıra sabittir ve ajan s
 → kahin_pattern_query(context="doggystyle")      -> öğrenilenler
 ```
 
-## Tool Listesi (Inspector Dogrulamali + canli dogrulama)
+## Tarihsel Faz Doğrulama Notları (165 Tool'un Tam Listesi Yukarıdadır)
+
+Aşağıdaki bloklar, araçların eklendiği tarihsel faz doğrulamalarını özetler; canlı sunucudaki güncel 165 aracın tamamı yukarıdaki `## Tool Listesi (165 adet)` bölümündedir.
 
 WAF-COOKIE (3) ucu MCP uzerinden canli dogrulandi: `kahin_waf_cookie_mint` →
 gitee.com `nox_jst_v1` uretildi → ayni URL `200` (124-126 KB).

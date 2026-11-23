@@ -7,7 +7,8 @@
 // Client listesi, otomatik tespit yapan sistemlerden derlendi (add-mcp 15 ajan,
 // everymcp 15, mcpm 20+, getmcp 19, mcp-get 9, mcpkit): 22 client.
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, realpathSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
@@ -341,6 +342,41 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const QUICKJS_REPO = "https://github.com/quickjs-ng/quickjs.git";
 const SETUP_COMMAND_TIMEOUT_MS = 120_000;
 
+function isCheckoutInstall() {
+  return existsSync(join(PACKAGE_ROOT, "pyproject.toml")) && existsSync(join(PACKAGE_ROOT, "kahin"));
+}
+
+export function resolveInstallSource() {
+  const override = (process.env.KAHIN_INSTALL_SOURCE || "").trim().toLowerCase();
+  if (override === "editable" || override === "wheel") {
+    return override;
+  }
+  return isCheckoutInstall() ? "editable" : "wheel";
+}
+
+function sha256File(filePath) {
+  try {
+    return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function depsHash() {
+  const hash = createHash("sha256");
+  let found = false;
+  for (const name of ["pyproject.toml", "uv.lock"]) {
+    const filePath = join(PACKAGE_ROOT, name);
+    if (!existsSync(filePath)) continue;
+    hash.update(name);
+    hash.update("\0");
+    hash.update(readFileSync(filePath));
+    hash.update("\0");
+    found = true;
+  }
+  return found ? hash.digest("hex") : null;
+}
+
 function wheelStamp() {
   try {
     const info = statSync(KAHIN_WHEEL);
@@ -350,21 +386,63 @@ function wheelStamp() {
   }
 }
 
-function installMarkerMatches(stamp) {
-  if (!stamp || !existsSync(KAHIN_INSTALL_MARKER)) return false;
+function desiredInstallState(source) {
+  if (source === "editable") {
+    let resolvedRoot = PACKAGE_ROOT;
+    try {
+      resolvedRoot = realpathSync(PACKAGE_ROOT);
+    } catch {
+      resolvedRoot = PACKAGE_ROOT;
+    }
+    return {
+      schema: 2,
+      source: "editable",
+      root: resolvedRoot,
+      depsHash: depsHash(),
+      python: KAHIN_PY,
+    };
+  }
+  let resolvedWheel = KAHIN_WHEEL;
+  try {
+    resolvedWheel = realpathSync(KAHIN_WHEEL);
+  } catch {
+    resolvedWheel = KAHIN_WHEEL;
+  }
+  return {
+    schema: 2,
+    source: "wheel",
+    wheel: wheelStamp(),
+    wheelPath: resolvedWheel,
+    wheelHash: sha256File(KAHIN_WHEEL),
+    python: KAHIN_PY,
+  };
+}
+
+function readInstallMarker() {
+  if (!existsSync(KAHIN_INSTALL_MARKER)) return null;
   try {
     const marker = JSON.parse(readFileSync(KAHIN_INSTALL_MARKER, "utf8"));
-    return marker && marker.wheel === stamp && marker.python === KAHIN_PY;
+    return marker && typeof marker === "object" ? marker : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-function writeInstallMarker(stamp) {
-  if (!stamp) return;
+function installMarkerMatches(desired, marker = readInstallMarker()) {
+  if (!marker || marker.schema !== 2 || marker.source !== desired.source || marker.python !== desired.python) {
+    return false;
+  }
+  if (desired.source === "editable") {
+    return marker.root === desired.root && marker.depsHash === desired.depsHash;
+  }
+  return Boolean(desired.wheelHash) && marker.wheelHash === desired.wheelHash;
+}
+
+function writeInstallMarker(state) {
+  if (!state) return;
   try {
     mkdirSync(KAHIN_HOME, { recursive: true });
-    writeFileSync(KAHIN_INSTALL_MARKER, JSON.stringify({ wheel: stamp, python: KAHIN_PY }) + "\n");
+    writeFileSync(KAHIN_INSTALL_MARKER, JSON.stringify(state) + "\n");
   } catch (err) {
     process.stderr.write(`[kahin] install marker yazılamadı: ${err.message}\n`);
   }
@@ -486,17 +564,18 @@ export async function buildCfHost() {
   return { built: target };
 }
 
-// Gömülü wheel'i venv'e kurar ve varsayılan Camoufox binary'sini hazırlar.
-// PyPI'a bağımlı DEĞİL — wheel paketle birlikte gelir; wheel'in bağımlılıkları
-// (Camoufox dahil) pip tarafından kurulup resmi `camoufox fetch` ile tarayıcı
-// cache'i doldurulur.
-export async function installPython() {
+// Gömülü wheel'i veya yerel checkout'u (editable) venv'e kurar ve varsayılan
+// Camoufox binary'sini hazırlar. PyPI'a bağımlı DEĞİL — yayınlanan pakette
+// wheel paketle birlikte gelir; yerel geliştirme checkout'unda ise doğrudan
+// kaynak dizin editable olarak bağlanır ki stale wheel sessizce çalışmasın.
+export async function installPython({ force = false } = {}) {
   if (process.env.KAHIN_SKIP_PYTHON) {
     log("python kurulumu atlandı (KAHIN_SKIP_PYTHON)");
     return { skipped: true };
   }
-  if (!existsSync(KAHIN_WHEEL)) {
-    log(`wheel bulunamadı: ${KAHIN_WHEEL} — kurulum atlandı (geliştirme ortamı?)`);
+  const source = resolveInstallSource();
+  if (source === "wheel" && !existsSync(KAHIN_WHEEL)) {
+    log(`wheel bulunamadı: ${KAHIN_WHEEL} — kurulum atlandı`);
     return { skipped: true };
   }
   const python3 = process.env.KAHIN_PYTHON || "python3";
@@ -509,10 +588,38 @@ export async function installPython() {
       return { error: code };
     }
   }
-  const stamp = wheelStamp();
-  if (installMarkerMatches(stamp)) {
-    log("Kahin wheel zaten güncel; pip kurulumu atlandı");
+  const desired = desiredInstallState(source);
+  const previous = readInstallMarker();
+  if (!force && installMarkerMatches(desired, previous)) {
+    log(`Kahin python ortamı zaten güncel (${source}); kurulum atlandı`);
+  } else if (source === "editable") {
+    const needsUninstall = force || !previous || previous.schema !== 2 || previous.source !== "editable";
+    if (needsUninstall) {
+      await run(KAHIN_PY, ["-m", "pip", "uninstall", "-y", "kahin"], SETUP_COMMAND_TIMEOUT_MS);
+    }
+    log(`yerel checkout editable kuruluyor: ${PACKAGE_ROOT}`);
+    let code = await run(
+      "uv",
+      ["pip", "install", "--python", KAHIN_PY, "-e", PACKAGE_ROOT],
+      SETUP_COMMAND_TIMEOUT_MS,
+    );
+    if (code !== 0) {
+      code = await run(
+        KAHIN_PY,
+        ["-m", "pip", "install", "-e", PACKAGE_ROOT],
+        SETUP_COMMAND_TIMEOUT_MS,
+      );
+    }
+    if (code !== 0) {
+      log(`editable kurulum başarısız (çıkış ${code})`);
+      return { error: code };
+    }
+    writeInstallMarker(desired);
+    log("kahin python paketi yerel checkout'a (editable) bağlandı");
   } else {
+    // Aynı sürüm numarasında wheel->wheel veya editable->wheel geçişinde pip
+    // upgrade no-op kalabildiği için önce temiz uninstall yap.
+    await run(KAHIN_PY, ["-m", "pip", "uninstall", "-y", "kahin"], SETUP_COMMAND_TIMEOUT_MS);
     log(`wheel kuruluyor: ${KAHIN_WHEEL}`);
     const code = await run(
       KAHIN_PY,
@@ -523,8 +630,8 @@ export async function installPython() {
       log(`wheel kurulamadı (çıkış ${code})`);
       return { error: code };
     }
-    writeInstallMarker(stamp);
-    log("kahin python paketi kuruldu/güncellendi");
+    writeInstallMarker(desired);
+    log("kahin python paketi wheel'den kuruldu/güncellendi");
   }
 
   if (process.env.KAHIN_SKIP_CAMOUFOX_FETCH) {

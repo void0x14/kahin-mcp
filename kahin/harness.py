@@ -30,9 +30,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from collections import deque
 from typing import Any
+
+from mcp import types as mcp_types
+
+try:
+    import Levenshtein
+except ImportError:  # pragma: no cover - optional only if stripped manually
+    Levenshtein = None  # type: ignore[assignment]
 
 
 _CLICK_TOOLS = frozenset({
@@ -181,6 +189,93 @@ def _inject_auto_dialogs(raw: Any, auto_dialogs: list[dict[str, Any]]) -> tuple[
     else:
         payload["dialogs"] = auto_dialogs
     return json.dumps(payload, indent=2, ensure_ascii=False, default=str), True
+_CAMEL_RE_1 = re.compile(r"(.)([A-Z][a-z]+)")
+_CAMEL_RE_2 = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def _normalize_arg_name(name: str) -> str:
+    step1 = _CAMEL_RE_1.sub(r"\1_\2", name)
+    return _CAMEL_RE_2.sub(r"\1_\2", step1).replace("-", "_").lower()
+
+
+def _suggest_argument(unknown: str, allowed: list[str]) -> str | None:
+    if not allowed or Levenshtein is None:
+        return None
+    norm_unknown = _normalize_arg_name(unknown)
+    best_name: str | None = None
+    best_score = 0.0
+    for candidate in allowed:
+        norm_cand = _normalize_arg_name(candidate)
+        if norm_unknown == norm_cand:
+            return candidate
+        score = max(
+            Levenshtein.ratio(unknown.lower(), candidate.lower()),
+            Levenshtein.ratio(norm_unknown, norm_cand),
+        )
+        if score > best_score:
+            best_score = score
+            best_name = candidate
+    return best_name if best_score >= 0.55 else None
+
+
+def _unexpected_arguments_error(tool_name: str, tool: Any, arguments: Any) -> str | None:
+    """Reject unknown or malformed tool arguments instead of silently dropping them."""
+    if arguments is None:
+        return None
+    if not isinstance(arguments, dict):
+        return json.dumps(
+            {
+                "error": f"{tool_name} arguments must be a JSON object.",
+                "code": "invalid_argument",
+                "tool": tool_name,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    props = tool.parameters.get("properties") if isinstance(getattr(tool, "parameters", None), dict) else {}
+    allowed = sorted(str(k) for k in (props or {}).keys())
+    allowed_set = set(allowed)
+    unexpected = sorted(str(k) for k in arguments.keys() if k not in allowed_set)
+    if not unexpected:
+        return None
+    suggestions: dict[str, str] = {}
+    for bad in unexpected:
+        match = _suggest_argument(bad, allowed)
+        if match is not None:
+            suggestions[bad] = match
+    payload: dict[str, Any] = {
+        "error": (
+            f"Bilinmeyen parametre(ler): {', '.join(unexpected)} ({tool_name}). "
+            "Kahin bilinmeyen parametreleri asla sessizce yoksaymaz."
+        ),
+        "code": "unknown_argument",
+        "tool": tool_name,
+        "unexpected_arguments": unexpected,
+        "allowed_arguments": allowed,
+        "hint": (
+            "Beklenmeyen parametreyi kaldırın veya şemadaki doğru adla tekrar çağırın; "
+            "hiçbir tercih sessizce yutulmaz."
+        ),
+    }
+    if suggestions:
+        payload["suggestions"] = suggestions
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def enforce_strict_tool_arguments(mcp: Any) -> None:
+    """Set extra='forbid' + top-level additionalProperties=false on every registered tool."""
+    manager = mcp._tool_manager
+    for tool in manager.list_tools():
+        params = getattr(tool, "parameters", None)
+        if isinstance(params, dict) and params.get("additionalProperties") is False:
+            continue
+        arg_model = getattr(getattr(tool, "fn_metadata", None), "arg_model", None)
+        if arg_model is not None:
+            arg_model.model_config = {**arg_model.model_config, "extra": "forbid"}
+            arg_model.model_rebuild(force=True)
+            tool.parameters = arg_model.model_json_schema(by_alias=True)
+        if isinstance(getattr(tool, "parameters", None), dict):
+            tool.parameters["additionalProperties"] = False
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -487,6 +582,7 @@ def get_harness() -> OperatorHarness:
 
 def install(mcp: Any) -> None:
     """Wrap FastMCP's tool dispatch once; every client call passes the harness."""
+    enforce_strict_tool_arguments(mcp)
     manager = mcp._tool_manager
     if getattr(manager, "_kahin_harness_installed", False):
         return
@@ -502,6 +598,29 @@ def install(mcp: Any) -> None:
         if tool is None:
             return await original(name, arguments, context=context, convert_result=convert_result)
 
+        # Bilinmeyen argüman reddi (TercihSaygı) KAHIN_HARNESS=0 olsa bile aktiftir:
+        # yanlış/uydurulmuş veya eski şema parametresi asla sessizce yutulamaz.
+        unknown_err = _unexpected_arguments_error(name, tool, arguments)
+        if unknown_err is not None:
+            await _harness.record(
+                name,
+                arguments if isinstance(arguments, dict) else None,
+                unknown_err,
+                None,
+            )
+            if convert_result:
+                return mcp_types.CallToolResult(
+                    content=[mcp_types.TextContent(type="text", text=unknown_err)],
+                    isError=True,
+                )
+            return unknown_err
+        annotations = getattr(tool, "annotations", None)
+        read_only = bool(getattr(annotations, "readOnlyHint", False))
+        refusal = _harness.precheck(name, arguments, read_only)
+        if refusal is not None:
+            raw: Any = json.dumps({**refusal, "tool": name}, indent=2, default=str)
+            return tool.fn_metadata.convert_result(raw) if convert_result else raw
+        started = time.monotonic()
         from kahin.subagent import (  # noqa: PLC0415
             extract_caller_identity,
             set_active_subagent_context,

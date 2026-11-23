@@ -354,7 +354,7 @@ async def mirage_set_user_agent(user_agent: str) -> str:
                 engine = _mirage_engine()
                 sid = engine.current_session_id()
                 if sid:
-                    js = f"try {{ Object.defineProperty(Navigator.prototype, 'userAgent', {{ get: () => {json.dumps(checked)}, configurable: true }}); }} catch (e) {{}}"
+                    js = f"try {{ Object.defineProperty(Navigator.prototype, 'userAgent', {{ get: () => {orjson.dumps(checked).decode()}, configurable: true }}); }} catch (e) {{}}"
                     await engine.call("Runtime.evaluate", {"expression": js}, session_id=sid)
             except Exception:
                 pass

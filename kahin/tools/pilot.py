@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover
 from kahin import _state as state
 from kahin import media as _media
 from kahin._mcp import mcp
+from kahin.oracle import _on_cdp_event, _on_console_event, _on_engine_death, _on_network_event
 from kahin.the_twins.capabilities import capabilities_for
 from kahin.the_twins.mirage import (
     STATE_MODE_AGIRBAS,
@@ -477,6 +478,14 @@ async def browser_start(
             )
         ),
     ] = False,
+    media_destination: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Oturum boyunca ekran görüntüsü ve medya çıktılarının kaydedileceği hedef dizin/yol."
+            )
+        ),
+    ] = None,
 ) -> str:
     """Start or reuse one browser engine.
 
